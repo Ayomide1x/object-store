@@ -14,6 +14,8 @@ import io.github.ayomide1x.objectstore.v1.GetObjectResponse;
 import io.github.ayomide1x.objectstore.v1.InitiateUploadRequest;
 import io.github.ayomide1x.objectstore.v1.InitiateUploadResponse;
 import io.github.ayomide1x.objectstore.v1.NodeLocation;
+import io.github.ayomide1x.objectstore.v1.ReportBadReplicaRequest;
+import io.github.ayomide1x.objectstore.v1.ReportBadReplicaResponse;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -31,9 +33,11 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
     private static final Logger log = LoggerFactory.getLogger(CoordinatorGrpcService.class);
 
     private final MetadataService metadata;
+    private final ReplicaHealthService replicaHealth;
 
-    public CoordinatorGrpcService(MetadataService metadata) {
+    public CoordinatorGrpcService(MetadataService metadata, ReplicaHealthService replicaHealth) {
         this.metadata = metadata;
+        this.replicaHealth = replicaHealth;
     }
 
     @Override
@@ -91,6 +95,19 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                         .addAllReplicas(c.replicas().stream().map(CoordinatorGrpcService::clientLocation).toList()));
             }
             return b.build();
+        });
+    }
+
+    @Override
+    public void reportBadReplica(ReportBadReplicaRequest request, StreamObserver<ReportBadReplicaResponse> response) {
+        respond(response, () -> {
+            if (request.getNodeId().isEmpty()) {
+                throw RequestException.invalid("node_id is required");
+            }
+            ReportBadReplicaResponse.Verdict verdict = replicaHealth.reportBadReplica(
+                    parseUuid("chunk_id", request.getChunkId()), request.getNodeId(),
+                    request.getReason().name(), request.getDetail());
+            return ReportBadReplicaResponse.newBuilder().setVerdict(verdict).build();
         });
     }
 

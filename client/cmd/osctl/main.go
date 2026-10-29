@@ -9,6 +9,11 @@
 //	OSCTL_CHUNK_WRITE_TIMEOUT   deadline for each replica write, a Go duration
 //	                            (default 10s). A node that misses it, or fails,
 //	                            is not tried again for the rest of that upload.
+//	OSCTL_CHUNK_READ_TIMEOUT    deadline for each replica read (default 10s). A
+//	                            node that misses it, is unreachable or busy is
+//	                            tried last for the rest of that get.
+//	OSCTL_READ_ORDER            "random" (default): shuffle each chunk's replicas;
+//	                            "listed": the coordinator's order, by node ID.
 package main
 
 import (

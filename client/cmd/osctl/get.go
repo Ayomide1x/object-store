@@ -1,134 +1,96 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
+	"time"
 
+	"github.com/Ayomide1x/object-store/client/internal/download"
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 )
 
-// get downloads an object into path. Chunks are written in index order to a
-// temp file in the same directory, which is fsynced and renamed over path
-// only after every chunk arrived with its expected size and SHA-256. A failed
-// get never leaves a partial file at path.
+const (
+	defaultChunkReadTimeout = 10 * time.Second
+	reportTimeout           = 5 * time.Second
+)
+
+// get downloads an object into path. Each chunk is read from one healthy
+// replica and, on failure, from the next; only verified bytes are written,
+// and a failed get leaves no file at path. Replicas that served bad data (or
+// none) are reported to the coordinator afterwards, as hints it confirms with
+// the node; the get's outcome never depends on a report.
 func get(ctx context.Context, log *slog.Logger, coordAddr, key, path string) error {
+	timeout, err := durationEnv("OSCTL_CHUNK_READ_TIMEOUT", defaultChunkReadTimeout)
+	if err != nil {
+		return err
+	}
+	order, err := readOrder()
+	if err != nil {
+		return err
+	}
+
 	conn, err := dial(coordAddr)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	coord := objectstorev1.NewCoordinatorServiceClient(conn)
 
-	obj, err := objectstorev1.NewCoordinatorServiceClient(conn).GetObject(ctx, &objectstorev1.GetObjectRequest{Key: key})
+	obj, err := coord.GetObject(ctx, &objectstorev1.GetObjectRequest{Key: key})
 	if err != nil {
 		return fmt.Errorf("get object %q: %w", key, err)
 	}
 	log = log.With("object_id", obj.GetObjectId())
-	if err := checkChunkList(obj.GetChunks(), obj.GetSizeBytes()); err != nil {
-		return fmt.Errorf("get object %q: %w", key, err)
+
+	var chunks []download.Chunk
+	for _, c := range obj.GetChunks() {
+		chunk := download.Chunk{ID: c.GetChunkId(), Index: c.GetIndex(), Size: c.GetSizeBytes(), SHA256: c.GetSha256()}
+		for _, r := range c.GetReplicas() {
+			chunk.Replicas = append(chunk.Replicas, download.Replica{NodeID: r.GetNodeId(), Address: r.GetAddress()})
+		}
+		chunks = append(chunks, chunk)
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".osctl-get-*")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+	d := download.New(timeout, order, log)
+	readErr := d.ToFile(ctx, chunks, obj.GetSizeBytes(), path)
+	sendReports(coord, log, d.Reports())
+	if readErr != nil {
+		return fmt.Errorf("get %q: %w", key, readErr)
 	}
-	// Cleanup on failure. After a successful rename, Remove fails harmlessly.
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
-
-	var total int64
-	for _, chunk := range obj.GetChunks() {
-		if len(chunk.GetReplicas()) == 0 {
-			return fmt.Errorf("chunk %d (%s) has no replicas", chunk.GetIndex(), chunk.GetChunkId())
-		}
-		replica := chunk.GetReplicas()[0]
-		// Hash the bytes as they go to disk, and check them end to end against
-		// the coordinator's record. Failover to another replica is stage 5;
-		// until then a bad chunk fails the whole get.
-		hasher := sha256.New()
-		n, err := readChunk(ctx, replica.GetAddress(), chunk.GetChunkId(), io.MultiWriter(tmp, hasher))
-		if err != nil {
-			return fmt.Errorf("read chunk %d (%s) from %s: %w", chunk.GetIndex(), chunk.GetChunkId(), replica.GetNodeId(), err)
-		}
-		if n != chunk.GetSizeBytes() {
-			return fmt.Errorf("chunk %d (%s): got %d bytes, expected %d", chunk.GetIndex(), chunk.GetChunkId(), n, chunk.GetSizeBytes())
-		}
-		if got := hasher.Sum(nil); !bytes.Equal(got, chunk.GetSha256()) {
-			return fmt.Errorf("chunk %d (%s) from %s: sha256 %x, coordinator recorded %x",
-				chunk.GetIndex(), chunk.GetChunkId(), replica.GetNodeId(), got, chunk.GetSha256())
-		}
-		log.Info("chunk read", "chunk_id", chunk.GetChunkId(), "node_id", replica.GetNodeId(), "index", chunk.GetIndex(), "bytes", n)
-		total += n
-	}
-	if total != obj.GetSizeBytes() {
-		return fmt.Errorf("object %q: got %d bytes, expected %d", key, total, obj.GetSizeBytes())
-	}
-
-	// Sync before rename, so a crash can't leave path naming an empty file.
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return fmt.Errorf("rename to %s: %w", path, err)
-	}
-	log.Info("download complete", "key", key, "bytes", total, "chunks", len(obj.GetChunks()))
+	log.Info("download complete", "key", key, "bytes", obj.GetSizeBytes(), "chunks", len(chunks))
 	return nil
 }
 
-// checkChunkList rejects a chunk list whose indexes are not exactly 0..n-1 in
-// order, whose sizes do not sum to the object size, or that lacks a SHA-256
-// for any chunk (an older coordinator): unverifiable data is not downloaded.
-func checkChunkList(chunks []*objectstorev1.ChunkInfo, size int64) error {
-	var total int64
-	for i, c := range chunks {
-		if int(c.GetIndex()) != i {
-			return fmt.Errorf("chunk list out of order or has a gap: position %d has index %d", i, c.GetIndex())
+// sendReports tells the coordinator about each bad replica seen, and logs its
+// verdict. Failures are only logged: a report is a hint, never part of the get.
+func sendReports(coord objectstorev1.CoordinatorServiceClient, log *slog.Logger, reports []download.Report) {
+	for _, r := range reports {
+		ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
+		resp, err := coord.ReportBadReplica(ctx, &objectstorev1.ReportBadReplicaRequest{
+			ChunkId: r.ChunkID, NodeId: r.NodeID, Reason: r.Reason, Detail: r.Detail,
+		})
+		cancel()
+		if err != nil {
+			log.Warn("bad replica report failed", "chunk_id", r.ChunkID, "node_id", r.NodeID, "error", err)
+			continue
 		}
-		if len(c.GetSha256()) != sha256.Size {
-			return fmt.Errorf("chunk %d (%s) has no sha256 to verify against", i, c.GetChunkId())
-		}
-		total += c.GetSizeBytes()
+		log.Info("bad replica reported", "chunk_id", r.ChunkID, "node_id", r.NodeID,
+			"reason", r.Reason.String(), "verdict", resp.GetVerdict().String())
 	}
-	if total != size {
-		return fmt.Errorf("chunk sizes sum to %d, object size is %d", total, size)
-	}
-	return nil
 }
 
-// readChunk streams one chunk from a node into w and returns the bytes read.
-func readChunk(ctx context.Context, addr, chunkID string, w io.Writer) (int64, error) {
-	conn, err := dial(addr)
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-
-	stream, err := objectstorev1.NewStorageNodeServiceClient(conn).ReadChunk(ctx, &objectstorev1.ReadChunkRequest{ChunkId: chunkID})
-	if err != nil {
-		return 0, fmt.Errorf("open stream: %w", err)
-	}
-	var n int64
-	for {
-		resp, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return n, nil
-		}
-		if err != nil {
-			return n, err
-		}
-		written, err := w.Write(resp.GetData())
-		n += int64(written)
-		if err != nil {
-			return n, fmt.Errorf("write output: %w", err)
-		}
+// readOrder reads OSCTL_READ_ORDER: "random" (default) shuffles each chunk's
+// replicas to spread load; "listed" keeps the coordinator's order (by node ID),
+// for scripts that need to know which replica is read first.
+func readOrder() (download.Order, error) {
+	switch v := os.Getenv("OSCTL_READ_ORDER"); v {
+	case "", "random":
+		return download.Shuffled, nil
+	case "listed":
+		return download.Listed, nil
+	default:
+		return nil, fmt.Errorf("OSCTL_READ_ORDER must be random or listed, got %q", v)
 	}
 }

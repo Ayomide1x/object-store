@@ -19,8 +19,14 @@ service CoordinatorService {
   // verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
   // overwritten. Completing an already COMMITTED object succeeds without changes.
   rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
-  // GetObject returns the chunk list and replica locations for a key.
+  // GetObject returns the chunk list and the HEALTHY replica locations for a
+  // key. Replicas marked BAD are left out. If any chunk has no healthy replica,
+  // it fails with DATA_LOSS naming the chunk and each replica's recorded reason.
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+  // ReportBadReplica is a client's hint that a replica served bad data or none.
+  // The coordinator marks the replica BAD only if the node itself confirms it
+  // (VerifyChunk); the verdict says what happened. Reading never depends on it.
+  rpc ReportBadReplica(ReportBadReplicaRequest) returns (ReportBadReplicaResponse);
 }
 
 message InitiateUploadRequest {
@@ -91,6 +97,40 @@ message ChunkInfo {
   bytes sha256 = 5;
 }
 
+message ReportBadReplicaRequest {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // The node answered NOT_FOUND for a chunk it is recorded as holding.
+    REASON_NOT_FOUND = 1;
+    // The node refused to serve the chunk: its own verification failed.
+    REASON_DATA_LOSS = 2;
+    // The node served bytes whose size or SHA-256 differs from the record.
+    REASON_CHECKSUM_MISMATCH = 3;
+  }
+  string chunk_id = 1;
+  string node_id = 2;
+  Reason reason = 3;
+  // Free text for logs, such as the error the client saw.
+  string detail = 4;
+}
+
+message ReportBadReplicaResponse {
+  enum Verdict {
+    VERDICT_UNSPECIFIED = 0;
+    // The node confirmed the replica is corrupt or missing; it is now BAD.
+    VERDICT_MARKED_BAD = 1;
+    // The replica was already BAD.
+    VERDICT_ALREADY_BAD = 2;
+    // The node says the replica is healthy; nothing was marked.
+    VERDICT_CONTRADICTED = 3;
+    // The node did not answer, or the answer came from another node; nothing was marked.
+    VERDICT_UNCONFIRMED = 4;
+    // No such replica is recorded.
+    VERDICT_NOT_A_REPLICA = 5;
+  }
+  Verdict verdict = 1;
+}
+
 // StorageNodeService stores and serves chunk bytes. Every stream is framed in
 // messages of at most 1 MiB of data. Every byte served has been checked against
 // its SHA-256 first.
@@ -105,6 +145,10 @@ service StorageNodeService {
   // name. It reads only headers, not data. One call covers every chunk of an
   // object placed on this node.
   rpc StatChunks(StatChunksRequest) returns (StatChunksResponse);
+  // VerifyChunk re-reads a whole chunk and checks its header, its data against
+  // the stored SHA-256, and the stored SHA-256 against expected_sha256 (the
+  // coordinator's record). It counts against the node's concurrent read limit.
+  rpc VerifyChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
 }
 
 message WriteChunkRequest {
@@ -172,4 +216,26 @@ message ChunkStat {
   // Set when state is STATE_FOUND: data size and the SHA-256 from the header.
   int64 size_bytes = 3;
   bytes sha256 = 4;
+}
+
+message VerifyChunkRequest {
+  string chunk_id = 1;
+  bytes expected_sha256 = 2;
+}
+
+message VerifyChunkResponse {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // Header valid, data matches the stored hash, stored hash matches expected.
+    STATE_HEALTHY = 1;
+    // Any check failed; detail says which.
+    STATE_CORRUPT = 2;
+    // No file under the chunk's final name.
+    STATE_MISSING = 3;
+  }
+  // The responding node's ID (see StatChunksResponse.node_id).
+  string node_id = 1;
+  string chunk_id = 2;
+  State state = 3;
+  string detail = 4;
 }

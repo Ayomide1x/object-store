@@ -1,0 +1,12 @@
+--- a/client/internal/download/download.go
++++ b/client/internal/download/download.go
+@@ -151,9 +151,6 @@
+ 		}
+ 		v := classify(err)
+ 		failures = append(failures, fmt.Sprintf("%s: %v", r.NodeID, err))
+-		if v.demote {
+-			d.demoted[r.NodeID] = true
+-		}
+ 		if v.report != noReport {
+ 			d.reports = append(d.reports, Report{ChunkID: c.ID, NodeID: r.NodeID, Reason: v.report, Detail: err.Error()})
+ 		}

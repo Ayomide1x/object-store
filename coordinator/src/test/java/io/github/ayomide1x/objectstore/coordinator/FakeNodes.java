@@ -14,18 +14,20 @@ import io.github.ayomide1x.objectstore.v1.ChunkStat;
 import io.github.ayomide1x.objectstore.v1.StatChunksRequest;
 import io.github.ayomide1x.objectstore.v1.StatChunksResponse;
 import io.github.ayomide1x.objectstore.v1.StorageNodeServiceGrpc;
+import io.github.ayomide1x.objectstore.v1.VerifyChunkRequest;
+import io.github.ayomide1x.objectstore.v1.VerifyChunkResponse;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
 /**
- * Four in-process storage nodes answering StatChunks. Each test decides what
- * each node holds and how it behaves.
+ * Four in-process storage nodes answering StatChunks and VerifyChunk. Each
+ * test decides what each node holds and how it behaves.
  */
 final class FakeNodes {
 
-    /** How a fake node answers StatChunks. FAIL_ONCE fails the next call with UNAVAILABLE, then answers. */
+    /** How a fake node answers its next calls. FAIL_ONCE fails the next call with UNAVAILABLE, then answers. */
     enum Mode { NORMAL, FAIL, FAIL_ONCE, HANG }
 
     /** What a node holds for one chunk. */
@@ -40,6 +42,12 @@ final class FakeNodes {
         /** The node ID put in responses; normally this node's own. */
         volatile String answerAs;
         final AtomicInteger calls = new AtomicInteger();
+        /**
+         * What VerifyChunk reports per chunk ID. Without an entry: HEALTHY if
+         * the node holds the chunk, otherwise MISSING.
+         */
+        final Map<String, VerifyChunkResponse.State> verifyAs = new ConcurrentHashMap<>();
+        final AtomicInteger verifyCalls = new AtomicInteger();
         Server server;
 
         FakeNode(String nodeId) {
@@ -50,27 +58,8 @@ final class FakeNodes {
         @Override
         public void statChunks(StatChunksRequest request, StreamObserver<StatChunksResponse> response) {
             calls.incrementAndGet();
-            switch (mode) {
-                case FAIL_ONCE -> {
-                    mode = Mode.NORMAL;
-                    response.onError(Status.UNAVAILABLE.withDescription("fake node failing once").asRuntimeException());
-                    return;
-                }
-                case FAIL -> {
-                    response.onError(Status.UNAVAILABLE.withDescription("fake node failing").asRuntimeException());
-                    return;
-                }
-                case HANG -> {
-                    try {
-                        release.await(); // until the test ends: never within the coordinator's deadline
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                    response.onError(Status.UNAVAILABLE.asRuntimeException());
-                    return;
-                }
-                case NORMAL -> {
-                }
+            if (failedByMode(response)) {
+                return;
             }
             StatChunksResponse.Builder b = StatChunksResponse.newBuilder().setNodeId(answerAs);
             for (String id : request.getChunkIdsList()) {
@@ -88,6 +77,48 @@ final class FakeNodes {
             }
             response.onNext(b.build());
             response.onCompleted();
+        }
+
+        @Override
+        public void verifyChunk(VerifyChunkRequest request, StreamObserver<VerifyChunkResponse> response) {
+            verifyCalls.incrementAndGet();
+            if (failedByMode(response)) {
+                return;
+            }
+            String id = request.getChunkId();
+            VerifyChunkResponse.State state = verifyAs.getOrDefault(id,
+                    held.containsKey(id) ? VerifyChunkResponse.State.STATE_HEALTHY : VerifyChunkResponse.State.STATE_MISSING);
+            response.onNext(VerifyChunkResponse.newBuilder().setNodeId(answerAs).setChunkId(id).setState(state)
+                    .setDetail(state == VerifyChunkResponse.State.STATE_CORRUPT ? "fake: data hashes wrong" : "").build());
+            response.onCompleted();
+        }
+
+        /** Applies the current mode; true if the call has been answered with an error. */
+        private boolean failedByMode(StreamObserver<?> response) {
+            switch (mode) {
+                case FAIL_ONCE -> {
+                    mode = Mode.NORMAL;
+                    response.onError(Status.UNAVAILABLE.withDescription("fake node failing once").asRuntimeException());
+                    return true;
+                }
+                case FAIL -> {
+                    response.onError(Status.UNAVAILABLE.withDescription("fake node failing").asRuntimeException());
+                    return true;
+                }
+                case HANG -> {
+                    try {
+                        release.await(); // until the test ends: never within the coordinator's deadline
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    response.onError(Status.UNAVAILABLE.asRuntimeException());
+                    return true;
+                }
+                case NORMAL -> {
+                    return false;
+                }
+            }
+            return false;
         }
     }
 
@@ -123,6 +154,8 @@ final class FakeNodes {
             n.mode = Mode.NORMAL;
             n.answerAs = n.nodeId;
             n.calls.set(0);
+            n.verifyAs.clear();
+            n.verifyCalls.set(0);
             n.release.countDown();
             n.release = new CountDownLatch(1);
         }

@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
-# Stage 3 acceptance: flipping one byte of a stored chunk file makes get fail
-# loudly instead of returning bad data.
+# Stage 3 acceptance, adapted to replication and failover: flipping a byte in
+# stored chunk files makes get fail loudly instead of returning bad data.
 #
-# Puts two 10 MiB objects (3 chunks each), flips one data byte in the middle
-# chunk of the first, then expects:
-#   - get of the first object fails with DataLoss and leaves no output file
-#   - the node logs a verification failure naming that chunk
-#   - get of the second object still returns identical bytes
-# Finally it flips the byte back (XOR 0xFF is its own inverse), even on
-# failure, and checks the first object reads back identical. That leaves every
-# chunk on the volume valid for the next script.
-#
-# Since stage 4 each chunk has several replicas. The byte is flipped on the
-# replica get reads first (the lowest node_id, as GetObject orders them): read
-# failover is stage 5, so until then that replica decides the outcome.
-#
-# The node image is distroless (no shell), so the byte is flipped from a
-# throwaway alpine container that mounts that node's volume with --volumes-from.
+# Since stage 5 a get fails over between replicas, so one corrupt replica no
+# longer fails it (stage5-failover-check.sh covers that). To keep stage 3's
+# criterion, this flips one data byte in EVERY replica of the middle chunk of
+# a 10 MiB object, then expects:
+#   - get of that object fails, naming each replica's DataLoss, and leaves no
+#     output file
+#   - each replica's node logs a verification failure for that chunk
+#   - get of a second, untouched object still returns identical bytes
+#   - the get's reports, confirmed by the nodes, mark all three replicas BAD
+# Finally it flips the bytes back, so every file on the volumes is valid for the
+# next script. The BAD marks stay (BAD is terminal), so the object then fails at
+# GetObject with DATA_LOSS; the script checks that too.
 #
 # Usage: scripts/stage3-corrupt-check.sh
 # Needs the Compose stack up and bin/osctl built (make build).
@@ -24,30 +21,26 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
-source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
+source "$root/scripts/lib/osctl.sh"
+source "$root/scripts/lib/volume.sh"
 work="$(mktemp -d)"
-node=""    # container of the node holding the replica get reads first
-flipped="" # chunk ID whose byte is currently flipped
+offset=$((56 + 1000000)) # past the 56-byte header, inside the data
 
-# Inverts one byte of a chunk file on $node's volume.
-flip() {
-  docker run --rm --volumes-from "$node" alpine:3 sh -c '
-    f=/data/chunks/$1; off=$2
-    before=$(od -An -tu1 -j "$off" -N1 "$f" | tr -d " ")
-    printf "$(printf "\\%03o" $((before ^ 255)))" | dd of="$f" bs=1 seek="$off" count=1 conv=notrunc 2>/dev/null
-    after=$(od -An -tu1 -j "$off" -N1 "$f" | tr -d " ")
-    echo "byte at $off: $before -> $after"
-  ' sh "$1" "$2"
-}
+flipped="$work/flipped" # "node chunk" per byte currently flipped
+: > "$flipped"
 cleanup() {
-  if [[ -n "$flipped" ]]; then
-    echo "restoring chunk $flipped"
-    flip "$flipped" "$offset" | sed 's/^/  /'
-  fi
+  while read -r node chunk; do
+    [[ -n "$node" ]] && flip_byte "$node" "$chunk" "$offset" >/dev/null
+  done <"$flipped"
   rm -rf "$work"
 }
 trap cleanup EXIT
+
+sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -c "$1"; }
+status=0
+ok() { echo "  ok: $*"; }
+fail() { echo "  FAIL: $*"; status=1; }
 
 key1="corrupt-check/one-$$"
 key2="corrupt-check/two-$$"
@@ -56,63 +49,64 @@ head -c $((10 << 20)) /dev/urandom > "$work/two"
 osctl_run put "$work/one" "$key1"
 osctl_run put "$work/two" "$key2"
 
-chunk="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tAc \
-  "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = '$key1' AND c.chunk_index = 1")"
-reader="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tAc \
-  "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$chunk' ORDER BY node_id LIMIT 1")"
-node="$("${compose[@]}" ps -q "$reader")"
-offset=$((56 + 1000000)) # past the 56-byte header, inside the data
-echo "flipping byte $offset of chunk $chunk (index 1 of $key1) on $reader, the replica get reads first"
-flip "$chunk" "$offset"
-flipped="$chunk"
+chunk="$(sql "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = '$key1' AND c.chunk_index = 1")"
+replicas="$(sql "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$chunk' ORDER BY node_id" | tr '\n' ' ')"
+echo "flipping byte $offset of chunk $chunk (index 1 of $key1) on every replica: $replicas"
+for n in $replicas; do
+  printf '  %s: ' "$n"
+  flip_byte "$n" "$chunk" "$offset"
+  echo "$n $chunk" >> "$flipped"
+done
 
-status=0
 echo
-echo "get $key1 (corrupted):"
+echo "get $key1 (every replica of chunk 1 corrupted):"
 if "$osctl" get "$key1" "$work/one.out" 2>"$work/get1.err"; then
-  echo "  FAIL: get succeeded on a corrupted chunk"
-  status=1
+  fail "get succeeded with every replica corrupt"
 else
-  tail -1 "$work/get1.err" | sed 's/^/  /'
-  if grep -q "DataLoss" "$work/get1.err"; then
-    echo "  ok: failed with DataLoss"
+  err="$(grep -v ' level=INFO ' "$work/get1.err" | grep 'osctl:' | tail -1)"
+  echo "  ${err:0:200}..."
+  missing=""
+  for n in $replicas; do grep -q "$n: rpc error: code = DataLoss" <<<"$err" || missing="$missing $n"; done
+  [[ -z "$missing" ]] && ok "failed loudly, naming each replica's DataLoss" || fail "no DataLoss for:$missing"
+fi
+[[ -e "$work/one.out" ]] && fail "an output file was left behind" || ok "no output file"
+for n in $replicas; do
+  if "${compose[@]}" logs "$n" | grep "failed verification" | grep -q "$chunk"; then
+    ok "$n logged a verification failure for chunk $chunk"
   else
-    echo "  FAIL: error is not DataLoss"
-    status=1
+    fail "no $n log line for chunk $chunk"
   fi
-fi
-if [[ -e "$work/one.out" ]]; then
-  echo "  FAIL: an output file was left behind"
-  status=1
-else
-  echo "  ok: no output file"
-fi
-
-if "${compose[@]}" logs "$reader" | grep "failed verification" | grep -q "$chunk"; then
-  echo "  ok: $reader logged a verification failure for chunk $chunk"
-else
-  echo "  FAIL: no $reader log line for chunk $chunk"
-  status=1
-fi
+done
 
 echo
 echo "get $key2 (untouched):"
 if osctl_run get "$key2" "$work/two.out" && cmp -s "$work/two" "$work/two.out"; then
-  echo "  ok: IDENTICAL"
+  ok "IDENTICAL"
 else
-  echo "  FAIL: untouched object did not round-trip"
-  status=1
+  fail "untouched object did not round-trip"
 fi
 
 echo
-echo "restoring the flipped byte:"
-flip "$chunk" "$offset" | sed 's/^/  /'
-flipped=""
-if osctl_run get "$key1" "$work/one.out" && cmp -s "$work/one" "$work/one.out"; then
-  echo "  ok: $key1 reads back IDENTICAL after restore"
+echo "replica states after the get's reports:"
+for n in $replicas; do
+  st="$(sql "SELECT state FROM chunk_replicas WHERE chunk_id = '$chunk' AND node_id = '$n'")"
+  echo "  $n: $st"
+  [[ "$st" == BAD ]] || fail "$n was not marked BAD"
+done
+
+echo
+echo "restoring the flipped bytes:"
+while read -r node c; do
+  printf '  %s: ' "$node"
+  flip_byte "$node" "$c" "$offset"
+done <"$flipped"
+: > "$flipped"
+if "$osctl" get "$key1" "$work/one.out" 2>"$work/get1b.err"; then
+  fail "get succeeded although every replica is marked BAD"
+elif grep -q "code = DataLoss.*no healthy replicas" "$work/get1b.err"; then
+  ok "files restored, but BAD is terminal: get now fails at GetObject with DataLoss"
 else
-  echo "  FAIL: $key1 did not read back after restore"
-  status=1
+  fail "get failed differently: $(grep -v ' level=INFO ' "$work/get1b.err" | tail -1)"
 fi
 
 echo

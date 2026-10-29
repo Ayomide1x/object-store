@@ -145,6 +145,59 @@ public class MetadataRepository {
                 .update();
     }
 
+    /** A replica's state ("HEALTHY" or "BAD"), or empty if no such replica is recorded. */
+    public Optional<String> replicaState(UUID chunkId, String nodeId) {
+        return jdbc.sql("SELECT state FROM chunk_replicas WHERE chunk_id = :chunkId AND node_id = :nodeId")
+                .param("chunkId", chunkId)
+                .param("nodeId", nodeId)
+                .query(String.class)
+                .optional();
+    }
+
+    /**
+     * Marks a HEALTHY replica BAD. Returns the rows changed: 0 if it was
+     * already BAD (or gone), so of two concurrent marks exactly one wins.
+     */
+    public int markReplicaBad(UUID chunkId, String nodeId, String reason) {
+        return jdbc.sql("""
+                UPDATE chunk_replicas
+                SET state = 'BAD', bad_reason = :reason, marked_bad_at = clock_timestamp()
+                WHERE chunk_id = :chunkId AND node_id = :nodeId AND state = 'HEALTHY'
+                """)
+                .param("chunkId", chunkId)
+                .param("nodeId", nodeId)
+                .param("reason", reason)
+                .update();
+    }
+
+    /** The recorded SHA-256 of a chunk, or empty if it has none (still PENDING) or doesn't exist. */
+    public Optional<byte[]> chunkHash(UUID chunkId) {
+        return jdbc.sql("SELECT sha256 FROM chunks WHERE chunk_id = :id AND sha256 IS NOT NULL")
+                .param("id", chunkId)
+                .query((rs, i) -> rs.getBytes(1))
+                .optional();
+    }
+
+    /** "node_id: reason" for each BAD replica of each chunk, for error messages. */
+    public Map<UUID, List<String>> badReplicaReasons(List<UUID> chunkIds) {
+        Map<UUID, List<String>> result = new LinkedHashMap<>();
+        if (chunkIds.isEmpty()) {
+            return result;
+        }
+        jdbc.sql("""
+                SELECT chunk_id, node_id, bad_reason FROM chunk_replicas
+                WHERE chunk_id IN (:ids) AND state = 'BAD' ORDER BY chunk_id, node_id
+                """)
+                .param("ids", chunkIds)
+                .query((rs, i) -> {
+                    result.computeIfAbsent(rs.getObject("chunk_id", UUID.class), id -> new ArrayList<>())
+                            .add(rs.getString("node_id") + ": " + rs.getString("bad_reason"));
+                    return null;
+                })
+                .list();
+        return result;
+    }
+
     /** Records a chunk's SHA-256. Set once: a chunk's hash never changes. */
     public void recordChunkHash(UUID chunkId, byte[] sha256) {
         jdbc.sql("UPDATE chunks SET sha256 = :sha256 WHERE chunk_id = :chunkId AND sha256 IS NULL")
@@ -180,10 +233,11 @@ public class MetadataRepository {
     }
 
     /**
-     * Resolves a key and loads that object's chunks and replicas in one
-     * statement, so the result is a single snapshot of exactly one object.
+     * Resolves a key and loads that object's chunks and HEALTHY replicas in
+     * one statement, so the result is a single snapshot of exactly one object.
      * Chunks and replicas are LEFT JOINed: a 0-byte object has no chunks but
-     * still resolves.
+     * still resolves, and a chunk whose replicas are all BAD comes back with
+     * none.
      */
     public Optional<StoredObject> findObjectByKey(String key) {
         record Row(UUID objectId, long objectSize, UUID chunkId, int chunkIndex, long chunkSize, byte[] sha256,
@@ -196,7 +250,7 @@ public class MetadataRepository {
                 FROM keys k
                 JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'
                 LEFT JOIN chunks c ON c.object_id = o.object_id
-                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
+                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.state = 'HEALTHY'
                 LEFT JOIN nodes n ON n.node_id = r.node_id
                 WHERE k.key = :key
                 ORDER BY c.chunk_index, n.node_id

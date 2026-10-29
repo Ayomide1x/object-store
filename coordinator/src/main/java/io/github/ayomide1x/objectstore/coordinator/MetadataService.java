@@ -257,10 +257,31 @@ public class MetadataService {
         };
     }
 
+    /**
+     * Resolves a key to its committed object with HEALTHY replicas only. If any
+     * chunk has no healthy replica left, fails with DATA_LOSS naming each such
+     * chunk and its replicas' recorded reasons: no download could succeed.
+     */
     @Transactional(readOnly = true)
     public Optional<StoredObject> getObject(String key) {
         requireKey(key);
-        return repository.findObjectByKey(key);
+        Optional<StoredObject> obj = repository.findObjectByKey(key);
+        if (obj.isPresent()) {
+            List<UUID> unreadable = obj.get().chunks().stream()
+                    .filter(c -> c.replicas().isEmpty()).map(StoredObject.Chunk::chunkId).toList();
+            if (!unreadable.isEmpty()) {
+                Map<UUID, List<String>> reasons = repository.badReplicaReasons(unreadable);
+                List<String> parts = new ArrayList<>();
+                for (StoredObject.Chunk c : obj.get().chunks()) {
+                    if (c.replicas().isEmpty()) {
+                        parts.add("chunk %d (%s) has no healthy replicas: %s".formatted(c.index(), c.chunkId(),
+                                String.join("; ", reasons.getOrDefault(c.chunkId(), List.of()))));
+                    }
+                }
+                throw new RequestException(Status.Code.DATA_LOSS, "key '%s': %s".formatted(key, String.join(" | ", parts)));
+            }
+        }
+        return obj;
     }
 
     static int chunkCount(long sizeBytes) {

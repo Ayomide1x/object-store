@@ -471,3 +471,66 @@ func TestStatChunks(t *testing.T) {
 		t.Errorf("invalid chunk id: code = %v, want InvalidArgument", got)
 	}
 }
+
+func TestVerifyChunk(t *testing.T) {
+	good := []byte("verify me please")
+	tests := []struct {
+		name      string
+		damage    func(t *testing.T, n testNode) // applied after testChunkID holds good
+		expected  []byte
+		wantState objectstorev1.VerifyChunkResponse_State
+	}{
+		{"healthy", func(*testing.T, testNode) {}, sha(good), objectstorev1.VerifyChunkResponse_STATE_HEALTHY},
+		{"data byte flipped", func(t *testing.T, n testNode) {
+			flip(t, n.finalPath(testChunkID), chunkstore.HeaderSize+3)
+		}, sha(good), objectstorev1.VerifyChunkResponse_STATE_CORRUPT},
+		{"bad header", func(t *testing.T, n testNode) { flip(t, n.finalPath(testChunkID), 0) },
+			sha(good), objectstorev1.VerifyChunkResponse_STATE_CORRUPT},
+		{"misplaced file", func(t *testing.T, n testNode) {
+			writeValid(t, n, otherChunkID, good)
+			b, err := os.ReadFile(n.finalPath(otherChunkID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(n.finalPath(testChunkID), b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, sha(good), objectstorev1.VerifyChunkResponse_STATE_CORRUPT},
+		{"missing", func(t *testing.T, n testNode) {
+			if err := os.Remove(n.finalPath(testChunkID)); err != nil {
+				t.Fatal(err)
+			}
+		}, sha(good), objectstorev1.VerifyChunkResponse_STATE_MISSING},
+		// Internally consistent, but not the chunk the coordinator recorded.
+		{"stored hash differs from expected", func(*testing.T, testNode) {}, sha([]byte("something else")),
+			objectstorev1.VerifyChunkResponse_STATE_CORRUPT},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := startServer(t, 4)
+			writeValid(t, n, testChunkID, good)
+			tt.damage(t, n)
+
+			resp, err := n.client.VerifyChunk(t.Context(), &objectstorev1.VerifyChunkRequest{ChunkId: testChunkID, ExpectedSha256: tt.expected})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.GetState() != tt.wantState {
+				t.Errorf("state = %s (%s), want %s", resp.GetState(), resp.GetDetail(), tt.wantState)
+			}
+			if resp.GetNodeId() != "test-node" || resp.GetChunkId() != testChunkID {
+				t.Errorf("response identifies %s/%s, want test-node/%s", resp.GetNodeId(), resp.GetChunkId(), testChunkID)
+			}
+		})
+	}
+}
+
+func TestVerifyChunkCountsAgainstReadLimit(t *testing.T) {
+	n := startServer(t, 1)
+	writeValid(t, n, testChunkID, []byte("x"))
+	n.srv.readSlots <- struct{}{}
+	_, err := n.client.VerifyChunk(t.Context(), &objectstorev1.VerifyChunkRequest{ChunkId: testChunkID, ExpectedSha256: sha([]byte("x"))})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code with the only slot taken = %v, want ResourceExhausted", got)
+	}
+}

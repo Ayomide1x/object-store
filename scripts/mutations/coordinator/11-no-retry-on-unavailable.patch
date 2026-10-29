@@ -1,8 +1,8 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
-@@ -109,7 +109,7 @@
+@@ -150,7 +150,7 @@
          try {
-             return stub(node, deadline).statChunks(req);
+             return call.apply(stub(node, deadline));
          } catch (StatusRuntimeException e) {
 -            if (e.getStatus().getCode() != Status.Code.UNAVAILABLE || deadline.isExpired()) {
 +            if (true) {

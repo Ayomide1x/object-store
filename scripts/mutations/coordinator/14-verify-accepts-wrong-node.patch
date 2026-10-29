@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
+@@ -133,7 +133,7 @@
+                     .log("VerifyChunk failed; nothing can be concluded: {}", e.getStatus());
+             return Optional.empty();
+         }
+-        if (!node.nodeId().equals(answer.getNodeId())) {
++        if (false && !node.nodeId().equals(answer.getNodeId())) {
+             log.atError()
+                     .addKeyValue("chunk_id", chunkId)
+                     .addKeyValue("node_id", node.nodeId())

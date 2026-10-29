@@ -476,3 +476,114 @@ M2 (no transaction) is regenerated: the commit phase now runs through a `Transac
 
 **Because:** an adapted corruption check died silently. Its first put had been refused because of the stale-DNS problem above, and the error went to `/dev/null`.
 **Breaks if:** new scripts call osctl directly.
+
+## Reads shuffle each chunk's replicas; OSCTL_READ_ORDER=listed for deterministic reads (stage 5)
+**Amends:** "Stage 3 acceptance scripts adapted to replication; scripts never hide osctl errors" (stage 4), whose corrupt-check relied on `get` reading the lowest `node_id` first.
+**Chose:** `GetObject` returns a chunk's HEALTHY replicas in a stable order (by `node_id`). The client shuffles each chunk's list before reading (`download.Shuffled`). `OSCTL_READ_ORDER=listed` keeps the coordinator's order, so scripts know which replica is read first. Go tests inject the order function directly.
+**Over:** always reading the lowest `node_id` first (every read of a chunk lands on one node, and node1 is first for about half of all chunks); one shuffle per `get` (spreads load only across gets); shuffling in the coordinator (puts read policy in the metadata service and makes `GetObject` non-deterministic for its own tests); forcing a replica in scripts by watching logs in a retry loop (non-deterministic, and the steps must know the first replica before corrupting it).
+**Because:** spread load by default, determinism on request.
+**Breaks if:** reads need to prefer a node for locality or cost. Then the order would need a real policy, not just a shuffle.
+
+## Failover and report classification, with an explicit default (stage 5)
+**Chose:** `download.classify` decides what each failed replica read means.
+
+| Outcome | Fail over | Report |
+|---|---|---|
+| `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | yes, and the node is demoted for the rest of the get | no |
+| a stream that breaks mid-chunk (surfaces as one of the codes above, or as an unlisted code) | yes | no |
+| `NOT_FOUND` | yes | yes (`REASON_NOT_FOUND`) |
+| `DATA_LOSS` | yes | yes (`REASON_DATA_LOSS`) |
+| wrong size or SHA-256 at the client | yes | yes (`REASON_CHECKSUM_MISMATCH`) |
+| `INVALID_ARGUMENT` | **no**: the get fails; every replica would refuse a malformed request | no |
+| **any other code** (`INTERNAL`, `UNKNOWN`, `UNIMPLEMENTED`, and so on) | yes | **no** |
+
+The last row is an **explicit `default:` branch** in the switch, not whatever falls through: an unlisted code isn't proof the replica is bad. Our own cancelled context (Ctrl-C) stops the get. A replica is reported only when it served wrong data, or claims not to have a chunk it's recorded as holding. A stopped, slow or busy node is a liveness matter (stage 6), not a bad replica. Tested by `TestFailoverClassification`, one case per row, including an `INTERNAL` replica (fails over, identical output, no report), and by `TestInvalidArgumentDoesNotFailOver`. Mutations: D2 (report on `UNAVAILABLE`), D5 (fail over on `INVALID_ARGUMENT`), D6 (an unlisted code is reported).
+**Over:** reporting every failure (a stopped node would get its replicas marked bad); failing the get on an unknown code (one odd node could make an object unreadable when other replicas are fine).
+**Because:** failover is cheap and safe, while a report ends in a permanent BAD mark if the node confirms it, so reports need evidence.
+**Breaks if:** a node returns `INTERNAL` for a corrupt file. It would never be reported, and only stage 7's checks or another reader's `DATA_LOSS` would catch it.
+
+## Per-replica read deadline; demotion for the rest of the get (stage 5)
+**Chose:** each replica read has a deadline covering connect and the whole stream: `OSCTL_CHUNK_READ_TIMEOUT`, default 10 s. A replica that fails with `UNAVAILABLE`, `DEADLINE_EXCEEDED` or `RESOURCE_EXHAUSTED` is tried **last** for the rest of that get. It's demoted, not dropped, so it's still the last resort if every other replica fails.
+**Over:** dropping the node for the rest of the get, as uploads do (on a read, the dropped node might be the only replica that would have worked); no demotion (a hung node first in the order for every chunk costs 10 s per chunk).
+**Because:** a hung node costs one deadline per get. `TestHungReplicaDemotedForRestOfGet` checks 5 chunks in about one deadline (mutation D4). On a paused node, a 10 MiB get took 10.2 s.
+**Breaks if:** many gets run against a hung node at once. Each one pays a deadline until stage 6 stops directing reads there.
+
+## Chunks are buffered in memory and verified before anything is written (stage 5)
+**Amends:** "get verifies every chunk end to end against the coordinator's hash" (stage 3). Bytes no longer go straight to the temp file.
+**Chose:** each replica attempt reads into a per-get buffer, reset to length 0 before every attempt, with a fresh SHA-256 hasher. Frames beyond the chunk's size are a mismatch. Only after the size and hash match are the bytes written to the temp file. Memory is at most 4 MiB per get, because chunks are read one at a time and the buffer is reused.
+**Over:** writing straight to the temp file and, on failover, truncating and seeking back to the chunk's offset and resetting the hasher (1 MiB of memory, but unverified bytes sit on disk, and a rewind bug corrupts output silently); one temp file per chunk attempt, appended on success (every chunk written twice).
+**Because:** the temp file only ever holds verified chunks, so there's nothing to rewind. Tested by the "stream breaks mid-chunk" case: two frames, then `UNAVAILABLE`, then byte-identical output from the next replica. Mutation D1 (no reset on failover) is caught by it.
+**Breaks if:** chunks are read in parallel. Memory then becomes the number of chunks in flight × 4 MiB.
+
+## A client's bad-replica report is a hint; the node confirms it before anything is marked (stage 5)
+**Extends:** "Node responses must identify the responding node" (stage 4), to `VerifyChunk`.
+**Chose:** `ReportBadReplica(chunk_id, node_id, reason, detail)` doesn't mark anything by itself. If the replica isn't recorded → `NOT_A_REPLICA`. If it's already BAD → `ALREADY_BAD`. Otherwise the coordinator calls the new node RPC `VerifyChunk(chunk_id, expected_sha256)`, with the hash from `chunks.sha256`, within the node RPC deadline and with the stage 4 retry on `UNAVAILABLE`. The node re-reads the whole file: magic, chunk ID, data against the stored hash, and the stored hash against the expected one.
+
+| The node's answer | Effect | Verdict |
+|---|---|---|
+| `CORRUPT` | marked BAD, reason "corrupt: <node's detail>" | `MARKED_BAD` |
+| `MISSING` | marked BAD, reason "missing" | `MARKED_BAD` |
+| `HEALTHY` | nothing; logged as contradicted (transit corruption or a client bug) | `CONTRADICTED` |
+| no answer | nothing | `UNCONFIRMED` |
+| answer from the wrong node | nothing; error log | `UNCONFIRMED` |
+
+The mark is `UPDATE … WHERE state = 'HEALTHY'`, so of two concurrent reports exactly one marks; the rest get `ALREADY_BAD`. Tested in `BadReplicaReportIT`. Mutations: M12 (mark without confirmation) and M14 (accept a `VerifyChunk` answer from the wrong node).
+**Over:** marking on the client's word (breaks invariant 3); confirming with `StatChunks` (it reads only the header, so it can't see data corruption); the coordinator reading the chunk itself (breaks invariant 6).
+**Because:** "this replica is bad" is a fact about a node, so per invariant 3 it's recorded only from a response that identifies as that node.
+**Breaks if:** a node is down when the report arrives. The report is dropped (`UNCONFIRMED`) and not retried. The next reader that hits the bad replica reports it again.
+
+## Reports are sent after the get, are bounded, and never affect its outcome (stage 5)
+**Chose:** `osctl get` collects reports while reading and sends them once reading has finished, whether the get succeeded or not. Each has a 5 s deadline. Each verdict is logged. A failed report is a warning line and nothing more: it never changes the get's result or exit status.
+**Over:** fire-and-forget goroutines (the CLI may exit before they finish, and the reports are lost); reporting synchronously at the moment of failover (adds the confirmation round trip, including the node's re-hash, to the get's latency).
+**Because:** reading stays as fast as failover allows, and reports still reliably reach the coordinator from a short-lived CLI.
+**Breaks if:** a get is killed (`SIGKILL`) before its reports are sent. Those reports are lost, and the next reader reports again.
+
+## Replica state on chunk_replicas; BAD is terminal (stage 5)
+**Chose:** migration V4 adds `state` (`HEALTHY` or `BAD`, default `HEALTHY`), `bad_reason` and `marked_bad_at` (set with `clock_timestamp()`), with a CHECK that BAD rows have both. There's no transition from BAD back to HEALTHY.
+- Stage 7 counts and copies only HEALTHY replicas.
+- Stage 8 finds BAD rows, deletes the file on that node, then deletes the row.
+
+**Over:** deleting the row (stage 8 would lose track of where the bad file is, "placed but no row" would mean both "never acknowledged" and "went bad", and the reason would be lost); a separate `bad_replicas` table (rows moving between tables must stay consistent, for no gain).
+**Because:** one row tracks one copy for its whole life.
+**Breaks if:** a node bug produces a false `CORRUPT`. There's no way to reinstate the replica short of manual SQL. Stage 7 would just make a new copy elsewhere.
+
+## GetObject excludes BAD replicas; DATA_LOSS when a chunk has none healthy (stage 5)
+**Amends:** "Key pointer table with last-commit-wins atomic swap" (stage 2): the read is still one statement, with the replica join now `ON … AND r.state = 'HEALTHY'`.
+**Chose:** BAD replicas are never listed. If any chunk is left with no healthy replica, `GetObject` fails with `DATA_LOSS`: "chunk N (id) has no healthy replicas: node1: corrupt: …; …". No download starts.
+**Over:** listing BAD replicas last (a confirmed-bad replica can't serve verified bytes, so trying it wastes an attempt and repeats the report); returning an empty replica list and letting the client fail (later, with less context).
+**Because:** readers are never sent to a known-bad copy, and an unreadable object fails at once with the recorded reasons. Mutations: M13 (`GetObject` ignores the state) and M15 (no `DATA_LOSS`).
+**Breaks if:** every replica of a chunk is wrongly marked BAD (see the previous entry). The object is then unreadable, even though a file might still be good.
+
+## Bad files stay on disk until stages 7 and 8; no quarantine (stage 5)
+**Chose:** a BAD replica's file is left where it is. A file that fails the node's own check keeps getting refused with `DATA_LOSS`. A file that passes the node's check but isn't the recorded chunk (a stale or misplaced file) would still be served by the node, but `GetObject` no longer lists that replica, and stage 7 copies only from healthy ones, so nothing is sent to it.
+**Over:** the node moving the file to `/data/bad/` on the coordinator's word. Renaming doesn't change the contents, so invariant 4 holds either way, but it adds a coordinator-driven RPC that changes node state ahead of stage 8, which owns deletion and its safety rules.
+**Because:** stage 5 is about reading correctly. Removing files belongs to stage 8.
+**Breaks if:** disk space matters before stage 8. BAD files take up space until then.
+
+## VerifyChunk: a full re-hash against the header and the coordinator's hash, counted against the read limit (stage 5)
+**Chose:** `VerifyChunk` reuses `store.Read`, which checks the magic, the chunk ID and the data hash. It then compares the stored hash with `expected_sha256`. It answers `HEALTHY`, `CORRUPT` (with detail) or `MISSING`, plus `node_id` and `chunk_id`. It takes a read slot like `ReadChunk`, so a flood of reports can't add unbounded re-hash work; when the node is full it returns `RESOURCE_EXHAUSTED`, which the coordinator treats as no answer. Mutation N10 (ignore `expected_sha256`) is caught by `TestVerifyChunk/stored_hash_differs_from_expected`.
+**Over:** checking the header only (that's `StatChunks`, and it can't see data corruption); verifying only against the node's own header (a valid file under the wrong chunk's name, or a stale file, would pass).
+**Because:** confirmation must be as strong as the claim being confirmed.
+**Breaks if:** reports arrive faster than nodes can re-hash. Then they come back `UNCONFIRMED`.
+
+## Mutation scripts extended for stage 5 (stage 5)
+**Extends:** "Mutation scripts extended; the Go script renamed" (stage 4).
+**Chose:**
+- **Go:** D1 no reset on failover; D2 report on `UNAVAILABLE`; D3 no read deadline; D4 no demotion; D5 fail over on `INVALID_ARGUMENT`; D6 an unlisted code is reported; N10 `VerifyChunk` ignores the expected hash. Each mutation names a target test, or a single subtest such as `TestFailoverClassification/internal_(unlisted_code)`.
+- **Coordinator:** M12 mark BAD without confirmation; M13 `GetObject` ignores the state; M14 `VerifyChunk` accepts a response from the wrong node; M15 no `DATA_LOSS` without a healthy replica.
+
+The coordinator script now totals every JUnit report, because there are two test classes. Patches M1, M4 and M11 are regenerated against the changed repository and `NodeClient`.
+**Because:** every new guarantee is shown to be load-bearing.
+**Breaks if:** code edits stop patches from applying. The scripts fail at `git apply --check`.
+
+## stage3-corrupt-check corrupts every replica; shared volume helpers (stage 5)
+**Amends:** "Stage 3 acceptance scripts adapted to replication; scripts never hide osctl errors" (stage 4).
+**Chose:** with failover, one corrupt replica no longer fails a get (`stage5-failover-check.sh` covers that). To keep stage 3's criterion (a flipped byte makes get fail loudly, never return bad data), `stage3-corrupt-check.sh` now corrupts **every** replica of one chunk. It expects:
+- the get fails, naming each replica's `DataLoss`, and leaves no output file;
+- each node logs its verification failure;
+- the untouched object is still identical;
+- the get's reports mark all three replicas BAD.
+
+It then flips the bytes back, so every file on the volumes is valid again, and checks that the object now fails at `GetObject` with `DATA_LOSS`, because BAD is terminal. The flip and delete helpers live in `scripts/lib/volume.sh`, shared with `stage5-failover-check.sh`.
+**Because:** the criterion stays testable after the behaviour it was written against has changed.
+**Breaks if:** an object needs to stay readable after the script runs. It doesn't, by design.

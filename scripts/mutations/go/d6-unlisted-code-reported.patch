@@ -1,0 +1,11 @@
+--- a/client/internal/download/download.go
++++ b/client/internal/download/download.go
+@@ -114,7 +114,7 @@
+ 	default:
+ 		// INTERNAL, UNKNOWN, UNIMPLEMENTED and anything else: not proof the
+ 		// replica is bad, so fail over without reporting.
+-		return verdict{failOver: true, report: noReport}
++		return verdict{failOver: true, report: objectstorev1.ReportBadReplicaRequest_REASON_DATA_LOSS}
+ 	}
+ }
+ 

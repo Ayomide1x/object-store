@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ReplicaHealthService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ReplicaHealthService.java
+@@ -50,7 +50,8 @@
+             return Verdict.VERDICT_NOT_A_REPLICA;
+         }
+ 
+-        Optional<VerifyChunkResponse> answer = nodeClient.verifyChunk(node.get(), chunkId, expected.get());
++        Optional<VerifyChunkResponse> answer = Optional.of(VerifyChunkResponse.newBuilder()
++                .setState(VerifyChunkResponse.State.STATE_CORRUPT).setDetail("the client said so").build());
+         if (answer.isEmpty()) {
+             logCtx.log("bad replica report unconfirmed: the node did not answer as itself");
+             return Verdict.VERDICT_UNCONFIRMED;

@@ -2,7 +2,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -197,6 +199,48 @@ func (s *Server) StatChunks(ctx context.Context, req *objectstorev1.StatChunksRe
 		}
 		resp.Stats = append(resp.Stats, stat)
 	}
+	return resp, nil
+}
+
+// VerifyChunk re-reads a whole chunk and reports whether it is healthy: header
+// valid and naming this chunk, data matching the stored hash, and the stored
+// hash matching expected_sha256, the coordinator's record. The coordinator
+// asks this before it marks a replica bad on a client's report. It holds a
+// read slot, like ReadChunk, so reports can't add unbounded work.
+func (s *Server) VerifyChunk(ctx context.Context, req *objectstorev1.VerifyChunkRequest) (*objectstorev1.VerifyChunkResponse, error) {
+	log := s.log.With("node_id", s.nodeID, "chunk_id", req.GetChunkId())
+	select {
+	case s.readSlots <- struct{}{}:
+		defer func() { <-s.readSlots }()
+	default:
+		return nil, status.Errorf(codes.ResourceExhausted, "node %s is serving %d reads; retry later", s.nodeID, cap(s.readSlots))
+	}
+
+	resp := &objectstorev1.VerifyChunkResponse{NodeId: s.nodeID, ChunkId: req.GetChunkId()}
+	data, err := s.store.Read(ctx, req.GetChunkId())
+	switch {
+	case errors.Is(err, chunkstore.ErrInvalidID):
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, chunkstore.ErrNotFound):
+		resp.State = objectstorev1.VerifyChunkResponse_STATE_MISSING
+		resp.Detail = "no file under the chunk's final name"
+	case errors.Is(err, chunkstore.ErrCorrupt):
+		resp.State = objectstorev1.VerifyChunkResponse_STATE_CORRUPT
+		resp.Detail = err.Error()
+	case err != nil:
+		log.Error("verify chunk", "error", err)
+		return nil, status.Errorf(codes.Internal, "verify chunk %s: %v", req.GetChunkId(), err)
+	default:
+		// The file is internally consistent; it must also be the chunk the
+		// coordinator recorded.
+		if sum := sha256.Sum256(data); !bytes.Equal(sum[:], req.GetExpectedSha256()) {
+			resp.State = objectstorev1.VerifyChunkResponse_STATE_CORRUPT
+			resp.Detail = fmt.Sprintf("stored sha256 %x differs from the coordinator's record %x", sum, req.GetExpectedSha256())
+		} else {
+			resp.State = objectstorev1.VerifyChunkResponse_STATE_HEALTHY
+		}
+	}
+	log.Info("chunk verified on request", "state", resp.GetState().String(), "detail", resp.GetDetail())
 	return resp, nil
 }
 

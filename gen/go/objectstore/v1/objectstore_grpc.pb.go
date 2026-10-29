@@ -19,9 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	CoordinatorService_InitiateUpload_FullMethodName = "/objectstore.v1.CoordinatorService/InitiateUpload"
-	CoordinatorService_CompleteUpload_FullMethodName = "/objectstore.v1.CoordinatorService/CompleteUpload"
-	CoordinatorService_GetObject_FullMethodName      = "/objectstore.v1.CoordinatorService/GetObject"
+	CoordinatorService_InitiateUpload_FullMethodName   = "/objectstore.v1.CoordinatorService/InitiateUpload"
+	CoordinatorService_CompleteUpload_FullMethodName   = "/objectstore.v1.CoordinatorService/CompleteUpload"
+	CoordinatorService_GetObject_FullMethodName        = "/objectstore.v1.CoordinatorService/GetObject"
+	CoordinatorService_ReportBadReplica_FullMethodName = "/objectstore.v1.CoordinatorService/ReportBadReplica"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -41,8 +42,14 @@ type CoordinatorServiceClient interface {
 	// verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
 	// overwritten. Completing an already COMMITTED object succeeds without changes.
 	CompleteUpload(ctx context.Context, in *CompleteUploadRequest, opts ...grpc.CallOption) (*CompleteUploadResponse, error)
-	// GetObject returns the chunk list and replica locations for a key.
+	// GetObject returns the chunk list and the HEALTHY replica locations for a
+	// key. Replicas marked BAD are left out. If any chunk has no healthy replica,
+	// it fails with DATA_LOSS naming the chunk and each replica's recorded reason.
 	GetObject(ctx context.Context, in *GetObjectRequest, opts ...grpc.CallOption) (*GetObjectResponse, error)
+	// ReportBadReplica is a client's hint that a replica served bad data or none.
+	// The coordinator marks the replica BAD only if the node itself confirms it
+	// (VerifyChunk); the verdict says what happened. Reading never depends on it.
+	ReportBadReplica(ctx context.Context, in *ReportBadReplicaRequest, opts ...grpc.CallOption) (*ReportBadReplicaResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -83,6 +90,16 @@ func (c *coordinatorServiceClient) GetObject(ctx context.Context, in *GetObjectR
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) ReportBadReplica(ctx context.Context, in *ReportBadReplicaRequest, opts ...grpc.CallOption) (*ReportBadReplicaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportBadReplicaResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_ReportBadReplica_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -100,8 +117,14 @@ type CoordinatorServiceServer interface {
 	// verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
 	// overwritten. Completing an already COMMITTED object succeeds without changes.
 	CompleteUpload(context.Context, *CompleteUploadRequest) (*CompleteUploadResponse, error)
-	// GetObject returns the chunk list and replica locations for a key.
+	// GetObject returns the chunk list and the HEALTHY replica locations for a
+	// key. Replicas marked BAD are left out. If any chunk has no healthy replica,
+	// it fails with DATA_LOSS naming the chunk and each replica's recorded reason.
 	GetObject(context.Context, *GetObjectRequest) (*GetObjectResponse, error)
+	// ReportBadReplica is a client's hint that a replica served bad data or none.
+	// The coordinator marks the replica BAD only if the node itself confirms it
+	// (VerifyChunk); the verdict says what happened. Reading never depends on it.
+	ReportBadReplica(context.Context, *ReportBadReplicaRequest) (*ReportBadReplicaResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -120,6 +143,9 @@ func (UnimplementedCoordinatorServiceServer) CompleteUpload(context.Context, *Co
 }
 func (UnimplementedCoordinatorServiceServer) GetObject(context.Context, *GetObjectRequest) (*GetObjectResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetObject not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) ReportBadReplica(context.Context, *ReportBadReplicaRequest) (*ReportBadReplicaResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportBadReplica not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -196,6 +222,24 @@ func _CoordinatorService_GetObject_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_ReportBadReplica_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportBadReplicaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).ReportBadReplica(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_ReportBadReplica_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).ReportBadReplica(ctx, req.(*ReportBadReplicaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -215,15 +259,20 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "GetObject",
 			Handler:    _CoordinatorService_GetObject_Handler,
 		},
+		{
+			MethodName: "ReportBadReplica",
+			Handler:    _CoordinatorService_ReportBadReplica_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "objectstore/v1/objectstore.proto",
 }
 
 const (
-	StorageNodeService_WriteChunk_FullMethodName = "/objectstore.v1.StorageNodeService/WriteChunk"
-	StorageNodeService_ReadChunk_FullMethodName  = "/objectstore.v1.StorageNodeService/ReadChunk"
-	StorageNodeService_StatChunks_FullMethodName = "/objectstore.v1.StorageNodeService/StatChunks"
+	StorageNodeService_WriteChunk_FullMethodName  = "/objectstore.v1.StorageNodeService/WriteChunk"
+	StorageNodeService_ReadChunk_FullMethodName   = "/objectstore.v1.StorageNodeService/ReadChunk"
+	StorageNodeService_StatChunks_FullMethodName  = "/objectstore.v1.StorageNodeService/StatChunks"
+	StorageNodeService_VerifyChunk_FullMethodName = "/objectstore.v1.StorageNodeService/VerifyChunk"
 )
 
 // StorageNodeServiceClient is the client API for StorageNodeService service.
@@ -244,6 +293,10 @@ type StorageNodeServiceClient interface {
 	// name. It reads only headers, not data. One call covers every chunk of an
 	// object placed on this node.
 	StatChunks(ctx context.Context, in *StatChunksRequest, opts ...grpc.CallOption) (*StatChunksResponse, error)
+	// VerifyChunk re-reads a whole chunk and checks its header, its data against
+	// the stored SHA-256, and the stored SHA-256 against expected_sha256 (the
+	// coordinator's record). It counts against the node's concurrent read limit.
+	VerifyChunk(ctx context.Context, in *VerifyChunkRequest, opts ...grpc.CallOption) (*VerifyChunkResponse, error)
 }
 
 type storageNodeServiceClient struct {
@@ -296,6 +349,16 @@ func (c *storageNodeServiceClient) StatChunks(ctx context.Context, in *StatChunk
 	return out, nil
 }
 
+func (c *storageNodeServiceClient) VerifyChunk(ctx context.Context, in *VerifyChunkRequest, opts ...grpc.CallOption) (*VerifyChunkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyChunkResponse)
+	err := c.cc.Invoke(ctx, StorageNodeService_VerifyChunk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StorageNodeServiceServer is the server API for StorageNodeService service.
 // All implementations must embed UnimplementedStorageNodeServiceServer
 // for forward compatibility.
@@ -314,6 +377,10 @@ type StorageNodeServiceServer interface {
 	// name. It reads only headers, not data. One call covers every chunk of an
 	// object placed on this node.
 	StatChunks(context.Context, *StatChunksRequest) (*StatChunksResponse, error)
+	// VerifyChunk re-reads a whole chunk and checks its header, its data against
+	// the stored SHA-256, and the stored SHA-256 against expected_sha256 (the
+	// coordinator's record). It counts against the node's concurrent read limit.
+	VerifyChunk(context.Context, *VerifyChunkRequest) (*VerifyChunkResponse, error)
 	mustEmbedUnimplementedStorageNodeServiceServer()
 }
 
@@ -332,6 +399,9 @@ func (UnimplementedStorageNodeServiceServer) ReadChunk(*ReadChunkRequest, grpc.S
 }
 func (UnimplementedStorageNodeServiceServer) StatChunks(context.Context, *StatChunksRequest) (*StatChunksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StatChunks not implemented")
+}
+func (UnimplementedStorageNodeServiceServer) VerifyChunk(context.Context, *VerifyChunkRequest) (*VerifyChunkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyChunk not implemented")
 }
 func (UnimplementedStorageNodeServiceServer) mustEmbedUnimplementedStorageNodeServiceServer() {}
 func (UnimplementedStorageNodeServiceServer) testEmbeddedByValue()                            {}
@@ -390,6 +460,24 @@ func _StorageNodeService_StatChunks_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageNodeService_VerifyChunk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyChunkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageNodeServiceServer).VerifyChunk(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageNodeService_VerifyChunk_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageNodeServiceServer).VerifyChunk(ctx, req.(*VerifyChunkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // StorageNodeService_ServiceDesc is the grpc.ServiceDesc for StorageNodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -400,6 +488,10 @@ var StorageNodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StatChunks",
 			Handler:    _StorageNodeService_StatChunks_Handler,
+		},
+		{
+			MethodName: "VerifyChunk",
+			Handler:    _StorageNodeService_VerifyChunk_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

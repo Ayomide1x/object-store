@@ -1,0 +1,10 @@
+--- a/client/internal/download/download.go
++++ b/client/internal/download/download.go
+@@ -183,7 +183,6 @@
+ 	}
+ 
+ 	// Start clean: nothing from an earlier attempt survives.
+-	d.buf = d.buf[:0]
+ 	hasher := sha256.New()
+ 	for {
+ 		resp, err := stream.Recv()

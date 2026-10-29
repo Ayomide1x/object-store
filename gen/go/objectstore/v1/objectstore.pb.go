@@ -21,6 +21,124 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ReportBadReplicaRequest_Reason int32
+
+const (
+	ReportBadReplicaRequest_REASON_UNSPECIFIED ReportBadReplicaRequest_Reason = 0
+	// The node answered NOT_FOUND for a chunk it is recorded as holding.
+	ReportBadReplicaRequest_REASON_NOT_FOUND ReportBadReplicaRequest_Reason = 1
+	// The node refused to serve the chunk: its own verification failed.
+	ReportBadReplicaRequest_REASON_DATA_LOSS ReportBadReplicaRequest_Reason = 2
+	// The node served bytes whose size or SHA-256 differs from the record.
+	ReportBadReplicaRequest_REASON_CHECKSUM_MISMATCH ReportBadReplicaRequest_Reason = 3
+)
+
+// Enum value maps for ReportBadReplicaRequest_Reason.
+var (
+	ReportBadReplicaRequest_Reason_name = map[int32]string{
+		0: "REASON_UNSPECIFIED",
+		1: "REASON_NOT_FOUND",
+		2: "REASON_DATA_LOSS",
+		3: "REASON_CHECKSUM_MISMATCH",
+	}
+	ReportBadReplicaRequest_Reason_value = map[string]int32{
+		"REASON_UNSPECIFIED":       0,
+		"REASON_NOT_FOUND":         1,
+		"REASON_DATA_LOSS":         2,
+		"REASON_CHECKSUM_MISMATCH": 3,
+	}
+)
+
+func (x ReportBadReplicaRequest_Reason) Enum() *ReportBadReplicaRequest_Reason {
+	p := new(ReportBadReplicaRequest_Reason)
+	*p = x
+	return p
+}
+
+func (x ReportBadReplicaRequest_Reason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ReportBadReplicaRequest_Reason) Descriptor() protoreflect.EnumDescriptor {
+	return file_objectstore_v1_objectstore_proto_enumTypes[0].Descriptor()
+}
+
+func (ReportBadReplicaRequest_Reason) Type() protoreflect.EnumType {
+	return &file_objectstore_v1_objectstore_proto_enumTypes[0]
+}
+
+func (x ReportBadReplicaRequest_Reason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ReportBadReplicaRequest_Reason.Descriptor instead.
+func (ReportBadReplicaRequest_Reason) EnumDescriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{10, 0}
+}
+
+type ReportBadReplicaResponse_Verdict int32
+
+const (
+	ReportBadReplicaResponse_VERDICT_UNSPECIFIED ReportBadReplicaResponse_Verdict = 0
+	// The node confirmed the replica is corrupt or missing; it is now BAD.
+	ReportBadReplicaResponse_VERDICT_MARKED_BAD ReportBadReplicaResponse_Verdict = 1
+	// The replica was already BAD.
+	ReportBadReplicaResponse_VERDICT_ALREADY_BAD ReportBadReplicaResponse_Verdict = 2
+	// The node says the replica is healthy; nothing was marked.
+	ReportBadReplicaResponse_VERDICT_CONTRADICTED ReportBadReplicaResponse_Verdict = 3
+	// The node did not answer, or the answer came from another node; nothing was marked.
+	ReportBadReplicaResponse_VERDICT_UNCONFIRMED ReportBadReplicaResponse_Verdict = 4
+	// No such replica is recorded.
+	ReportBadReplicaResponse_VERDICT_NOT_A_REPLICA ReportBadReplicaResponse_Verdict = 5
+)
+
+// Enum value maps for ReportBadReplicaResponse_Verdict.
+var (
+	ReportBadReplicaResponse_Verdict_name = map[int32]string{
+		0: "VERDICT_UNSPECIFIED",
+		1: "VERDICT_MARKED_BAD",
+		2: "VERDICT_ALREADY_BAD",
+		3: "VERDICT_CONTRADICTED",
+		4: "VERDICT_UNCONFIRMED",
+		5: "VERDICT_NOT_A_REPLICA",
+	}
+	ReportBadReplicaResponse_Verdict_value = map[string]int32{
+		"VERDICT_UNSPECIFIED":   0,
+		"VERDICT_MARKED_BAD":    1,
+		"VERDICT_ALREADY_BAD":   2,
+		"VERDICT_CONTRADICTED":  3,
+		"VERDICT_UNCONFIRMED":   4,
+		"VERDICT_NOT_A_REPLICA": 5,
+	}
+)
+
+func (x ReportBadReplicaResponse_Verdict) Enum() *ReportBadReplicaResponse_Verdict {
+	p := new(ReportBadReplicaResponse_Verdict)
+	*p = x
+	return p
+}
+
+func (x ReportBadReplicaResponse_Verdict) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ReportBadReplicaResponse_Verdict) Descriptor() protoreflect.EnumDescriptor {
+	return file_objectstore_v1_objectstore_proto_enumTypes[1].Descriptor()
+}
+
+func (ReportBadReplicaResponse_Verdict) Type() protoreflect.EnumType {
+	return &file_objectstore_v1_objectstore_proto_enumTypes[1]
+}
+
+func (x ReportBadReplicaResponse_Verdict) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ReportBadReplicaResponse_Verdict.Descriptor instead.
+func (ReportBadReplicaResponse_Verdict) EnumDescriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{11, 0}
+}
+
 type ChunkStat_State int32
 
 const (
@@ -60,11 +178,11 @@ func (x ChunkStat_State) String() string {
 }
 
 func (ChunkStat_State) Descriptor() protoreflect.EnumDescriptor {
-	return file_objectstore_v1_objectstore_proto_enumTypes[0].Descriptor()
+	return file_objectstore_v1_objectstore_proto_enumTypes[2].Descriptor()
 }
 
 func (ChunkStat_State) Type() protoreflect.EnumType {
-	return &file_objectstore_v1_objectstore_proto_enumTypes[0]
+	return &file_objectstore_v1_objectstore_proto_enumTypes[2]
 }
 
 func (x ChunkStat_State) Number() protoreflect.EnumNumber {
@@ -73,7 +191,62 @@ func (x ChunkStat_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ChunkStat_State.Descriptor instead.
 func (ChunkStat_State) EnumDescriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{18, 0}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{20, 0}
+}
+
+type VerifyChunkResponse_State int32
+
+const (
+	VerifyChunkResponse_STATE_UNSPECIFIED VerifyChunkResponse_State = 0
+	// Header valid, data matches the stored hash, stored hash matches expected.
+	VerifyChunkResponse_STATE_HEALTHY VerifyChunkResponse_State = 1
+	// Any check failed; detail says which.
+	VerifyChunkResponse_STATE_CORRUPT VerifyChunkResponse_State = 2
+	// No file under the chunk's final name.
+	VerifyChunkResponse_STATE_MISSING VerifyChunkResponse_State = 3
+)
+
+// Enum value maps for VerifyChunkResponse_State.
+var (
+	VerifyChunkResponse_State_name = map[int32]string{
+		0: "STATE_UNSPECIFIED",
+		1: "STATE_HEALTHY",
+		2: "STATE_CORRUPT",
+		3: "STATE_MISSING",
+	}
+	VerifyChunkResponse_State_value = map[string]int32{
+		"STATE_UNSPECIFIED": 0,
+		"STATE_HEALTHY":     1,
+		"STATE_CORRUPT":     2,
+		"STATE_MISSING":     3,
+	}
+)
+
+func (x VerifyChunkResponse_State) Enum() *VerifyChunkResponse_State {
+	p := new(VerifyChunkResponse_State)
+	*p = x
+	return p
+}
+
+func (x VerifyChunkResponse_State) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (VerifyChunkResponse_State) Descriptor() protoreflect.EnumDescriptor {
+	return file_objectstore_v1_objectstore_proto_enumTypes[3].Descriptor()
+}
+
+func (VerifyChunkResponse_State) Type() protoreflect.EnumType {
+	return &file_objectstore_v1_objectstore_proto_enumTypes[3]
+}
+
+func (x VerifyChunkResponse_State) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use VerifyChunkResponse_State.Descriptor instead.
+func (VerifyChunkResponse_State) EnumDescriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{22, 0}
 }
 
 type InitiateUploadRequest struct {
@@ -671,6 +844,119 @@ func (x *ChunkInfo) GetSha256() []byte {
 	return nil
 }
 
+type ReportBadReplicaRequest struct {
+	state   protoimpl.MessageState         `protogen:"open.v1"`
+	ChunkId string                         `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	NodeId  string                         `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Reason  ReportBadReplicaRequest_Reason `protobuf:"varint,3,opt,name=reason,proto3,enum=objectstore.v1.ReportBadReplicaRequest_Reason" json:"reason,omitempty"`
+	// Free text for logs, such as the error the client saw.
+	Detail        string `protobuf:"bytes,4,opt,name=detail,proto3" json:"detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReportBadReplicaRequest) Reset() {
+	*x = ReportBadReplicaRequest{}
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReportBadReplicaRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReportBadReplicaRequest) ProtoMessage() {}
+
+func (x *ReportBadReplicaRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReportBadReplicaRequest.ProtoReflect.Descriptor instead.
+func (*ReportBadReplicaRequest) Descriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ReportBadReplicaRequest) GetChunkId() string {
+	if x != nil {
+		return x.ChunkId
+	}
+	return ""
+}
+
+func (x *ReportBadReplicaRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *ReportBadReplicaRequest) GetReason() ReportBadReplicaRequest_Reason {
+	if x != nil {
+		return x.Reason
+	}
+	return ReportBadReplicaRequest_REASON_UNSPECIFIED
+}
+
+func (x *ReportBadReplicaRequest) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
+}
+
+type ReportBadReplicaResponse struct {
+	state         protoimpl.MessageState           `protogen:"open.v1"`
+	Verdict       ReportBadReplicaResponse_Verdict `protobuf:"varint,1,opt,name=verdict,proto3,enum=objectstore.v1.ReportBadReplicaResponse_Verdict" json:"verdict,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReportBadReplicaResponse) Reset() {
+	*x = ReportBadReplicaResponse{}
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReportBadReplicaResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReportBadReplicaResponse) ProtoMessage() {}
+
+func (x *ReportBadReplicaResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReportBadReplicaResponse.ProtoReflect.Descriptor instead.
+func (*ReportBadReplicaResponse) Descriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *ReportBadReplicaResponse) GetVerdict() ReportBadReplicaResponse_Verdict {
+	if x != nil {
+		return x.Verdict
+	}
+	return ReportBadReplicaResponse_VERDICT_UNSPECIFIED
+}
+
 type WriteChunkRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Frame:
@@ -685,7 +971,7 @@ type WriteChunkRequest struct {
 
 func (x *WriteChunkRequest) Reset() {
 	*x = WriteChunkRequest{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[10]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -697,7 +983,7 @@ func (x *WriteChunkRequest) String() string {
 func (*WriteChunkRequest) ProtoMessage() {}
 
 func (x *WriteChunkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[10]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -710,7 +996,7 @@ func (x *WriteChunkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteChunkRequest.ProtoReflect.Descriptor instead.
 func (*WriteChunkRequest) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{10}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *WriteChunkRequest) GetFrame() isWriteChunkRequest_Frame {
@@ -781,7 +1067,7 @@ type WriteChunkHeader struct {
 
 func (x *WriteChunkHeader) Reset() {
 	*x = WriteChunkHeader{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[11]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -793,7 +1079,7 @@ func (x *WriteChunkHeader) String() string {
 func (*WriteChunkHeader) ProtoMessage() {}
 
 func (x *WriteChunkHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[11]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -806,7 +1092,7 @@ func (x *WriteChunkHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteChunkHeader.ProtoReflect.Descriptor instead.
 func (*WriteChunkHeader) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{11}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *WriteChunkHeader) GetChunkId() string {
@@ -842,7 +1128,7 @@ type WriteChunkTrailer struct {
 
 func (x *WriteChunkTrailer) Reset() {
 	*x = WriteChunkTrailer{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -854,7 +1140,7 @@ func (x *WriteChunkTrailer) String() string {
 func (*WriteChunkTrailer) ProtoMessage() {}
 
 func (x *WriteChunkTrailer) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -867,7 +1153,7 @@ func (x *WriteChunkTrailer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteChunkTrailer.ProtoReflect.Descriptor instead.
 func (*WriteChunkTrailer) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{12}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *WriteChunkTrailer) GetSha256() []byte {
@@ -889,7 +1175,7 @@ type WriteChunkResponse struct {
 
 func (x *WriteChunkResponse) Reset() {
 	*x = WriteChunkResponse{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -901,7 +1187,7 @@ func (x *WriteChunkResponse) String() string {
 func (*WriteChunkResponse) ProtoMessage() {}
 
 func (x *WriteChunkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -914,7 +1200,7 @@ func (x *WriteChunkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteChunkResponse.ProtoReflect.Descriptor instead.
 func (*WriteChunkResponse) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{13}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *WriteChunkResponse) GetChunkId() string {
@@ -947,7 +1233,7 @@ type ReadChunkRequest struct {
 
 func (x *ReadChunkRequest) Reset() {
 	*x = ReadChunkRequest{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -959,7 +1245,7 @@ func (x *ReadChunkRequest) String() string {
 func (*ReadChunkRequest) ProtoMessage() {}
 
 func (x *ReadChunkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -972,7 +1258,7 @@ func (x *ReadChunkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadChunkRequest.ProtoReflect.Descriptor instead.
 func (*ReadChunkRequest) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{14}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ReadChunkRequest) GetChunkId() string {
@@ -991,7 +1277,7 @@ type ReadChunkResponse struct {
 
 func (x *ReadChunkResponse) Reset() {
 	*x = ReadChunkResponse{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[15]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1003,7 +1289,7 @@ func (x *ReadChunkResponse) String() string {
 func (*ReadChunkResponse) ProtoMessage() {}
 
 func (x *ReadChunkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[15]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1016,7 +1302,7 @@ func (x *ReadChunkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadChunkResponse.ProtoReflect.Descriptor instead.
 func (*ReadChunkResponse) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{15}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ReadChunkResponse) GetData() []byte {
@@ -1035,7 +1321,7 @@ type StatChunksRequest struct {
 
 func (x *StatChunksRequest) Reset() {
 	*x = StatChunksRequest{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[16]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1047,7 +1333,7 @@ func (x *StatChunksRequest) String() string {
 func (*StatChunksRequest) ProtoMessage() {}
 
 func (x *StatChunksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[16]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1060,7 +1346,7 @@ func (x *StatChunksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatChunksRequest.ProtoReflect.Descriptor instead.
 func (*StatChunksRequest) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{16}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *StatChunksRequest) GetChunkIds() []string {
@@ -1084,7 +1370,7 @@ type StatChunksResponse struct {
 
 func (x *StatChunksResponse) Reset() {
 	*x = StatChunksResponse{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[17]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1096,7 +1382,7 @@ func (x *StatChunksResponse) String() string {
 func (*StatChunksResponse) ProtoMessage() {}
 
 func (x *StatChunksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[17]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1109,7 +1395,7 @@ func (x *StatChunksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatChunksResponse.ProtoReflect.Descriptor instead.
 func (*StatChunksResponse) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{17}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *StatChunksResponse) GetStats() []*ChunkStat {
@@ -1139,7 +1425,7 @@ type ChunkStat struct {
 
 func (x *ChunkStat) Reset() {
 	*x = ChunkStat{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[18]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1151,7 +1437,7 @@ func (x *ChunkStat) String() string {
 func (*ChunkStat) ProtoMessage() {}
 
 func (x *ChunkStat) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[18]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1164,7 +1450,7 @@ func (x *ChunkStat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkStat.ProtoReflect.Descriptor instead.
 func (*ChunkStat) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{18}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ChunkStat) GetChunkId() string {
@@ -1193,6 +1479,127 @@ func (x *ChunkStat) GetSha256() []byte {
 		return x.Sha256
 	}
 	return nil
+}
+
+type VerifyChunkRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ChunkId        string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	ExpectedSha256 []byte                 `protobuf:"bytes,2,opt,name=expected_sha256,json=expectedSha256,proto3" json:"expected_sha256,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *VerifyChunkRequest) Reset() {
+	*x = VerifyChunkRequest{}
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyChunkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyChunkRequest) ProtoMessage() {}
+
+func (x *VerifyChunkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyChunkRequest.ProtoReflect.Descriptor instead.
+func (*VerifyChunkRequest) Descriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *VerifyChunkRequest) GetChunkId() string {
+	if x != nil {
+		return x.ChunkId
+	}
+	return ""
+}
+
+func (x *VerifyChunkRequest) GetExpectedSha256() []byte {
+	if x != nil {
+		return x.ExpectedSha256
+	}
+	return nil
+}
+
+type VerifyChunkResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The responding node's ID (see StatChunksResponse.node_id).
+	NodeId        string                    `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ChunkId       string                    `protobuf:"bytes,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	State         VerifyChunkResponse_State `protobuf:"varint,3,opt,name=state,proto3,enum=objectstore.v1.VerifyChunkResponse_State" json:"state,omitempty"`
+	Detail        string                    `protobuf:"bytes,4,opt,name=detail,proto3" json:"detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyChunkResponse) Reset() {
+	*x = VerifyChunkResponse{}
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyChunkResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyChunkResponse) ProtoMessage() {}
+
+func (x *VerifyChunkResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyChunkResponse.ProtoReflect.Descriptor instead.
+func (*VerifyChunkResponse) Descriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *VerifyChunkResponse) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *VerifyChunkResponse) GetChunkId() string {
+	if x != nil {
+		return x.ChunkId
+	}
+	return ""
+}
+
+func (x *VerifyChunkResponse) GetState() VerifyChunkResponse_State {
+	if x != nil {
+		return x.State
+	}
+	return VerifyChunkResponse_STATE_UNSPECIFIED
+}
+
+func (x *VerifyChunkResponse) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
 }
 
 var File_objectstore_v1_objectstore_proto protoreflect.FileDescriptor
@@ -1243,7 +1650,26 @@ const file_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x128\n" +
 	"\breplicas\x18\x04 \x03(\v2\x1c.objectstore.v1.NodeLocationR\breplicas\x12\x16\n" +
-	"\x06sha256\x18\x05 \x01(\fR\x06sha256\"\xad\x01\n" +
+	"\x06sha256\x18\x05 \x01(\fR\x06sha256\"\x99\x02\n" +
+	"\x17ReportBadReplicaRequest\x12\x19\n" +
+	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12F\n" +
+	"\x06reason\x18\x03 \x01(\x0e2..objectstore.v1.ReportBadReplicaRequest.ReasonR\x06reason\x12\x16\n" +
+	"\x06detail\x18\x04 \x01(\tR\x06detail\"j\n" +
+	"\x06Reason\x12\x16\n" +
+	"\x12REASON_UNSPECIFIED\x10\x00\x12\x14\n" +
+	"\x10REASON_NOT_FOUND\x10\x01\x12\x14\n" +
+	"\x10REASON_DATA_LOSS\x10\x02\x12\x1c\n" +
+	"\x18REASON_CHECKSUM_MISMATCH\x10\x03\"\x8a\x02\n" +
+	"\x18ReportBadReplicaResponse\x12J\n" +
+	"\averdict\x18\x01 \x01(\x0e20.objectstore.v1.ReportBadReplicaResponse.VerdictR\averdict\"\xa1\x01\n" +
+	"\aVerdict\x12\x17\n" +
+	"\x13VERDICT_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12VERDICT_MARKED_BAD\x10\x01\x12\x17\n" +
+	"\x13VERDICT_ALREADY_BAD\x10\x02\x12\x18\n" +
+	"\x14VERDICT_CONTRADICTED\x10\x03\x12\x17\n" +
+	"\x13VERDICT_UNCONFIRMED\x10\x04\x12\x19\n" +
+	"\x15VERDICT_NOT_A_REPLICA\x10\x05\"\xad\x01\n" +
 	"\x11WriteChunkRequest\x12:\n" +
 	"\x06header\x18\x01 \x01(\v2 .objectstore.v1.WriteChunkHeaderH\x00R\x06header\x12\x14\n" +
 	"\x04data\x18\x02 \x01(\fH\x00R\x04data\x12=\n" +
@@ -1279,17 +1705,32 @@ const file_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\x11STATE_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vSTATE_FOUND\x10\x01\x12\x11\n" +
 	"\rSTATE_MISSING\x10\x02\x12\x14\n" +
-	"\x10STATE_BAD_HEADER\x10\x032\xa8\x02\n" +
+	"\x10STATE_BAD_HEADER\x10\x03\"X\n" +
+	"\x12VerifyChunkRequest\x12\x19\n" +
+	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12'\n" +
+	"\x0fexpected_sha256\x18\x02 \x01(\fR\x0eexpectedSha256\"\xfb\x01\n" +
+	"\x13VerifyChunkResponse\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x19\n" +
+	"\bchunk_id\x18\x02 \x01(\tR\achunkId\x12?\n" +
+	"\x05state\x18\x03 \x01(\x0e2).objectstore.v1.VerifyChunkResponse.StateR\x05state\x12\x16\n" +
+	"\x06detail\x18\x04 \x01(\tR\x06detail\"W\n" +
+	"\x05State\x12\x15\n" +
+	"\x11STATE_UNSPECIFIED\x10\x00\x12\x11\n" +
+	"\rSTATE_HEALTHY\x10\x01\x12\x11\n" +
+	"\rSTATE_CORRUPT\x10\x02\x12\x11\n" +
+	"\rSTATE_MISSING\x10\x032\x8f\x03\n" +
 	"\x12CoordinatorService\x12_\n" +
 	"\x0eInitiateUpload\x12%.objectstore.v1.InitiateUploadRequest\x1a&.objectstore.v1.InitiateUploadResponse\x12_\n" +
 	"\x0eCompleteUpload\x12%.objectstore.v1.CompleteUploadRequest\x1a&.objectstore.v1.CompleteUploadResponse\x12P\n" +
-	"\tGetObject\x12 .objectstore.v1.GetObjectRequest\x1a!.objectstore.v1.GetObjectResponse2\x94\x02\n" +
+	"\tGetObject\x12 .objectstore.v1.GetObjectRequest\x1a!.objectstore.v1.GetObjectResponse\x12e\n" +
+	"\x10ReportBadReplica\x12'.objectstore.v1.ReportBadReplicaRequest\x1a(.objectstore.v1.ReportBadReplicaResponse2\xec\x02\n" +
 	"\x12StorageNodeService\x12U\n" +
 	"\n" +
 	"WriteChunk\x12!.objectstore.v1.WriteChunkRequest\x1a\".objectstore.v1.WriteChunkResponse(\x01\x12R\n" +
 	"\tReadChunk\x12 .objectstore.v1.ReadChunkRequest\x1a!.objectstore.v1.ReadChunkResponse0\x01\x12S\n" +
 	"\n" +
-	"StatChunks\x12!.objectstore.v1.StatChunksRequest\x1a\".objectstore.v1.StatChunksResponseBm\n" +
+	"StatChunks\x12!.objectstore.v1.StatChunksRequest\x1a\".objectstore.v1.StatChunksResponse\x12V\n" +
+	"\vVerifyChunk\x12\".objectstore.v1.VerifyChunkRequest\x1a#.objectstore.v1.VerifyChunkResponseBm\n" +
 	"\"io.github.ayomide1x.objectstore.v1P\x01ZEgithub.com/Ayomide1x/object-store/gen/go/objectstore/v1;objectstorev1b\x06proto3"
 
 var (
@@ -1304,57 +1745,71 @@ func file_objectstore_v1_objectstore_proto_rawDescGZIP() []byte {
 	return file_objectstore_v1_objectstore_proto_rawDescData
 }
 
-var file_objectstore_v1_objectstore_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_objectstore_v1_objectstore_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_objectstore_v1_objectstore_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_objectstore_v1_objectstore_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_objectstore_v1_objectstore_proto_goTypes = []any{
-	(ChunkStat_State)(0),           // 0: objectstore.v1.ChunkStat.State
-	(*InitiateUploadRequest)(nil),  // 1: objectstore.v1.InitiateUploadRequest
-	(*InitiateUploadResponse)(nil), // 2: objectstore.v1.InitiateUploadResponse
-	(*ChunkPlacement)(nil),         // 3: objectstore.v1.ChunkPlacement
-	(*NodeLocation)(nil),           // 4: objectstore.v1.NodeLocation
-	(*CompleteUploadRequest)(nil),  // 5: objectstore.v1.CompleteUploadRequest
-	(*CompletedChunk)(nil),         // 6: objectstore.v1.CompletedChunk
-	(*CompleteUploadResponse)(nil), // 7: objectstore.v1.CompleteUploadResponse
-	(*GetObjectRequest)(nil),       // 8: objectstore.v1.GetObjectRequest
-	(*GetObjectResponse)(nil),      // 9: objectstore.v1.GetObjectResponse
-	(*ChunkInfo)(nil),              // 10: objectstore.v1.ChunkInfo
-	(*WriteChunkRequest)(nil),      // 11: objectstore.v1.WriteChunkRequest
-	(*WriteChunkHeader)(nil),       // 12: objectstore.v1.WriteChunkHeader
-	(*WriteChunkTrailer)(nil),      // 13: objectstore.v1.WriteChunkTrailer
-	(*WriteChunkResponse)(nil),     // 14: objectstore.v1.WriteChunkResponse
-	(*ReadChunkRequest)(nil),       // 15: objectstore.v1.ReadChunkRequest
-	(*ReadChunkResponse)(nil),      // 16: objectstore.v1.ReadChunkResponse
-	(*StatChunksRequest)(nil),      // 17: objectstore.v1.StatChunksRequest
-	(*StatChunksResponse)(nil),     // 18: objectstore.v1.StatChunksResponse
-	(*ChunkStat)(nil),              // 19: objectstore.v1.ChunkStat
+	(ReportBadReplicaRequest_Reason)(0),   // 0: objectstore.v1.ReportBadReplicaRequest.Reason
+	(ReportBadReplicaResponse_Verdict)(0), // 1: objectstore.v1.ReportBadReplicaResponse.Verdict
+	(ChunkStat_State)(0),                  // 2: objectstore.v1.ChunkStat.State
+	(VerifyChunkResponse_State)(0),        // 3: objectstore.v1.VerifyChunkResponse.State
+	(*InitiateUploadRequest)(nil),         // 4: objectstore.v1.InitiateUploadRequest
+	(*InitiateUploadResponse)(nil),        // 5: objectstore.v1.InitiateUploadResponse
+	(*ChunkPlacement)(nil),                // 6: objectstore.v1.ChunkPlacement
+	(*NodeLocation)(nil),                  // 7: objectstore.v1.NodeLocation
+	(*CompleteUploadRequest)(nil),         // 8: objectstore.v1.CompleteUploadRequest
+	(*CompletedChunk)(nil),                // 9: objectstore.v1.CompletedChunk
+	(*CompleteUploadResponse)(nil),        // 10: objectstore.v1.CompleteUploadResponse
+	(*GetObjectRequest)(nil),              // 11: objectstore.v1.GetObjectRequest
+	(*GetObjectResponse)(nil),             // 12: objectstore.v1.GetObjectResponse
+	(*ChunkInfo)(nil),                     // 13: objectstore.v1.ChunkInfo
+	(*ReportBadReplicaRequest)(nil),       // 14: objectstore.v1.ReportBadReplicaRequest
+	(*ReportBadReplicaResponse)(nil),      // 15: objectstore.v1.ReportBadReplicaResponse
+	(*WriteChunkRequest)(nil),             // 16: objectstore.v1.WriteChunkRequest
+	(*WriteChunkHeader)(nil),              // 17: objectstore.v1.WriteChunkHeader
+	(*WriteChunkTrailer)(nil),             // 18: objectstore.v1.WriteChunkTrailer
+	(*WriteChunkResponse)(nil),            // 19: objectstore.v1.WriteChunkResponse
+	(*ReadChunkRequest)(nil),              // 20: objectstore.v1.ReadChunkRequest
+	(*ReadChunkResponse)(nil),             // 21: objectstore.v1.ReadChunkResponse
+	(*StatChunksRequest)(nil),             // 22: objectstore.v1.StatChunksRequest
+	(*StatChunksResponse)(nil),            // 23: objectstore.v1.StatChunksResponse
+	(*ChunkStat)(nil),                     // 24: objectstore.v1.ChunkStat
+	(*VerifyChunkRequest)(nil),            // 25: objectstore.v1.VerifyChunkRequest
+	(*VerifyChunkResponse)(nil),           // 26: objectstore.v1.VerifyChunkResponse
 }
 var file_objectstore_v1_objectstore_proto_depIdxs = []int32{
-	3,  // 0: objectstore.v1.InitiateUploadResponse.chunks:type_name -> objectstore.v1.ChunkPlacement
-	4,  // 1: objectstore.v1.ChunkPlacement.nodes:type_name -> objectstore.v1.NodeLocation
-	6,  // 2: objectstore.v1.CompleteUploadRequest.chunks:type_name -> objectstore.v1.CompletedChunk
-	10, // 3: objectstore.v1.GetObjectResponse.chunks:type_name -> objectstore.v1.ChunkInfo
-	4,  // 4: objectstore.v1.ChunkInfo.replicas:type_name -> objectstore.v1.NodeLocation
-	12, // 5: objectstore.v1.WriteChunkRequest.header:type_name -> objectstore.v1.WriteChunkHeader
-	13, // 6: objectstore.v1.WriteChunkRequest.trailer:type_name -> objectstore.v1.WriteChunkTrailer
-	19, // 7: objectstore.v1.StatChunksResponse.stats:type_name -> objectstore.v1.ChunkStat
-	0,  // 8: objectstore.v1.ChunkStat.state:type_name -> objectstore.v1.ChunkStat.State
-	1,  // 9: objectstore.v1.CoordinatorService.InitiateUpload:input_type -> objectstore.v1.InitiateUploadRequest
-	5,  // 10: objectstore.v1.CoordinatorService.CompleteUpload:input_type -> objectstore.v1.CompleteUploadRequest
-	8,  // 11: objectstore.v1.CoordinatorService.GetObject:input_type -> objectstore.v1.GetObjectRequest
-	11, // 12: objectstore.v1.StorageNodeService.WriteChunk:input_type -> objectstore.v1.WriteChunkRequest
-	15, // 13: objectstore.v1.StorageNodeService.ReadChunk:input_type -> objectstore.v1.ReadChunkRequest
-	17, // 14: objectstore.v1.StorageNodeService.StatChunks:input_type -> objectstore.v1.StatChunksRequest
-	2,  // 15: objectstore.v1.CoordinatorService.InitiateUpload:output_type -> objectstore.v1.InitiateUploadResponse
-	7,  // 16: objectstore.v1.CoordinatorService.CompleteUpload:output_type -> objectstore.v1.CompleteUploadResponse
-	9,  // 17: objectstore.v1.CoordinatorService.GetObject:output_type -> objectstore.v1.GetObjectResponse
-	14, // 18: objectstore.v1.StorageNodeService.WriteChunk:output_type -> objectstore.v1.WriteChunkResponse
-	16, // 19: objectstore.v1.StorageNodeService.ReadChunk:output_type -> objectstore.v1.ReadChunkResponse
-	18, // 20: objectstore.v1.StorageNodeService.StatChunks:output_type -> objectstore.v1.StatChunksResponse
-	15, // [15:21] is the sub-list for method output_type
-	9,  // [9:15] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	6,  // 0: objectstore.v1.InitiateUploadResponse.chunks:type_name -> objectstore.v1.ChunkPlacement
+	7,  // 1: objectstore.v1.ChunkPlacement.nodes:type_name -> objectstore.v1.NodeLocation
+	9,  // 2: objectstore.v1.CompleteUploadRequest.chunks:type_name -> objectstore.v1.CompletedChunk
+	13, // 3: objectstore.v1.GetObjectResponse.chunks:type_name -> objectstore.v1.ChunkInfo
+	7,  // 4: objectstore.v1.ChunkInfo.replicas:type_name -> objectstore.v1.NodeLocation
+	0,  // 5: objectstore.v1.ReportBadReplicaRequest.reason:type_name -> objectstore.v1.ReportBadReplicaRequest.Reason
+	1,  // 6: objectstore.v1.ReportBadReplicaResponse.verdict:type_name -> objectstore.v1.ReportBadReplicaResponse.Verdict
+	17, // 7: objectstore.v1.WriteChunkRequest.header:type_name -> objectstore.v1.WriteChunkHeader
+	18, // 8: objectstore.v1.WriteChunkRequest.trailer:type_name -> objectstore.v1.WriteChunkTrailer
+	24, // 9: objectstore.v1.StatChunksResponse.stats:type_name -> objectstore.v1.ChunkStat
+	2,  // 10: objectstore.v1.ChunkStat.state:type_name -> objectstore.v1.ChunkStat.State
+	3,  // 11: objectstore.v1.VerifyChunkResponse.state:type_name -> objectstore.v1.VerifyChunkResponse.State
+	4,  // 12: objectstore.v1.CoordinatorService.InitiateUpload:input_type -> objectstore.v1.InitiateUploadRequest
+	8,  // 13: objectstore.v1.CoordinatorService.CompleteUpload:input_type -> objectstore.v1.CompleteUploadRequest
+	11, // 14: objectstore.v1.CoordinatorService.GetObject:input_type -> objectstore.v1.GetObjectRequest
+	14, // 15: objectstore.v1.CoordinatorService.ReportBadReplica:input_type -> objectstore.v1.ReportBadReplicaRequest
+	16, // 16: objectstore.v1.StorageNodeService.WriteChunk:input_type -> objectstore.v1.WriteChunkRequest
+	20, // 17: objectstore.v1.StorageNodeService.ReadChunk:input_type -> objectstore.v1.ReadChunkRequest
+	22, // 18: objectstore.v1.StorageNodeService.StatChunks:input_type -> objectstore.v1.StatChunksRequest
+	25, // 19: objectstore.v1.StorageNodeService.VerifyChunk:input_type -> objectstore.v1.VerifyChunkRequest
+	5,  // 20: objectstore.v1.CoordinatorService.InitiateUpload:output_type -> objectstore.v1.InitiateUploadResponse
+	10, // 21: objectstore.v1.CoordinatorService.CompleteUpload:output_type -> objectstore.v1.CompleteUploadResponse
+	12, // 22: objectstore.v1.CoordinatorService.GetObject:output_type -> objectstore.v1.GetObjectResponse
+	15, // 23: objectstore.v1.CoordinatorService.ReportBadReplica:output_type -> objectstore.v1.ReportBadReplicaResponse
+	19, // 24: objectstore.v1.StorageNodeService.WriteChunk:output_type -> objectstore.v1.WriteChunkResponse
+	21, // 25: objectstore.v1.StorageNodeService.ReadChunk:output_type -> objectstore.v1.ReadChunkResponse
+	23, // 26: objectstore.v1.StorageNodeService.StatChunks:output_type -> objectstore.v1.StatChunksResponse
+	26, // 27: objectstore.v1.StorageNodeService.VerifyChunk:output_type -> objectstore.v1.VerifyChunkResponse
+	20, // [20:28] is the sub-list for method output_type
+	12, // [12:20] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_objectstore_v1_objectstore_proto_init() }
@@ -1362,7 +1817,7 @@ func file_objectstore_v1_objectstore_proto_init() {
 	if File_objectstore_v1_objectstore_proto != nil {
 		return
 	}
-	file_objectstore_v1_objectstore_proto_msgTypes[10].OneofWrappers = []any{
+	file_objectstore_v1_objectstore_proto_msgTypes[12].OneofWrappers = []any{
 		(*WriteChunkRequest_Header)(nil),
 		(*WriteChunkRequest_Data)(nil),
 		(*WriteChunkRequest_Trailer)(nil),
@@ -1372,8 +1827,8 @@ func file_objectstore_v1_objectstore_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_objectstore_v1_objectstore_proto_rawDesc), len(file_objectstore_v1_objectstore_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   19,
+			NumEnums:      4,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

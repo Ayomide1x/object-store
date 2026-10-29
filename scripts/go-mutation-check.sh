@@ -29,6 +29,13 @@ expected_test() {
     c1-client-quorum-of-one) echo "TestWriteChunkQuorum" ;;
     c2-no-write-deadline) echo "TestWriteChunkQuorum" ;;
     c3-no-skip-after-failure) echo "TestFailedNodeSkippedForRestOfUpload" ;;
+    d1-no-reset-on-failover) echo "TestFailoverClassification/stream_breaks_mid-chunk" ;;
+    d2-report-on-unavailable) echo "TestFailoverClassification/unavailable" ;;
+    d3-no-read-deadline) echo "TestFailoverClassification/hung_past_the_deadline" ;;
+    d4-no-demotion) echo "TestHungReplicaDemotedForRestOfGet" ;;
+    d5-fail-over-on-invalid-argument) echo "TestInvalidArgumentDoesNotFailOver" ;;
+    d6-unlisted-code-reported) echo "TestFailoverClassification/internal_(unlisted_code)" ;;
+    n10-verify-ignores-expected-hash) echo "TestVerifyChunk/stored_hash_differs_from_expected" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }
@@ -81,7 +88,12 @@ for patch in scripts/mutations/go/*.patch; do
   while IFS= read -r f; do
     if [[ -n "$f" ]]; then echo "    FAILED $f"; fi
   done <<<"$failed"
-  if grep -qx "$target\(/.*\)\{0,1\}" <<<"$failed"; then
+  # The target test, or any of its subtests, must have failed.
+  hit=no
+  while IFS= read -r f; do
+    if [[ "$f" == "$target" || "$f" == "$target/"* ]]; then hit=yes; fi
+  done <<<"$failed"
+  if [[ "$hit" == yes ]]; then
     echo "    DETECTED by $target"
   else
     echo "    NOT DETECTED: expected $target to fail"

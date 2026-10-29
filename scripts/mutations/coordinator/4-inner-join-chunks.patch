@@ -1,11 +1,11 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
-@@ -174,7 +174,7 @@
+@@ -249,7 +249,7 @@
                         n.node_id, n.internal_addr, n.client_addr
                  FROM keys k
                  JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'
 -                LEFT JOIN chunks c ON c.object_id = o.object_id
 +                JOIN chunks c ON c.object_id = o.object_id
-                 LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
+                 LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.state = 'HEALTHY'
                  LEFT JOIN nodes n ON n.node_id = r.node_id
                  WHERE k.key = :key

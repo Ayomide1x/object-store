@@ -19,7 +19,7 @@ const defaultChunkWriteTimeout = 10 * time.Second
 // only each chunk's SHA-256. Chunks go one after another; each replica reads
 // its own view of the file, one frame at a time, hashing as it streams.
 func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) error {
-	timeout, err := chunkWriteTimeout()
+	timeout, err := durationEnv("OSCTL_CHUNK_WRITE_TIMEOUT", defaultChunkWriteTimeout)
 	if err != nil {
 		return err
 	}
@@ -89,16 +89,15 @@ func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) err
 	return nil
 }
 
-// chunkWriteTimeout reads OSCTL_CHUNK_WRITE_TIMEOUT, a Go duration such as
-// "10s", which bounds each replica write.
-func chunkWriteTimeout() (time.Duration, error) {
-	v := os.Getenv("OSCTL_CHUNK_WRITE_TIMEOUT")
+// durationEnv reads a positive Go duration such as "10s" from env, or returns def.
+func durationEnv(env string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(env)
 	if v == "" {
-		return defaultChunkWriteTimeout, nil
+		return def, nil
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
-		return 0, fmt.Errorf("OSCTL_CHUNK_WRITE_TIMEOUT must be a positive duration such as 10s, got %q", v)
+		return 0, fmt.Errorf("%s must be a positive duration such as 10s, got %q", env, v)
 	}
 	return d, nil
 }

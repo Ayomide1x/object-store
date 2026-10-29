@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -269,7 +269,7 @@
+         if (obj.isPresent()) {
+             List<UUID> unreadable = obj.get().chunks().stream()
+                     .filter(c -> c.replicas().isEmpty()).map(StoredObject.Chunk::chunkId).toList();
+-            if (!unreadable.isEmpty()) {
++            if (false && !unreadable.isEmpty()) {
+                 Map<UUID, List<String>> reasons = repository.badReplicaReasons(unreadable);
+                 List<String> parts = new ArrayList<>();
+                 for (StoredObject.Chunk c : obj.get().chunks()) {

@@ -12,7 +12,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
-report=coordinator/build/test-results/test/TEST-io.github.ayomide1x.objectstore.coordinator.MetadataServiceCompleteUploadIT.xml
+reports=coordinator/build/test-results/test
 
 # The test that must fail under each mutation. (A case statement rather than an
 # associative array keeps this working on macOS's bash 3.2.)
@@ -29,6 +29,10 @@ expected_test() {
     9-skip-hash-comparison) echo '"one with another hash"' ;;
     10-accept-wrong-node) echo "responseFromTheWrongNodeRecordsNothingForIt()" ;;
     11-no-retry-on-unavailable) echo "unavailableOnceIsRetriedAndTheReplicaCounts()" ;;
+    12-mark-bad-without-confirmation) echo "reportContradictedByTheNodeMarksNothing()" ;;
+    13-getobject-ignores-bad-state) echo "getObjectLeavesOutBadReplicas()" ;;
+    14-verify-accepts-wrong-node) echo "confirmationFromTheWrongNodeMarksNothing()" ;;
+    15-no-data-loss-without-healthy-replica) echo "getObjectFailsWithDataLossWhenAChunkHasNoHealthyReplica()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }
@@ -46,14 +50,18 @@ run_tests() {
   (cd coordinator && ./gradlew --no-daemon -q test --rerun-tasks >/dev/null 2>&1) || true
 }
 
-# Prints the test count on the first line, then one failed test name per line.
+# Prints the test count (over every test class) on the first line, then one
+# failed test name per line.
 summarize() {
-  python3 -I - "$report" <<'EOF'
-import sys, xml.etree.ElementTree as ET
-suite = ET.parse(sys.argv[1]).getroot()
-failed = [tc.get("name") for tc in suite.iter("testcase")
-          if tc.find("failure") is not None or tc.find("error") is not None]
-print(suite.get("tests"), *failed, sep="\n")
+  python3 -I - "$reports" <<'EOF'
+import glob, sys, xml.etree.ElementTree as ET
+total, failed = 0, []
+for path in sorted(glob.glob(sys.argv[1] + "/TEST-*.xml")):
+    suite = ET.parse(path).getroot()
+    total += int(suite.get("tests"))
+    failed += [tc.get("name") for tc in suite.iter("testcase")
+               if tc.find("failure") is not None or tc.find("error") is not None]
+print(total, *failed, sep="\n")
 EOF
 }
 

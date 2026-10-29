@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -12,11 +13,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+
+import com.google.protobuf.ByteString;
 
 import io.github.ayomide1x.objectstore.v1.ChunkStat;
 import io.github.ayomide1x.objectstore.v1.StatChunksRequest;
 import io.github.ayomide1x.objectstore.v1.StatChunksResponse;
 import io.github.ayomide1x.objectstore.v1.StorageNodeServiceGrpc;
+import io.github.ayomide1x.objectstore.v1.VerifyChunkRequest;
+import io.github.ayomide1x.objectstore.v1.VerifyChunkResponse;
 import io.grpc.Deadline;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -71,7 +77,8 @@ public class NodeClient implements DisposableBean {
                 StatChunksRequest req = StatChunksRequest.newBuilder()
                         .addAllChunkIds(e.getValue().stream().map(UUID::toString).toList())
                         .build();
-                calls.put(e.getKey(), pool.submit(() -> callWithRetry(e.getKey(), req, deadline)));
+                calls.put(e.getKey(), pool.submit(
+                        () -> callWithRetry(e.getKey(), deadline, "StatChunks", stub -> stub.statChunks(req))));
             }
             for (Map.Entry<Node, Future<StatChunksResponse>> call : calls.entrySet()) {
                 Node node = call.getKey();
@@ -105,9 +112,43 @@ public class NodeClient implements DisposableBean {
         return result;
     }
 
-    private StatChunksResponse callWithRetry(Node node, StatChunksRequest req, Deadline deadline) {
+    /**
+     * Asks one node to re-read and re-hash a chunk (VerifyChunk), within one
+     * node RPC deadline. Empty if the node doesn't answer, or if the answer
+     * comes from another node: either way nothing can be concluded.
+     */
+    public Optional<VerifyChunkResponse> verifyChunk(Node node, UUID chunkId, byte[] expectedSha256) {
+        Deadline deadline = Deadline.after(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        VerifyChunkRequest req = VerifyChunkRequest.newBuilder()
+                .setChunkId(chunkId.toString())
+                .setExpectedSha256(ByteString.copyFrom(expectedSha256))
+                .build();
+        VerifyChunkResponse answer;
         try {
-            return stub(node, deadline).statChunks(req);
+            answer = callWithRetry(node, deadline, "VerifyChunk", stub -> stub.verifyChunk(req));
+        } catch (StatusRuntimeException e) {
+            log.atWarn()
+                    .addKeyValue("chunk_id", chunkId)
+                    .addKeyValue("node_id", node.nodeId())
+                    .log("VerifyChunk failed; nothing can be concluded: {}", e.getStatus());
+            return Optional.empty();
+        }
+        if (!node.nodeId().equals(answer.getNodeId())) {
+            log.atError()
+                    .addKeyValue("chunk_id", chunkId)
+                    .addKeyValue("node_id", node.nodeId())
+                    .addKeyValue("responder_node_id", answer.getNodeId())
+                    .addKeyValue("addr", node.internalAddr())
+                    .log("VerifyChunk answered by the wrong node; treated as no answer");
+            return Optional.empty();
+        }
+        return Optional.of(answer);
+    }
+
+    private <T> T callWithRetry(Node node, Deadline deadline, String rpc,
+            Function<StorageNodeServiceGrpc.StorageNodeServiceBlockingStub, T> call) {
+        try {
+            return call.apply(stub(node, deadline));
         } catch (StatusRuntimeException e) {
             if (e.getStatus().getCode() != Status.Code.UNAVAILABLE || deadline.isExpired()) {
                 throw e;
@@ -117,9 +158,9 @@ public class NodeClient implements DisposableBean {
             log.atInfo()
                     .addKeyValue("node_id", node.nodeId())
                     .addKeyValue("addr", node.internalAddr())
-                    .log("StatChunks UNAVAILABLE; resetting channel and retrying once: {}", e.getStatus());
+                    .log("{} UNAVAILABLE; resetting channel and retrying once: {}", rpc, e.getStatus());
             resetChannel(node);
-            return stub(node, deadline).statChunks(req);
+            return call.apply(stub(node, deadline));
         }
     }
 

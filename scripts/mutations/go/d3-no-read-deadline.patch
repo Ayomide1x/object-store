@@ -1,0 +1,11 @@
+--- a/client/internal/download/download.go
++++ b/client/internal/download/download.go
+@@ -169,7 +169,7 @@
+ 
+ // readReplica reads c from one replica into the reset buffer and verifies it.
+ func (d *Downloader) readReplica(ctx context.Context, r Replica, c Chunk) ([]byte, error) {
+-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
++	ctx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 
+ 	conn, err := grpc.NewClient(r.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))

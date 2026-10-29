@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -250,7 +250,7 @@
+                 FROM keys k
+                 JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'
+                 LEFT JOIN chunks c ON c.object_id = o.object_id
+-                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.state = 'HEALTHY'
++                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
+                 LEFT JOIN nodes n ON n.node_id = r.node_id
+                 WHERE k.key = :key
+                 ORDER BY c.chunk_index, n.node_id
