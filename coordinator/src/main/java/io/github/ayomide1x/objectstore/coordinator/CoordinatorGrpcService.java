@@ -1,0 +1,119 @@
+package io.github.ayomide1x.objectstore.coordinator;
+
+import java.util.List;
+import java.util.UUID;
+import java.util.function.Supplier;
+
+import io.github.ayomide1x.objectstore.v1.ChunkInfo;
+import io.github.ayomide1x.objectstore.v1.ChunkPlacement;
+import io.github.ayomide1x.objectstore.v1.CompleteUploadRequest;
+import io.github.ayomide1x.objectstore.v1.CompleteUploadResponse;
+import io.github.ayomide1x.objectstore.v1.CoordinatorServiceGrpc;
+import io.github.ayomide1x.objectstore.v1.GetObjectRequest;
+import io.github.ayomide1x.objectstore.v1.GetObjectResponse;
+import io.github.ayomide1x.objectstore.v1.InitiateUploadRequest;
+import io.github.ayomide1x.objectstore.v1.InitiateUploadResponse;
+import io.github.ayomide1x.objectstore.v1.NodeLocation;
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+/**
+ * gRPC adapter for {@link MetadataService}. Any {@code BindableService} bean is
+ * registered with the gRPC server by Spring Boot.
+ */
+@Service
+public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorServiceImplBase {
+
+    private static final Logger log = LoggerFactory.getLogger(CoordinatorGrpcService.class);
+
+    private final MetadataService metadata;
+
+    public CoordinatorGrpcService(MetadataService metadata) {
+        this.metadata = metadata;
+    }
+
+    @Override
+    public void initiateUpload(InitiateUploadRequest request, StreamObserver<InitiateUploadResponse> response) {
+        respond(response, () -> {
+            MetadataService.Placement p = metadata.initiateUpload(request.getKey(), request.getSizeBytes());
+            log.atInfo()
+                    .addKeyValue("object_id", p.objectId())
+                    .addKeyValue("chunk_id", p.chunkId())
+                    .addKeyValue("node_id", p.nodes().getFirst().nodeId())
+                    .addKeyValue("key", request.getKey())
+                    .log("upload initiated");
+            return InitiateUploadResponse.newBuilder()
+                    .setObjectId(p.objectId().toString())
+                    .setChunk(ChunkPlacement.newBuilder()
+                            .setChunkId(p.chunkId().toString())
+                            .addAllNodes(p.nodes().stream().map(CoordinatorGrpcService::clientLocation).toList()))
+                    .build();
+        });
+    }
+
+    @Override
+    public void completeUpload(CompleteUploadRequest request, StreamObserver<CompleteUploadResponse> response) {
+        respond(response, () -> {
+            List<MetadataService.CompletedChunk> chunks = request.getChunksList().stream()
+                    .map(c -> new MetadataService.CompletedChunk(
+                            parseUuid("chunk_id", c.getChunkId()), c.getIndex(), c.getSizeBytes(),
+                            c.getAckedNodeIdsList()))
+                    .toList();
+            metadata.completeUpload(parseUuid("object_id", request.getObjectId()), request.getKey(),
+                    request.getSizeBytes(), chunks);
+            return CompleteUploadResponse.getDefaultInstance();
+        });
+    }
+
+    @Override
+    public void getObject(GetObjectRequest request, StreamObserver<GetObjectResponse> response) {
+        respond(response, () -> {
+            StoredObject obj = metadata.getObject(request.getKey())
+                    .orElseThrow(() -> new RequestException(Status.Code.NOT_FOUND,
+                            "key '%s' not found".formatted(request.getKey())));
+            GetObjectResponse.Builder b = GetObjectResponse.newBuilder()
+                    .setObjectId(obj.objectId().toString())
+                    .setSizeBytes(obj.sizeBytes());
+            for (StoredObject.Chunk c : obj.chunks()) {
+                b.addChunks(ChunkInfo.newBuilder()
+                        .setChunkId(c.chunkId().toString())
+                        .setIndex(c.index())
+                        .setSizeBytes(c.sizeBytes())
+                        .addAllReplicas(c.replicas().stream().map(CoordinatorGrpcService::clientLocation).toList()));
+            }
+            return b.build();
+        });
+    }
+
+    /** Runs a unary handler and translates exceptions into gRPC statuses. */
+    private static <T> void respond(StreamObserver<T> observer, Supplier<T> handler) {
+        T result;
+        try {
+            result = handler.get();
+        } catch (RequestException e) {
+            observer.onError(Status.fromCode(e.code()).withDescription(e.getMessage()).asRuntimeException());
+            return;
+        } catch (RuntimeException e) {
+            log.error("unhandled error", e);
+            observer.onError(Status.INTERNAL.withDescription("internal error").asRuntimeException());
+            return;
+        }
+        observer.onNext(result);
+        observer.onCompleted();
+    }
+
+    private static NodeLocation clientLocation(Node node) {
+        return NodeLocation.newBuilder().setNodeId(node.nodeId()).setAddress(node.clientAddr()).build();
+    }
+
+    private static UUID parseUuid(String field, String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            throw RequestException.invalid("%s '%s' is not a UUID".formatted(field, value));
+        }
+    }
+}

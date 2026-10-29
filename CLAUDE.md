@@ -8,7 +8,7 @@ The core design rule: **metadata plane and data plane are separate.** The coordi
 
 | Component | Language | Role |
 |---|---|---|
-| `coordinator/` | Java 21, Spring Boot, grpc-java | Metadata, placement, liveness, re-replication. PostgreSQL via Flyway-managed schema. |
+| `coordinator/` | Java 25, Spring Boot, grpc-java | Metadata, placement, liveness, re-replication. PostgreSQL via Flyway-managed schema. |
 | `node/` | Go | Stores chunk files on local disk, serves reads, replicates to peers, heartbeats to coordinator. |
 | `client/` | Go | CLI: `put`, `get`, `ls`, `rm`, `stat`. |
 | `proto/` | Protocol Buffers | Single schema. Generates Go code (node, client) and Java code (coordinator). |
@@ -30,10 +30,15 @@ Both languages are clients of each other: the coordinator calls nodes (replicati
 ```
 proto/objectstore/v1/   *.proto (the only source of truth for the wire format)
 coordinator/            Gradle project; generated Java from proto/
-node/                   Go module; cmd/node, internal/...
-client/                 Go module; cmd/osctl
+go.mod                  single Go module (github.com/Ayomide1x/object-store)
+gen/go/                 generated Go code from proto/ (committed)
+node/                   storage node; cmd/node, internal/...
+client/                 CLI; cmd/osctl
 scripts/                demo and chaos scripts
 docker-compose.yml
+buf.yaml
+buf.gen.yaml
+Makefile
 DECISIONS.md
 ```
 
@@ -50,6 +55,7 @@ DECISIONS.md
 - Constructor injection only.
 - Every schema change is a Flyway migration. Never edit an applied migration.
 - Metadata state transitions happen inside a single database transaction.
+- Coordinator integration tests use Testcontainers against a real Postgres.
 
 **Protobuf**
 - Package `objectstore.v1`.

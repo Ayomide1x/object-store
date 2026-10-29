@@ -1,0 +1,114 @@
+package io.github.ayomide1x.objectstore.coordinator;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Repository;
+
+/** Plain SQL over the metadata schema. Callers own transaction boundaries. */
+@Repository
+public class MetadataRepository {
+
+    private final JdbcClient jdbc;
+
+    public MetadataRepository(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    public void upsertNode(Node node) {
+        jdbc.sql("""
+                INSERT INTO nodes (node_id, internal_addr, client_addr)
+                VALUES (:nodeId, :internalAddr, :clientAddr)
+                ON CONFLICT (node_id) DO UPDATE
+                SET internal_addr = EXCLUDED.internal_addr, client_addr = EXCLUDED.client_addr
+                """)
+                .param("nodeId", node.nodeId())
+                .param("internalAddr", node.internalAddr())
+                .param("clientAddr", node.clientAddr())
+                .update();
+    }
+
+    public List<Node> listNodes() {
+        return jdbc.sql("SELECT node_id, internal_addr, client_addr FROM nodes ORDER BY node_id")
+                .query((rs, i) -> new Node(rs.getString("node_id"), rs.getString("internal_addr"),
+                        rs.getString("client_addr")))
+                .list();
+    }
+
+    public void insertObject(UUID objectId, String key, long sizeBytes) {
+        jdbc.sql("INSERT INTO objects (object_id, key, size_bytes) VALUES (:objectId, :key, :sizeBytes)")
+                .param("objectId", objectId)
+                .param("key", key)
+                .param("sizeBytes", sizeBytes)
+                .update();
+    }
+
+    public void insertChunk(UUID chunkId, UUID objectId, int index, long sizeBytes) {
+        jdbc.sql("""
+                INSERT INTO chunks (chunk_id, object_id, chunk_index, size_bytes)
+                VALUES (:chunkId, :objectId, :index, :sizeBytes)
+                """)
+                .param("chunkId", chunkId)
+                .param("objectId", objectId)
+                .param("index", index)
+                .param("sizeBytes", sizeBytes)
+                .update();
+    }
+
+    public void insertReplica(UUID chunkId, String nodeId) {
+        jdbc.sql("INSERT INTO chunk_replicas (chunk_id, node_id) VALUES (:chunkId, :nodeId)")
+                .param("chunkId", chunkId)
+                .param("nodeId", nodeId)
+                .update();
+    }
+
+    /**
+     * Loads an object, its chunks and their replicas in one statement, so the
+     * result is a single consistent snapshot.
+     */
+    public Optional<StoredObject> findObjectByKey(String key) {
+        record Row(UUID objectId, long objectSize, UUID chunkId, int chunkIndex, long chunkSize, Node node) {
+        }
+        List<Row> rows = jdbc.sql("""
+                SELECT o.object_id, o.size_bytes AS object_size,
+                       c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size,
+                       n.node_id, n.internal_addr, n.client_addr
+                FROM objects o
+                JOIN chunks c ON c.object_id = o.object_id
+                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
+                LEFT JOIN nodes n ON n.node_id = r.node_id
+                WHERE o.key = :key
+                ORDER BY c.chunk_index, n.node_id
+                """)
+                .param("key", key)
+                .query((rs, i) -> new Row(
+                        rs.getObject("object_id", UUID.class),
+                        rs.getLong("object_size"),
+                        rs.getObject("chunk_id", UUID.class),
+                        rs.getInt("chunk_index"),
+                        rs.getLong("chunk_size"),
+                        rs.getString("node_id") == null ? null
+                                : new Node(rs.getString("node_id"), rs.getString("internal_addr"),
+                                        rs.getString("client_addr"))))
+                .list();
+        if (rows.isEmpty()) {
+            return Optional.empty();
+        }
+
+        Map<UUID, StoredObject.Chunk> chunks = new LinkedHashMap<>();
+        for (Row row : rows) {
+            StoredObject.Chunk chunk = chunks.computeIfAbsent(row.chunkId(),
+                    id -> new StoredObject.Chunk(id, row.chunkIndex(), row.chunkSize(), new ArrayList<>()));
+            if (row.node() != null) {
+                chunk.replicas().add(row.node());
+            }
+        }
+        Row first = rows.getFirst();
+        return Optional.of(new StoredObject(first.objectId(), first.objectSize(), List.copyOf(chunks.values())));
+    }
+}

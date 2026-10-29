@@ -1,0 +1,76 @@
+// Command osctl is the object store CLI.
+//
+//	osctl put <file> <key>
+//	osctl get <key> <file>
+//
+// OSCTL_COORDINATOR sets the coordinator address (default 127.0.0.1:9090).
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const defaultCoordinator = "127.0.0.1:9090"
+
+const usage = `usage:
+  osctl put <file> <key>
+  osctl get <key> <file>`
+
+func main() {
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	if err := run(ctx, log, os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "osctl:", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, log *slog.Logger, args []string) error {
+	if len(args) == 0 {
+		return errors.New(usage)
+	}
+	coordAddr := os.Getenv("OSCTL_COORDINATOR")
+	if coordAddr == "" {
+		coordAddr = defaultCoordinator
+	}
+
+	switch args[0] {
+	case "put":
+		if len(args) != 3 {
+			return errors.New(usage)
+		}
+		return put(ctx, log, coordAddr, args[1], args[2])
+	case "get":
+		if len(args) != 3 {
+			return errors.New(usage)
+		}
+		return get(ctx, log, coordAddr, args[1], args[2])
+	default:
+		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
+	}
+}
+
+// dial opens a plaintext gRPC connection. Connections are lazy: errors show up
+// on the first RPC, not here.
+func dial(addr string) (*grpc.ClientConn, error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	return conn, nil
+}

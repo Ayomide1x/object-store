@@ -1,0 +1,14 @@
+# Defaults only. Deployment config comes from environment variables, which are
+# documented in docker-compose.yml.
+spring:
+  application:
+    name: coordinator
+  main:
+    web-application-type: none
+  grpc:
+    server:
+      port: 9090
+logging:
+  structured:
+    format:
+      console: logstash

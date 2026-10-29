@@ -1,1 +1,4 @@
 CLAUDE.local.md
+bin/
+coordinator/build/
+coordinator/.gradle/
