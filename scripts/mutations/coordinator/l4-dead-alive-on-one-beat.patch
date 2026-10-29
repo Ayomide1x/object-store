@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
+@@ -125,7 +125,7 @@
+             case DEAD -> {
+                 // Hysteresis: a flapping node does not bounce back into placement.
+                 life.recoveryCount = silence <= suspectAfter ? life.recoveryCount + 1 : 1;
+-                if (life.recoveryCount >= recoveryBeats) {
++                if (true) {
+                     life.state = State.ALIVE;
+                     life.recoveryCount = 0;
+                 }

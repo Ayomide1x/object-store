@@ -1,0 +1,10 @@
+--- a/node/internal/heartbeat/heartbeat.go
++++ b/node/internal/heartbeat/heartbeat.go
+@@ -87,7 +87,6 @@
+ 		select {
+ 		case <-ctx.Done():
+ 			t.Stop()
+-			return
+ 		case <-t.C:
+ 		}
+ 	}

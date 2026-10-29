@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
+@@ -105,7 +105,7 @@
+             }
+         }
+         if (life.conflicted) {
+-            if (life.lastSeenBy.size() > 1) {
++            if (false) {
+                 throw new RequestException(Status.Code.FAILED_PRECONDITION,
+                         "node %s is claimed by %d processes (instances %s); beats rejected until only one remains"
+                                 .formatted(nodeId, life.lastSeenBy.size(), life.lastSeenBy.keySet()));

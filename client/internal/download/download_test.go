@@ -339,3 +339,32 @@ func errorsUnwrapToStatus(err error) error {
 	}
 	return err
 }
+
+// A replica the coordinator lists as DEAD is read only after every live one,
+// even when it comes first in the coordinator's order; it is never dropped.
+func TestDeadReplicasAreReadLast(t *testing.T) {
+	data := []byte("liveness ordered")
+	nodes, replicas := startNodes(t, data, ok, ok, ok)
+	replicas[0].Liveness = objectstorev1.NodeLiveness_NODE_LIVENESS_DEAD
+	replicas[1].Liveness = objectstorev1.NodeLiveness_NODE_LIVENESS_SUSPECT
+	replicas[2].Liveness = objectstorev1.NodeLiveness_NODE_LIVENESS_ALIVE
+	d := newDownloader(Listed)
+	if _, err := d.ReadChunk(t.Context(), chunkOf(data, replicas)); err != nil {
+		t.Fatal(err)
+	}
+	if nodes[0].reads.Load() != 0 || nodes[1].reads.Load() != 0 || nodes[2].reads.Load() != 1 {
+		t.Errorf("reads = %d, %d, %d; want only the ALIVE replica read", nodes[0].reads.Load(), nodes[1].reads.Load(), nodes[2].reads.Load())
+	}
+
+	// With every live replica failing, the DEAD one is still tried.
+	nodes2, replicas2 := startNodes(t, data, ok, unavailable, unavailable)
+	replicas2[0].Liveness = objectstorev1.NodeLiveness_NODE_LIVENESS_DEAD
+	d2 := newDownloader(Listed)
+	got, err := d2.ReadChunk(t.Context(), chunkOf(data, replicas2))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("ReadChunk = %q, %v; want the data from the DEAD-listed replica", got, err)
+	}
+	if nodes2[0].reads.Load() != 1 {
+		t.Errorf("DEAD-listed replica read %d times, want 1 (last resort)", nodes2[0].reads.Load())
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ import (
 type Replica struct {
 	NodeID  string
 	Address string
+	// Liveness is the coordinator's view of the node when it listed the
+	// replica. It orders reads; it never removes a replica.
+	Liveness objectstorev1.NodeLiveness
 }
 
 // Chunk is one chunk to read, with its healthy replicas in the coordinator's order.
@@ -118,22 +122,31 @@ func classify(err error) verdict {
 	}
 }
 
+// rank orders replicas: ALIVE (or unreported) first, then SUSPECT and
+// UNKNOWN, then DEAD, then nodes that already failed during this get. A DEAD
+// replica is still tried, after every live one: liveness can be wrong.
+func (d *Downloader) rank(r Replica) int {
+	if d.demoted[r.NodeID] {
+		return 3
+	}
+	switch r.Liveness {
+	case objectstorev1.NodeLiveness_NODE_LIVENESS_SUSPECT, objectstorev1.NodeLiveness_NODE_LIVENESS_UNKNOWN:
+		return 1
+	case objectstorev1.NodeLiveness_NODE_LIVENESS_DEAD:
+		return 2
+	default: // ALIVE, or a coordinator that doesn't report liveness
+		return 0
+	}
+}
+
 // ReadChunk returns c's bytes, verified against c.SHA256, from the first
 // replica that serves them. Each attempt reads into a reset buffer with a
 // fresh hasher, so bytes from a replica that failed part-way never reach the
 // result.
 func (d *Downloader) ReadChunk(ctx context.Context, c Chunk) ([]byte, error) {
 	order := d.order(append([]Replica(nil), c.Replicas...))
-	// Demoted nodes go last, keeping their relative order.
-	var first, last []Replica
-	for _, r := range order {
-		if d.demoted[r.NodeID] {
-			last = append(last, r)
-		} else {
-			first = append(first, r)
-		}
-	}
-	order = append(first, last...)
+	// Liveness and demotion first; the shuffle (or listed order) within each rank.
+	slices.SortStableFunc(order, func(a, b Replica) int { return d.rank(a) - d.rank(b) })
 	if len(order) == 0 {
 		return nil, fmt.Errorf("chunk %d (%s) has no healthy replicas", c.Index, c.ID)
 	}

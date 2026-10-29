@@ -44,6 +44,26 @@ public class MetadataRepository {
                 .update();
     }
 
+    /** Persisted liveness, for observability: written as UNKNOWN at coordinator startup. */
+    public void markAllNodesUnknown() {
+        jdbc.sql("UPDATE nodes SET state = 'UNKNOWN', state_changed_at = clock_timestamp()").update();
+    }
+
+    public void updateNodeState(String nodeId, String state) {
+        jdbc.sql("UPDATE nodes SET state = :state, state_changed_at = clock_timestamp() WHERE node_id = :id")
+                .param("state", state).param("id", nodeId).update();
+    }
+
+    public void recordHeartbeat(String nodeId, String instanceId) {
+        jdbc.sql("UPDATE nodes SET last_heartbeat_at = clock_timestamp(), instance_id = :inst WHERE node_id = :id")
+                .param("inst", instanceId).param("id", nodeId).update();
+    }
+
+    public void recordNodeInstance(String nodeId, String instanceId) {
+        jdbc.sql("UPDATE nodes SET instance_id = :inst WHERE node_id = :id")
+                .param("inst", instanceId).param("id", nodeId).update();
+    }
+
     public List<Node> listNodes() {
         return jdbc.sql("SELECT node_id, internal_addr, client_addr FROM nodes ORDER BY node_id")
                 .query((rs, i) -> new Node(rs.getString("node_id"), rs.getString("internal_addr"),

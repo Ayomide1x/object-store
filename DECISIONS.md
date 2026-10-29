@@ -587,3 +587,163 @@ The coordinator script now totals every JUnit report, because there are two test
 It then flips the bytes back, so every file on the volumes is valid again, and checks that the object now fails at `GetObject` with `DATA_LOSS`, because BAD is terminal. The flip and delete helpers live in `scripts/lib/volume.sh`, shared with `stage5-failover-check.sh`.
 **Because:** the criterion stays testable after the behaviour it was written against has changed.
 **Breaks if:** an object needs to stay readable after the script runs. It doesn't, by design.
+
+## Nodes push heartbeats; the node dials the coordinator with a fresh name lookup on every reconnect (stage 6)
+**Chose:** every node calls `CoordinatorService.Heartbeat(node_id, instance_id)`: once at startup, then every `NODE_HEARTBEAT_INTERVAL` (2 s) ±10 %. The coordinator records the receipt time on its own clock. The node dials `COORDINATOR_ADDR` through grpc-go's `passthrough` resolver, so every reconnect asks the OS resolver afresh (Go keeps no DNS cache): a coordinator restarted on a new IP costs at most one failed beat. gRPC's own reconnect backoff is capped at one interval (`heartbeat.Dial`). With grpc-go's default (base 1 s, growing to 120 s), a node would stay silent long after an outage ended, and go falsely DEAD. Measured: after a 2 s outage, the default delayed the first beat by 589 ms against a 200 ms bound; mutation H4.
+**Over:** pull (the coordinator probing each node). It needs a custom RPC that carries identity, since the standard gRPC health response has none; a scheduler in the coordinator; and it would add a second liveness signal on the coordinator→node path that stage 4 showed can go stale.
+**Because:** it's the plan's design, a dead node falls silent by itself, and the coordinator stays passive.
+**Breaks if:** a node can reach the coordinator but the coordinator can't reach the node (for example a stale `internal_addr`). The node is then ALIVE but unreachable. That's tolerated, because every coordinator→node call treats a failure as no answer (an under-count).
+
+## Membership stays COORDINATOR_NODES; heartbeats from unknown nodes are rejected (stage 6)
+**Amends:** "Node registry seeded from COORDINATOR_NODES at startup" (stage 1). Its expectation that stage 6 would replace seeding with heartbeat registration is deliberately not followed.
+**Chose:** heartbeats update liveness only, never membership or addresses. A beat from a `node_id` not in `COORDINATOR_NODES` → `NOT_FOUND` ("node9 is not in COORDINATOR_NODES"), and nothing is recorded. The node logs it and keeps beating, so fixing the config lets it in without a restart. Mutation L3.
+**Over:** nodes registering themselves.
+**Because:** a misconfigured process would add itself as a placement target, nodes would need to know their own client-facing address, and adding nodes and rebalancing are out of scope.
+**Breaks if:** membership must change at runtime. That means a config change and a coordinator restart.
+
+## A per-process instance_id; a replaced instance that beats again means a conflict (stage 6)
+**Chose:** each node process sends a random `instance_id`.
+- A new instance is treated as a **restart** and accepted at once, even within seconds of the old one: `docker compose restart` must not look like a conflict.
+- If an instance that was **replaced** beats again, two processes claim the node. Every beat for that node (from any instance) gets `FAILED_PRECONDITION` until only one instance has beaten for `DEAD_AFTER`. Rejected beats aren't signs of life, so the node goes SUSPECT, then DEAD, then recovers normally once one instance is left.
+
+Mutation L7.
+**Over:** treating any new instance as a conflict while the old one is recent (a fast restart would be refused for 15 s); accepting both instances (placement could reach the wrong process, so metadata could overstate).
+**Because:** the coordinator can't tell which process is the real node, so neither gets placed on.
+**Breaks if:** a restart reuses an instance ID. It can't: the ID is 128 random bits per process.
+
+## The liveness state machine and its clock (stage 6)
+**Chose:**
+- UNKNOWN →(first beat)→ ALIVE;
+- ALIVE →(6 s of silence)→ SUSPECT →(one beat)→ ALIVE;
+- ALIVE or SUSPECT →(15 s of silence)→ DEAD;
+- UNKNOWN →(no beat for 15 s since coordinator start)→ DEAD.
+
+All of it is configurable: `COORDINATOR_SUSPECT_AFTER`, `COORDINATOR_DEAD_AFTER`, `COORDINATOR_RECOVERY_BEATS`, and a 1 s `COORDINATOR_LIVENESS_SWEEP` that applies timeouts and persists transitions. Startup requires 0 < SUSPECT < DEAD. **The clock is the coordinator's own monotonic `System.nanoTime()` at receipt, behind an injectable `Ticker`.** Heartbeats carry no timestamp. Measured with the Compose defaults: node2 was SUSPECT 5.3 s and DEAD 14.4 s after `docker compose stop`. Mutation L1.
+**Over:** node-supplied timestamps (clock skew would decide liveness); phi-accrual failure detection (more than four nodes on a LAN need).
+**Because:** the coordinator is the only judge, and only its own elapsed time can be trusted.
+**Breaks if:** the coordinator itself stalls (for example a long GC pause). Beats arrive late, and nodes look silent.
+
+## Hysteresis: SUSPECT recovers on one beat, DEAD on two consecutive beats (stage 6)
+**Chose:** from SUSPECT, one beat → ALIVE. From DEAD, `COORDINATOR_RECOVERY_BEATS` (2) beats are needed, each within `SUSPECT_AFTER` of the previous; a longer gap starts the count again. With the defaults, a restarted node is ALIVE about one interval after its first beat. Mutation L4.
+**Over:** a single beat to leave DEAD (a node that flickers on would be placed, fail, and be placed again).
+**Because:** SUSPECT means "maybe slow", which one beat disproves. DEAD means "gone", which needs a little more evidence.
+**Breaks if:** heartbeats are lossy enough that two in a row rarely arrive within 6 s. The node then never recovers, which would mean the threshold is wrong.
+
+## UNKNOWN after a coordinator restart; never DEAD before a full window (stage 6)
+**Chose:** in-memory liveness is empty after a restart. Every node starts **UNKNOWN**, and startup persists that. UNKNOWN becomes ALIVE on its first beat (no hysteresis: there's no DEAD history to distrust), and DEAD only after `DEAD_AFTER` with no beat since the coordinator started. Placement treats UNKNOWN as not ALIVE, so initiates can fail with `UNAVAILABLE` for up to about one interval after a restart. Measured: no node was DEAD at any 0.5 s sample over the 15 s after a coordinator restart, and all four were ALIVE 2.9 s after it was serving. Mutation L5.
+**Over:** starting every node ALIVE (placement could pick a dead node for the first 15 s); trusting the persisted pre-restart state (stale by definition, and invariant 7 says it's rebuilt from heartbeats).
+**Because:** a restart must never declare a node DEAD, and must never place on a node it hasn't heard from.
+**Breaks if:** clients can't tolerate a few seconds of `UNAVAILABLE` after a coordinator restart.
+
+## Liveness lives in memory and is persisted for observability and stage 7; what stage 7 can rely on (stage 6)
+**Chose:** the in-memory `LivenessTracker` is authoritative. Migration V5 adds `nodes.state`, `state_changed_at`, `last_heartbeat_at` and `instance_id`. They're written on every transition (`last_heartbeat_at` at most every 10 s per node), with `clock_timestamp()`. They're wall-clock values for people and scripts only, and never drive transitions.
+
+Stage 7 can rely on:
+- the tracker's current state per node;
+- "DEAD since", measured by this coordinator's monotonic clock;
+- after a coordinator restart, "DEAD since" restarting from zero: a node can only be DEAD again after a full window, which delays repair, never hastens it;
+- never acting on UNKNOWN;
+- DEAD meaning "no heartbeat reached this coordinator for `DEAD_AFTER`", not "the data is gone".
+
+**Over:** persisting every beat (2 writes per second for no reader); Postgres as the liveness authority (invariant 7: in-memory state rebuilt from heartbeats).
+**Because:** decisions stay on monotonic time, and the facts stay inspectable.
+**Breaks if:** something reads `nodes.state` as authoritative. It can lag the tracker by up to one sweep (about 1 s).
+
+## Placement uses only ALIVE nodes; with 2 ALIVE, 2 replicas; with fewer, UNAVAILABLE (stage 6)
+**Supersedes:** "Placement: rotation of 3 of the 4 nodes from a random start per object; stopped nodes are still placed until stage 6" (stage 4).
+**Chose:** rotation as before, but over **ALIVE** nodes only, sorted by `node_id`.
+
+| ALIVE nodes | Placement |
+|---|---|
+| 3 or more | 3 replicas per chunk |
+| exactly 2 | 2 replicas on those 2 (quorum reachable; warn log; stage 7 tops up) |
+| fewer than 2 | `UNAVAILABLE`: "N of M storage nodes alive, need 2" |
+
+A 0-byte object places nothing, so it still commits with no node alive. Mutation L2.
+**Over:** refusing uploads when only 2 nodes are ALIVE (trades availability for a durability gap stage 7 closes); placing on SUSPECT or UNKNOWN nodes (writes would aim at nodes likely to fail).
+**Because:** writes go where they can succeed, and with 2 nodes the commit quorum is still met.
+**Breaks if:** many objects are written while only 2 nodes are ALIVE. They're under-replicated until stage 7 catches up.
+
+## CompleteUpload skips DEAD nodes when asking StatChunks (stage 6)
+**Amends:** "The coordinator verifies replicas by asking the placed nodes at CompleteUpload; the client's ack list is ignored" (stage 4).
+**Chose:** `StatChunks` goes to every placed node that isn't DEAD, which includes SUSPECT and UNKNOWN ones. A DEAD node is skipped, and its reason reads "DEAD, not asked". Mutation L6.
+**Over:** asking only ALIVE nodes (a brief SUSPECT blip would refuse a commit that should succeed); asking DEAD nodes too (a hung DEAD node costs the full 2 s deadline on every commit).
+**Because:** a briefly SUSPECT node usually still holds its chunks. A DEAD one is either stopped (the call would fail fast) or hung.
+**Breaks if:** a node is DEAD by heartbeat but serving and holding the chunk. Its replica isn't recorded: an under-count, which invariant 3 allows.
+
+## GetObject reports each replica's liveness; the client reads by liveness first and never drops a replica (stage 6)
+**Amends:** "Reads shuffle each chunk's replicas; OSCTL_READ_ORDER=listed for deterministic reads" and "Per-replica read deadline; demotion for the rest of the get" (stage 5). The latter's "until stage 6 stops directing reads there" is done here.
+**Chose:** `NodeLocation.liveness = 3` is set on every replica. The client groups a chunk's replicas:
+1. ALIVE (or unreported);
+2. SUSPECT and UNKNOWN;
+3. DEAD;
+4. nodes already demoted in this get.
+
+Within each group it shuffles, or keeps the listed order. A DEAD replica is read only after every live one fails, never skipped. Measured: with node2 DEAD and first in listed order for a chunk, a get took 0.19 s against a 0.15 s baseline, with no failover. Mutation R1.
+**Over:** the coordinator just listing non-ALIVE replicas last (the client's shuffle would scramble that); dropping non-ALIVE replicas (liveness can be wrong).
+**Because:** read policy stays in one place, the client, and acts on facts the coordinator supplies.
+**Breaks if:** liveness is systematically wrong (for example nodes that can't reach the coordinator but serve clients fine). Reads would then avoid healthy replicas until they're the only ones left.
+
+## The node's heartbeat loop: fixed interval with jitter, a per-beat timeout, no backoff, clean shutdown (stage 6)
+**Chose:** `node/internal/heartbeat.Run` runs in its own goroutine and never touches the serving path.
+- It beats immediately at startup, then every interval ±10 %.
+- Each beat has a timeout of one interval, so at most one is in flight.
+- When the coordinator is down, it keeps the **same interval with no exponential backoff**, and gRPC's reconnect backoff is capped to match. Failures are logged at the first one, then at most every 30 s, plus once on recovery.
+- On SIGTERM, `main` cancels the loop, waits for it (at most one beat's timeout), then calls `GracefulStop`.
+
+Tests use a fake coordinator: immediate first beat, the interval, surviving a 2 s outage, a hung coordinator (one beat in flight), rejections, and prompt shutdown. Mutations H1, H2, H3, H4.
+**Over:** exponential backoff (a node in a long backoff when the coordinator returns would sit UNKNOWN, then could go DEAD for no reason); a final "going away" beat that marks the node DEAD at once (a clean stop and a crash should take the same path through the state machine).
+**Because:** a beat is cheap, and the coordinator needs beats promptly when it comes back.
+**Breaks if:** many nodes beat a struggling coordinator. Then there's no backoff to shed load. Four nodes at 0.5 beats per second each is nothing.
+
+## `up --wait` means the coordinator is serving; ready for uploads means wait_alive (stage 6)
+**Amends:** "Coordinator readiness: in-container /dev/tcp healthcheck; `up --wait` is the only wait" (stage 2), and "Node readiness through a `health` subcommand and the gRPC health service" (stage 4).
+**Chose:** healthchecks stay local. The coordinator is healthy when its gRPC server listens; a node is healthy when its own health service is SERVING. **Neither depends on liveness.** "Ready for uploads" is a separate condition: enough ALIVE nodes. `scripts/lib/liveness.sh` provides `wait_alive N [NODE…]` (at least N ALIVE, or every named node ALIVE) and `wait_state NODE STATE TIMEOUT`. Both poll the persisted `nodes.state`, time out (30 s by default), and print the last states seen.
+
+Every script that starts services, a node or the coordinator and then puts calls it before the put:
+- **the start of every acceptance script:** stage 2 round-trip and overwrite, stage 3 corrupt, crash and fsync-trace, stage 4, stage 5 and stage 6;
+- **stage 4:** after restarting node2 (step 2), unpausing node3 (step 3), each step 4 cycle, and in step 6, where "put immediately" now means right after `wait_alive 4`;
+- **stage 3 crash-check:** after restarting node1;
+- **stage 5:** after restarting (step 3) and unpausing (step 4) the first replica's node;
+- **stage 6:** throughout.
+
+**Over:** making the coordinator's healthcheck depend on liveness (it would turn unhealthy whenever nodes are stopped on purpose, which several scripts do, and `up --wait` would then fail).
+**Because:** "the process is serving" and "the cluster can take an upload" are different facts, and Compose can only wait on the first.
+**Breaks if:** a script calls `wait_alive` before defining `$compose`. `liveness.sh` then reports that loudly; that bug showed up during stage 6 verification and is fixed.
+
+## Scripts are deterministic again under liveness (stage 6)
+**Amends:** "Stage 4 acceptance criteria corrected" (stage 4), the stage 4 acceptance-script entry, and "stage3-corrupt-check corrupts every replica; shared volume helpers" (stage 5). CLAUDE.md's stage 4 criteria remain true under liveness; only which branch each step exercises has changed.
+**Chose:** each step either waits for a known state, or checks a precondition that shows which side of detection it landed on.
+- **`stage4-replication-check.sh`:**
+  - *Step 2:* waits for node2 DEAD. It's never placed, and every chunk gets 3 replicas from the live nodes.
+  - *Step 3:* pauses and puts at once, and requires node3 to be in the placement (otherwise "inconclusive, rerun"), keeping the write-deadline path tested.
+  - *Step 4:* classifies each attempt by placement width (3 before detection, 2 after) and runs up to 3 stop/restart cycles until both branches and the 3-chunk failure are seen before detection. After detection, a 3-chunk object must succeed with exactly node1 and node2 on every chunk.
+  - *Step 5:* waits for three DEAD, then expects `UNAVAILABLE` at initiate.
+  - *Step 6:* waits for ALIVE after `up --wait`.
+- **`stage5-failover-check.sh` steps 3–4:** right before the get, the stopped or paused node's persisted state must still be ALIVE, otherwise the step fails as "inconclusive, rerun". The get must then log a failover from that node. A pass always means failover was really exercised; liveness-ordered reads are covered by `stage6-liveness-check.sh` and `TestDeadReplicasAreReadLast`. Accepting either path was rejected, because a pass could skip the failover the step exists to test.
+
+**Over:** shortening the coordinator's thresholds for scripts (it would no longer test the shipped configuration); letting steps race detection unchecked (flaky).
+**Because:** a check that sometimes tests something else is worse than none.
+**Breaks if:** detection is much faster than an initiate. A SUSPECT threshold below 1 s would shrink step 3's window, and its precondition would then fail loudly rather than pass wrongly.
+
+## Mutation scripts extended for stage 6 (stage 6)
+**Extends:** "Mutation scripts extended for stage 5" (stage 5).
+**Chose:**
+- **Coordinator:**
+  - L1 no SUSPECT/DEAD transition;
+  - L2 placement includes non-ALIVE nodes;
+  - L3 a beat from an unknown node is accepted;
+  - L4 one beat brings a DEAD node back;
+  - L5 UNKNOWN goes DEAD before a full window;
+  - L6 `CompleteUpload` asks DEAD nodes;
+  - L7 a conflicting instance is accepted.
+- **Go:**
+  - H1 no per-beat timeout;
+  - H2 the loop exits on error;
+  - H3 the loop ignores cancellation;
+  - H4 gRPC's default reconnect backoff;
+  - R1 the read order ignores liveness.
+
+The heartbeat test's cleanup waits for `Run` with a bound, so H3 fails the test instead of hanging the run.
+**Because:** each liveness rule is shown to be load-bearing.
+**Breaks if:** code edits stop patches from applying. The scripts fail at `git apply --check`.

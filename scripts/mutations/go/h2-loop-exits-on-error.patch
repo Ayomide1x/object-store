@@ -1,0 +1,12 @@
+--- a/node/internal/heartbeat/heartbeat.go
++++ b/node/internal/heartbeat/heartbeat.go
+@@ -71,6 +71,9 @@
+ 	var lastFailureLog time.Time
+ 	for {
+ 		err := beat(ctx, cfg)
++		if err != nil {
++			return
++		}
+ 		switch {
+ 		case err == nil && failing:
+ 			log.Info("heartbeats reaching the coordinator again")

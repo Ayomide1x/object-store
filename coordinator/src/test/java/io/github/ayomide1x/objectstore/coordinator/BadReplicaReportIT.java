@@ -44,6 +44,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 @SpringBootTest(properties = {
         "spring.grpc.server.port=0",
         "coordinator.node-rpc-timeout=500ms",
+        "coordinator.liveness-sweep=0",
 })
 class BadReplicaReportIT {
 
@@ -61,18 +62,24 @@ class BadReplicaReportIT {
     private final MetadataService metadata;
     private final ReplicaHealthService health;
     private final JdbcClient jdbc;
+    private final LivenessService liveness;
 
     @Autowired
-    BadReplicaReportIT(MetadataService metadata, ReplicaHealthService health, JdbcClient jdbc) {
+    BadReplicaReportIT(MetadataService metadata, ReplicaHealthService health, JdbcClient jdbc,
+            LivenessService liveness) {
         this.metadata = metadata;
         this.health = health;
         this.jdbc = jdbc;
+        this.liveness = liveness;
     }
 
     @BeforeEach
     void clear() {
         jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
         nodes.reset();
+        for (String n : List.of("node1", "node2", "node3", "node4")) {
+            liveness.heartbeat(n, "test-instance");
+        }
     }
 
     @AfterEach

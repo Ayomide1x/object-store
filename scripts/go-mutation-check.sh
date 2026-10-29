@@ -36,6 +36,11 @@ expected_test() {
     d5-fail-over-on-invalid-argument) echo "TestInvalidArgumentDoesNotFailOver" ;;
     d6-unlisted-code-reported) echo "TestFailoverClassification/internal_(unlisted_code)" ;;
     n10-verify-ignores-expected-hash) echo "TestVerifyChunk/stored_hash_differs_from_expected" ;;
+    h1-no-per-beat-timeout) echo "TestAHungCoordinatorCostsOneBeatAtATime" ;;
+    h2-loop-exits-on-error) echo "TestSurvivesTheCoordinatorBeingDown" ;;
+    h3-ignores-cancellation) echo "TestStopsPromptlyOnCancellation" ;;
+    h4-default-reconnect-backoff) echo "TestSurvivesTheCoordinatorBeingDown" ;;
+    r1-read-order-ignores-liveness) echo "TestDeadReplicasAreReadLast" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

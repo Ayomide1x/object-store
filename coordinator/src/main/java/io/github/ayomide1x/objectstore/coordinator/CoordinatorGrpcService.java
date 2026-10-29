@@ -13,6 +13,9 @@ import io.github.ayomide1x.objectstore.v1.GetObjectRequest;
 import io.github.ayomide1x.objectstore.v1.GetObjectResponse;
 import io.github.ayomide1x.objectstore.v1.InitiateUploadRequest;
 import io.github.ayomide1x.objectstore.v1.InitiateUploadResponse;
+import io.github.ayomide1x.objectstore.v1.HeartbeatRequest;
+import io.github.ayomide1x.objectstore.v1.HeartbeatResponse;
+import io.github.ayomide1x.objectstore.v1.NodeLiveness;
 import io.github.ayomide1x.objectstore.v1.NodeLocation;
 import io.github.ayomide1x.objectstore.v1.ReportBadReplicaRequest;
 import io.github.ayomide1x.objectstore.v1.ReportBadReplicaResponse;
@@ -34,10 +37,21 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
 
     private final MetadataService metadata;
     private final ReplicaHealthService replicaHealth;
+    private final LivenessService liveness;
 
-    public CoordinatorGrpcService(MetadataService metadata, ReplicaHealthService replicaHealth) {
+    public CoordinatorGrpcService(MetadataService metadata, ReplicaHealthService replicaHealth,
+            LivenessService liveness) {
         this.metadata = metadata;
         this.replicaHealth = replicaHealth;
+        this.liveness = liveness;
+    }
+
+    @Override
+    public void heartbeat(HeartbeatRequest request, StreamObserver<HeartbeatResponse> response) {
+        respond(response, () -> {
+            LivenessTracker.State state = liveness.heartbeat(request.getNodeId(), request.getInstanceId());
+            return HeartbeatResponse.newBuilder().setLiveness(toProto(state)).build();
+        });
     }
 
     @Override
@@ -57,7 +71,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                         .setChunkId(c.chunkId().toString())
                         .setIndex(c.index())
                         .setSizeBytes(c.sizeBytes())
-                        .addAllNodes(c.nodes().stream().map(CoordinatorGrpcService::clientLocation).toList()));
+                        .addAllNodes(c.nodes().stream().map(this::clientLocation).toList()));
             }
             return b.build();
         });
@@ -92,7 +106,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                         .setIndex(c.index())
                         .setSizeBytes(c.sizeBytes())
                         .setSha256(ByteString.copyFrom(c.sha256()))
-                        .addAllReplicas(c.replicas().stream().map(CoordinatorGrpcService::clientLocation).toList()));
+                        .addAllReplicas(c.replicas().stream().map(this::clientLocation).toList()));
             }
             return b.build();
         });
@@ -128,8 +142,18 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
         observer.onCompleted();
     }
 
-    private static NodeLocation clientLocation(Node node) {
-        return NodeLocation.newBuilder().setNodeId(node.nodeId()).setAddress(node.clientAddr()).build();
+    private NodeLocation clientLocation(Node node) {
+        return NodeLocation.newBuilder().setNodeId(node.nodeId()).setAddress(node.clientAddr())
+                .setLiveness(toProto(liveness.stateOf(node.nodeId()))).build();
+    }
+
+    private static NodeLiveness toProto(LivenessTracker.State state) {
+        return switch (state) {
+            case ALIVE -> NodeLiveness.NODE_LIVENESS_ALIVE;
+            case SUSPECT -> NodeLiveness.NODE_LIVENESS_SUSPECT;
+            case DEAD -> NodeLiveness.NODE_LIVENESS_DEAD;
+            case UNKNOWN -> NodeLiveness.NODE_LIVENESS_UNKNOWN;
+        };
     }
 
     private static UUID parseUuid(String field, String value) {

@@ -25,15 +25,18 @@ import (
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 	"github.com/Ayomide1x/object-store/node/internal/chunkstore"
+	"github.com/Ayomide1x/object-store/node/internal/heartbeat"
 	"github.com/Ayomide1x/object-store/node/internal/server"
 )
 
 // config is read from environment variables, documented in docker-compose.yml.
 type config struct {
-	nodeID     string
-	listenAddr string
-	dataDir    string
-	maxReads   int
+	nodeID            string
+	listenAddr        string
+	dataDir           string
+	maxReads          int
+	coordinatorAddr   string
+	heartbeatInterval time.Duration
 }
 
 func main() {
@@ -96,11 +99,34 @@ func run(ctx context.Context, log *slog.Logger) error {
 		serveErr <- srv.Serve(lis)
 	}()
 
+	// Heartbeats run beside serving and never block it.
+	coordConn, err := heartbeat.Dial(cfg.coordinatorAddr, cfg.heartbeatInterval)
+	if err != nil {
+		srv.Stop()
+		return err
+	}
+	defer coordConn.Close()
+	hbCtx, stopHeartbeats := context.WithCancel(ctx)
+	defer stopHeartbeats()
+	hbDone := make(chan struct{})
+	instanceID := heartbeat.NewInstanceID()
+	log.Info("heartbeating", "coordinator", cfg.coordinatorAddr, "interval", cfg.heartbeatInterval, "instance_id", instanceID)
+	go func() {
+		defer close(hbDone)
+		heartbeat.Run(hbCtx, heartbeat.Config{
+			NodeID: cfg.nodeID, InstanceID: instanceID, Interval: cfg.heartbeatInterval,
+			Client: objectstorev1.NewCoordinatorServiceClient(coordConn), Log: log,
+		})
+	}()
+
 	select {
 	case err := <-serveErr:
+		stopHeartbeats()
+		<-hbDone
 		return fmt.Errorf("serve: %w", err)
 	case <-ctx.Done():
 		log.Info("shutting down")
+		<-hbDone // the loop returns within one beat's timeout
 		srv.GracefulStop()
 		return nil
 	}
@@ -148,6 +174,18 @@ func loadConfig() (config, error) {
 	}
 	if cfg.dataDir == "" {
 		return config{}, fmt.Errorf("NODE_DATA_DIR is required")
+	}
+	cfg.coordinatorAddr = os.Getenv("COORDINATOR_ADDR")
+	if cfg.coordinatorAddr == "" {
+		return config{}, fmt.Errorf("COORDINATOR_ADDR is required")
+	}
+	cfg.heartbeatInterval = 2 * time.Second
+	if v := os.Getenv("NODE_HEARTBEAT_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return config{}, fmt.Errorf("NODE_HEARTBEAT_INTERVAL must be a positive duration such as 2s, got %q", v)
+		}
+		cfg.heartbeatInterval = d
 	}
 	cfg.maxReads = 32
 	if v := os.Getenv("NODE_MAX_CONCURRENT_READS"); v != "" {

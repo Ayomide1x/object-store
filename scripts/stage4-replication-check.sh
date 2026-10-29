@@ -5,28 +5,34 @@
 #   1. All 4 up: every chunk has 3 replica rows equal to its placed nodes, and
 #      each replica file passes the header, chunk-ID and SHA-256 check on its
 #      own node's volume.
-#   2. One stopped: the upload succeeds; each chunk records exactly its placed
-#      nodes minus the stopped one.
-#   3. One paused (hung): the upload finishes within the write deadline plus
-#      normal time, nothing is recorded on the paused node, and after unpause
-#      the node has no file or temp for those chunks.
-#   4. Two stopped. Each outcome must match the per-chunk rule computed from
-#      chunk_placements (success exactly when every chunk has >= 2 live placed
-#      nodes), and the recorded replicas must match it too. 1-chunk objects are
-#      put in a loop, up to 12 attempts, until both a predicted success and a
-#      predicted failure have been seen; either branch still unseen fails the
-#      script. A random start makes each attempt about 50/50, so 12 attempts all
-#      on one branch has a probability of about 1 in 2,000. Then a 3-chunk
-#      object: with rotation placement, 3 or more consecutive chunks always
-#      include one placed on both stopped nodes, so it must fail.
-#   5. Three stopped: a clean failure. Nothing COMMITTED; the overwritten key
-#      still resolves to its previous version, and a new key to nothing.
+#   2. One stopped: once the coordinator sees it DEAD (stage 6), it is never
+#      placed; every chunk gets 3 replicas from the 3 live nodes, which is still
+#      "placed nodes minus the stopped one".
+#   3. One paused (hung), put at once, before the coordinator can notice
+#      (SUSPECT takes 6 s of silence): the paused node is placed, and the upload
+#      finishes within the write deadline plus normal time with nothing
+#      recorded on it. Precondition checked: the paused node was placed.
+#   4. Two stopped, put at once, before detection. Each outcome must match the
+#      per-chunk rule computed from chunk_placements (success exactly when every
+#      chunk has >= 2 live placed nodes), and the recorded replicas must match.
+#      Placement width tells which side of detection an attempt landed on: 3
+#      nodes before, exactly the 2 ALIVE ones after. 1-chunk objects are put
+#      until a predicted success and a predicted failure are both seen before
+#      detection; a 3-chunk object placed before detection must fail (rotation
+#      always puts one of its chunks on both stopped nodes). If detection comes
+#      first, both nodes are restarted, brought back ALIVE, and stopped again,
+#      up to 3 cycles. After detection (both DEAD): a 3-chunk object succeeds
+#      with exactly 2 replicas per chunk on the 2 ALIVE nodes.
+#   5. Three stopped and DEAD: initiate fails with UNAVAILABLE. Nothing new
+#      is created; the overwritten key still resolves to its previous version,
+#      and a new key to nothing.
 #   6. Regression smoke test: stop three nodes, bring everything back with
-#      `up -d --wait`, then put immediately. It must succeed. Restarting can
-#      reassign the nodes' IPs; before the fix, the coordinator kept calling
-#      the old addresses and refused commits. The swap doesn't happen every
-#      run, so this is a smoke test; the deterministic proof is the coordinator
-#      tests for wrong-node responses and UNAVAILABLE retry.
+#      `up -d --wait`, wait for 4 ALIVE, then put at once. It must succeed.
+#      Restarting can reassign the nodes' IPs; before the stage 4 fix, the
+#      coordinator kept calling the old addresses and refused commits. The swap
+#      doesn't happen every run, so this is a smoke test; the deterministic
+#      proof is the coordinator tests for wrong-node responses and UNAVAILABLE
+#      retry.
 #
 # Node volumes are read from a throwaway alpine container with --volumes-from,
 # because the node image is distroless.
@@ -39,6 +45,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
 source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
+source "$root/scripts/lib/liveness.sh"
+# up --wait means the coordinator is serving; uploads need ALIVE nodes.
+wait_alive 4
 work="$(mktemp -d)"
 run="$$"
 deadline=10
@@ -122,33 +131,48 @@ verify_files "$obj1" && ok "every replica file verifies on its own node's volume
 osctl_run get "replication/all-up-$run" "$work/v1.out" && cmp -s "$work/v1" "$work/v1.out" \
   && ok "get IDENTICAL" || fail "get did not round-trip"
 
+# placement_width OBJECT_ID: how many nodes chunk 0 was placed on (3 before
+# the coordinator detects stopped nodes, the number of ALIVE nodes after).
+placement_width() { sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$1' AND c.chunk_index = 0"; }
+placed_on() { sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$1' AND p.node_id = '$2'"; }
+
 echo
-echo "2. node2 stopped"
+echo "2. node2 stopped and DEAD"
 "${compose[@]}" stop node2 >/dev/null 2>&1
+wait_state node2 DEAD 30 || fail "node2 never reached DEAD"
 mkfile_mib v2 10
 if "$osctl" put "$work/v2" "replication/one-stopped-$run" 2>"$work/put2.err"; then
   ok "upload succeeded"
   obj2="$(latest_object "replication/one-stopped-$run")"
+  [[ "$(placed_on "$obj2" node2)" == 0 ]] && ok "nothing placed on the DEAD node" || fail "a chunk was placed on node2"
   check_replicas "$obj2" '{node2}' && ok "each chunk records its placed nodes minus node2" || fail "replicas wrong"
+  [[ "$(sql "SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = '$obj2'")" == 9 ]] \
+    && ok "3 replicas per chunk from the 3 live nodes" || fail "expected 9 replica rows"
   osctl_run get "replication/one-stopped-$run" "$work/v2.out" && cmp -s "$work/v2" "$work/v2.out" \
     && ok "get IDENTICAL with node2 down" || fail "get failed with node2 down"
 else
   fail "upload failed:"; grep -v ' level=INFO ' "$work/put2.err" | tail -5 | sed 's/^/    /'
 fi
 "${compose[@]}" up -d --wait node2 >/dev/null 2>&1
+wait_alive 1 node2 || fail "node2 not ALIVE after restart"
 
 echo
-echo "3. node3 paused (hung)"
+echo "3. node3 paused (hung), put before the coordinator notices"
 "${compose[@]}" pause node3 >/dev/null
 mkfile_mib v3 10
 t0="$(now)"
 if "$osctl" put "$work/v3" "replication/one-paused-$run" 2>"$work/put3.err"; then
   elapsed="$(python3 -c "print(round($(now) - $t0, 2))")"
+  obj3="$(latest_object "replication/one-paused-$run")"
+  if [[ "$(placed_on "$obj3" node3)" == 0 ]]; then
+    fail "precondition: node3 was not placed (detected before initiate?); inconclusive, rerun"
+  else
+    ok "precondition: node3 was placed on $(placed_on "$obj3" node3) chunks"
+  fi
   limit="$(python3 -c "print(round($deadline + $baseline + 5, 2))")"
   echo "   put took ${elapsed}s (limit ${limit}s = ${deadline}s deadline + ${baseline}s baseline + 5s)"
   python3 -c "import sys; sys.exit(0 if $elapsed < $limit else 1)" \
     && ok "finished within the deadline" || fail "took longer than the limit"
-  obj3="$(latest_object "replication/one-paused-$run")"
   check_replicas "$obj3" '{node3}' && ok "nothing recorded on node3" || fail "replicas wrong"
 else
   fail "upload failed:"; grep -v ' level=INFO ' "$work/put3.err" | tail -5 | sed 's/^/    /'
@@ -171,19 +195,26 @@ if [[ -z "$leftover" ]]; then
 else
   fail "node3 still has: $leftover"
 fi
+wait_alive 1 node3 || fail "node3 not ALIVE after unpause"
 
 echo
 echo "4. node3 and node4 stopped"
-"${compose[@]}" stop node3 node4 >/dev/null 2>&1
 
-# two_stopped_put NAME MIB: puts a new object with node3 and node4 stopped,
-# predicts the outcome from its placements, and checks the actual outcome and
-# the recorded replicas against the prediction. Sets $expected and $matched.
+# two_stopped_put NAME MIB: puts a new object with node3 and node4 stopped.
+# Sets $width (chunk 0's placement width: 3 before detection, 2 after). Before
+# detection, predicts the outcome from the placements and checks the actual
+# outcome and recorded replicas against it, setting $expected and $matched.
 two_stopped_put() {
   local name="$1" mib="$2" key="replication/two-stopped-$1-$run" obj chunks min_live actual st
   mkfile_mib "$name" "$mib"
   if "$osctl" put "$work/$name" "$key" 2>"$work/$name.err"; then actual=success; else actual=failure; fi
   obj="$(latest_object "$key")"
+  width="$(placement_width "$obj")"
+  matched=no
+  if [[ "$width" != 3 ]]; then
+    echo "   $name: placed on $width nodes: the coordinator already excluded the stopped nodes"
+    return
+  fi
   chunks="$(sql "SELECT count(*) FROM chunks WHERE object_id = '$obj'")"
   # Fewest live placed nodes on any chunk of this object.
   min_live="$(sql "SELECT min(n) FROM (SELECT count(*) FILTER (WHERE p.node_id NOT IN ('node3', 'node4')) AS n
@@ -191,18 +222,16 @@ two_stopped_put() {
                    WHERE c.object_id = '$obj' GROUP BY c.chunk_id) t")"
   if ((min_live >= 2)); then expected=success; else expected=failure; fi
   echo "   $name: $chunks chunks, fewest live placed nodes on a chunk = $min_live -> expected $expected, actual $actual"
-  matched=yes
   if [[ "$actual" != "$expected" ]]; then
     fail "outcome does not follow the per-chunk rule"
-    matched=no
     return
   fi
   if [[ "$actual" == success ]]; then
     if check_replicas "$obj" '{node3,node4}'; then
       ok "recorded exactly the live placed nodes"
+      matched=yes
     else
       fail "recorded replicas differ from the live placed nodes"
-      matched=no
     fi
   else
     echo "     $(grep -v ' level=INFO ' "$work/$name.err" | tail -1 | cut -c1-150)"
@@ -211,49 +240,87 @@ two_stopped_put() {
                                       WHERE c.object_id = '$obj'")" == 0 && \
           "$(sql "SELECT count(*) FROM keys WHERE key = '$key'")" == 0 ]]; then
       ok "PENDING, no replicas recorded, key does not resolve"
+      matched=yes
     else
       fail "a failed upload left state behind (status $st)"
-      matched=no
     fi
   fi
 }
 
 seen_success=no
 seen_failure=no
-for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  two_stopped_put "one-chunk-$attempt" 1
-  if [[ "$matched" == yes ]]; then
-    [[ "$expected" == success ]] && seen_success=yes
-    [[ "$expected" == failure ]] && seen_failure=yes
+three_failed=no
+attempt=0
+for cycle in 1 2 3; do
+  echo "   cycle $cycle: stopping node3 and node4"
+  "${compose[@]}" stop node3 node4 >/dev/null 2>&1
+  width=3 # a fresh cycle starts before detection; each put measures it again
+  if [[ "$three_failed" == no ]]; then
+    two_stopped_put "three-chunk-c$cycle" 10
+    if [[ "$width" == 3 && "$matched" == yes ]]; then
+      if [[ "$expected" == failure ]]; then
+        three_failed=yes
+        ok "the 3-chunk object was predicted to fail, as rotation placement requires"
+      else
+        fail "rotation placement should make a 3-chunk object fail with 2 nodes stopped"
+      fi
+    fi
   fi
-  [[ "$seen_success" == yes && "$seen_failure" == yes ]] && break
+  while [[ "$width" == 3 ]] && ! [[ "$seen_success" == yes && "$seen_failure" == yes ]] && ((attempt < 12)); do
+    attempt=$((attempt + 1))
+    two_stopped_put "one-chunk-$attempt" 1
+    if [[ "$matched" == yes ]]; then
+      [[ "$expected" == success ]] && seen_success=yes
+      [[ "$expected" == failure ]] && seen_failure=yes
+    fi
+  done
+  [[ "$seen_success" == yes && "$seen_failure" == yes && "$three_failed" == yes ]] && break
+  ((cycle < 3)) || break
+  echo "   detection came first: restarting node3 and node4 for another cycle"
+  "${compose[@]}" up -d --wait node3 node4 >/dev/null 2>&1
+  wait_alive 1 node3 node4 || fail "node3/node4 not ALIVE"
+  attempt=0
 done
-echo "   1-chunk attempts: $attempt; predicted success seen and matched: $seen_success; predicted failure seen and matched: $seen_failure"
-if [[ "$seen_success" == yes && "$seen_failure" == yes ]]; then
-  ok "both branches of the per-chunk rule exercised"
+echo "   before detection: success seen and matched: $seen_success; failure seen and matched: $seen_failure; 3-chunk failed: $three_failed"
+if [[ "$seen_success" == yes && "$seen_failure" == yes && "$three_failed" == yes ]]; then
+  ok "both branches of the per-chunk rule exercised before detection"
 else
-  fail "a branch of the per-chunk rule was not exercised in 12 attempts"
+  fail "a branch of the per-chunk rule was not exercised before detection"
 fi
 
-two_stopped_put three-chunk 10
-[[ "$expected" == failure ]] && ok "the 3-chunk object was predicted to fail, as rotation placement requires" \
-  || fail "rotation placement should make a 3-chunk object fail with 2 nodes stopped"
+wait_state node3 DEAD 30 || fail "node3 never reached DEAD"
+wait_state node4 DEAD 30 || fail "node4 never reached DEAD"
+mkfile_mib after-detection 10
+if osctl_run put "$work/after-detection" "replication/two-dead-$run"; then
+  obj4="$(latest_object "replication/two-dead-$run")"
+  bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_placements p USING (chunk_id)
+              WHERE c.object_id = '$obj4' GROUP BY c.chunk_id
+              HAVING string_agg(p.node_id, ',' ORDER BY p.node_id) <> 'node1,node2') t")"
+  [[ "$bad" == 0 ]] && check_replicas "$obj4" '{}' \
+    && ok "after detection: succeeded, every chunk on exactly node1 and node2" \
+    || fail "after detection: placement or replicas not exactly node1,node2"
+else
+  fail "after detection: the upload failed"
+fi
 "${compose[@]}" up -d --wait node3 node4 >/dev/null 2>&1
+wait_alive 1 node3 node4 || fail "node3/node4 not ALIVE"
 
 echo
-echo "5. node1, node2 and node3 stopped"
+echo "5. node1, node2 and node3 stopped and DEAD"
 "${compose[@]}" stop node1 node2 node3 >/dev/null 2>&1
+for n in node1 node2 node3; do wait_state "$n" DEAD 30 || fail "$n never reached DEAD"; done
 mkfile_mib v5 10
 if "$osctl" put "$work/v5" "replication/all-up-$run" 2>"$work/put5.err"; then
   fail "overwrite succeeded with only one node up"
+elif grep -q "code = Unavailable.*1 of 4 storage nodes alive, need 2" "$work/put5.err"; then
+  ok "overwrite refused at initiate: UNAVAILABLE, 1 of 4 storage nodes alive"
 else
-  ok "overwrite failed cleanly: $(tail -1 "$work/put5.err" | cut -c1-120)"
+  fail "overwrite failed, but not with UNAVAILABLE: $(grep -v ' level=INFO ' "$work/put5.err" | tail -1)"
 fi
 [[ "$(sql "SELECT object_id FROM keys WHERE key = 'replication/all-up-$run'")" == "$obj1" ]] \
   && ok "key still resolves to its previous version (step 1's object)" || fail "key pointer moved"
-[[ "$(sql "SELECT status FROM objects WHERE key = 'replication/all-up-$run' ORDER BY created_at DESC LIMIT 1")" == PENDING ]] \
-  && ok "the new object is PENDING" || fail "the new object is not PENDING"
-[[ "$(sql "SELECT count(*) FROM objects WHERE status = 'COMMITTED' AND key = 'replication/fresh-$run'")" == 0 ]] || true
+[[ "$(sql "SELECT count(*) FROM objects WHERE key = 'replication/all-up-$run'")" == 1 ]] \
+  && ok "no new object was created" || fail "a new object row exists"
 if "$osctl" put "$work/v5" "replication/fresh-$run" 2>"$work/fresh-put.err"; then
   fail "a new key committed with only one node up"
 fi
@@ -266,7 +333,7 @@ else
 fi
 
 echo
-echo "6. stop three nodes, up --wait, put immediately (IP-change regression)"
+echo "6. stop three nodes, up --wait, wait for ALIVE, put at once (IP-change regression)"
 ips() {
   local n
   for n in node1 node2 node3 node4; do
@@ -275,9 +342,11 @@ ips() {
   done
 }
 "${compose[@]}" up -d --wait >/dev/null 2>&1
+wait_alive 4 || fail "not all nodes ALIVE before the restart"
 before="$(ips)"
 "${compose[@]}" stop node1 node2 node3 >/dev/null 2>&1
 "${compose[@]}" up -d --wait >/dev/null 2>&1
+wait_alive 4 || fail "not all nodes ALIVE after the restart"
 after="$(ips)"
 echo "   IPs before: $before"
 echo "   IPs after:  $after"
@@ -285,9 +354,9 @@ echo "   IPs after:  $after"
   || echo "   (IPs changed: the coordinator must re-resolve)"
 mkfile_mib v6 10
 if osctl_run put "$work/v6" "replication/after-restart-$run"; then
-  ok "put immediately after the restart succeeded"
+  ok "put right after wait_alive succeeded"
 else
-  fail "put immediately after the restart failed"
+  fail "put right after wait_alive failed"
 fi
 
 echo

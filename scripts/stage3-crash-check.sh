@@ -32,6 +32,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
 source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
+source "$root/scripts/lib/liveness.sh"
+# up --wait means the coordinator is serving; uploads need ALIVE nodes.
+wait_alive 4
 work="$(mktemp -d)"
 watcher="stage3-crash-watcher-$$"
 key="crash-check/big-$$"
@@ -104,6 +107,8 @@ if "${compose[@]}" up -d --wait node1 >/dev/null 2>&1; then
 else
   fail "node1 did not become healthy after restart"
 fi
+# The get in step h reads node1's replicas: wait until the coordinator sees it.
+wait_alive 1 node1 || fail "node1 not ALIVE after restart"
 
 echo "f. temp directory after restart:"
 left="$(on_volume 'ls /data/tmp')"

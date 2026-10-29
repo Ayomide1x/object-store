@@ -14,9 +14,33 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                       {@code node_id|internal_addr|client_addr} entries
  * @param nodeRpcTimeout {@code COORDINATOR_NODE_RPC_TIMEOUT}: deadline for each
  *                       call to a storage node, such as {@code 2s}
+ * @param suspectAfter   {@code COORDINATOR_SUSPECT_AFTER}: silence after which an
+ *                       ALIVE node becomes SUSPECT
+ * @param deadAfter      {@code COORDINATOR_DEAD_AFTER}: silence after which a node
+ *                       becomes DEAD
+ * @param recoveryBeats  {@code COORDINATOR_RECOVERY_BEATS}: consecutive beats, each
+ *                       within suspectAfter of the last, that bring a DEAD node back
+ * @param livenessSweep  {@code COORDINATOR_LIVENESS_SWEEP}: how often timeouts are
+ *                       applied; 0 disables the sweeper (tests sweep by hand)
  */
 @ConfigurationProperties("coordinator")
-public record CoordinatorProperties(String nodes, @DefaultValue("2s") Duration nodeRpcTimeout) {
+public record CoordinatorProperties(
+        String nodes,
+        @DefaultValue("2s") Duration nodeRpcTimeout,
+        @DefaultValue("6s") Duration suspectAfter,
+        @DefaultValue("15s") Duration deadAfter,
+        @DefaultValue("2") int recoveryBeats,
+        @DefaultValue("1s") Duration livenessSweep) {
+
+    public CoordinatorProperties {
+        if (suspectAfter.isNegative() || suspectAfter.isZero() || deadAfter.compareTo(suspectAfter) <= 0) {
+            throw new IllegalStateException(
+                    "need 0 < COORDINATOR_SUSPECT_AFTER (%s) < COORDINATOR_DEAD_AFTER (%s)".formatted(suspectAfter, deadAfter));
+        }
+        if (recoveryBeats < 1) {
+            throw new IllegalStateException("COORDINATOR_RECOVERY_BEATS must be >= 1, got " + recoveryBeats);
+        }
+    }
 
     public List<Node> parseNodes() {
         if (nodes == null || nodes.isBlank()) {

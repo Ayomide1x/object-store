@@ -1,0 +1,11 @@
+--- a/node/internal/heartbeat/heartbeat.go
++++ b/node/internal/heartbeat/heartbeat.go
+@@ -94,7 +94,7 @@
+ }
+ 
+ func beat(ctx context.Context, cfg Config) error {
+-	ctx, cancel := context.WithTimeout(ctx, cfg.Interval)
++	ctx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 	_, err := cfg.Client.Heartbeat(ctx, &objectstorev1.HeartbeatRequest{NodeId: cfg.NodeID, InstanceId: cfg.InstanceID})
+ 	if err != nil {

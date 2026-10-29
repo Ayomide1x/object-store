@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
+@@ -144,7 +144,7 @@
+             Life life = e.getValue();
+             long silence = life.lastBeat < 0 ? now - startedAt : now - life.lastBeat;
+             State next = switch (life.state) {
+-                case UNKNOWN -> silence >= deadAfter ? State.DEAD : State.UNKNOWN;
++                case UNKNOWN -> State.DEAD;
+                 case ALIVE -> silence >= deadAfter ? State.DEAD : silence >= suspectAfter ? State.SUSPECT : State.ALIVE;
+                 case SUSPECT -> silence >= deadAfter ? State.DEAD : State.SUSPECT;
+                 case DEAD -> State.DEAD;

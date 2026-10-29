@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessTracker.java
+@@ -80,6 +80,9 @@
+     public synchronized Beat beat(String nodeId, String instanceId) {
+         Life life = nodes.get(nodeId);
+         if (life == null) {
++            nodes.put(nodeId, life = new Life());
++        }
++        if (false) {
+             throw new RequestException(Status.Code.NOT_FOUND,
+                     "node %s is not in COORDINATOR_NODES".formatted(nodeId));
+         }

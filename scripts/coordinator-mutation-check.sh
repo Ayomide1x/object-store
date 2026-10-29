@@ -33,6 +33,13 @@ expected_test() {
     13-getobject-ignores-bad-state) echo "getObjectLeavesOutBadReplicas()" ;;
     14-verify-accepts-wrong-node) echo "confirmationFromTheWrongNodeMarksNothing()" ;;
     15-no-data-loss-without-healthy-replica) echo "getObjectFailsWithDataLossWhenAChunkHasNoHealthyReplica()" ;;
+    l1-no-suspect-dead-transition) echo "silenceMakesANodeSuspectThenDeadAtTheThresholds()" ;;
+    l2-placement-includes-non-alive) echo "placementUsesOnlyAliveNodes()" ;;
+    l3-unknown-node-accepted) echo "aBeatFromAnUnregisteredNodeIsRejectedAndRecordsNothing()" ;;
+    l4-dead-alive-on-one-beat) echo "aDeadNodeNeedsTwoConsecutiveBeatsToComeBack()" ;;
+    l5-unknown-dead-too-early) echo "afterARestartANodeIsNeverDeadBeforeAFullWindow()" ;;
+    l6-complete-asks-dead-nodes) echo "completeUploadDoesNotAskADeadNode()" ;;
+    l7-conflicting-instance-accepted) echo "twoProcessesClaimingOneNodeAreRejectedUntilOneGoesQuiet()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

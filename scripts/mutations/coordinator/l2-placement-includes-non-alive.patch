@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -81,7 +81,7 @@
+         }
+         List<Node> registered = repository.listNodes();
+         List<Node> nodes = registered.stream()
+-                .filter(n -> liveness.stateOf(n.nodeId()) == LivenessTracker.State.ALIVE).toList();
++                .filter(n -> true).toList();
+         int count = chunkCount(sizeBytes);
+         if (count > 0 && nodes.size() < MIN_REPLICAS) {
+             throw new RequestException(Status.Code.UNAVAILABLE, "%d of %d storage nodes alive, need %d"

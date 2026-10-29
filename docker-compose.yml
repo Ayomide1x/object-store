@@ -57,6 +57,15 @@ services:
       # containers can get new IPs on restart; a long cache keeps calling the
       # old address. On UNAVAILABLE the coordinator also re-resolves and retries.
       COORDINATOR_DNS_CACHE_TTL_SECONDS: "1"
+      # Liveness from node heartbeats, judged by the coordinator's own clock.
+      # ALIVE -> SUSPECT after this much silence:
+      COORDINATOR_SUSPECT_AFTER: 6s
+      # -> DEAD after this much (also: never heard from this long after startup):
+      COORDINATOR_DEAD_AFTER: 15s
+      # Consecutive beats, each within SUSPECT_AFTER, that bring a DEAD node back:
+      COORDINATOR_RECOVERY_BEATS: "2"
+      # How often timeouts are applied and transitions persisted to the nodes table:
+      COORDINATOR_LIVENESS_SWEEP: 1s
     ports:
       - "127.0.0.1:9090:9090"
     # Healthy once the gRPC server accepts connections, which happens only after
@@ -77,6 +86,8 @@ services:
   # same port inside the container and on the host. NODE_DATA_DIR holds chunk
   # files in chunks/ and in-progress writes in tmp/. NODE_MAX_CONCURRENT_READS:
   # reads beyond this get RESOURCE_EXHAUSTED; each holds up to 4 MiB in memory.
+  # COORDINATOR_ADDR is where heartbeats go; NODE_HEARTBEAT_INTERVAL how often
+  # (with +/-10% jitter). Nodes keep serving while the coordinator is down.
   node1:
     <<: *node
     environment:
@@ -84,6 +95,8 @@ services:
       NODE_LISTEN_ADDR: ":9101"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      COORDINATOR_ADDR: coordinator:9090
+      NODE_HEARTBEAT_INTERVAL: 2s
     ports:
       - "127.0.0.1:9101:9101"
     volumes:
@@ -96,6 +109,8 @@ services:
       NODE_LISTEN_ADDR: ":9102"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      COORDINATOR_ADDR: coordinator:9090
+      NODE_HEARTBEAT_INTERVAL: 2s
     ports:
       - "127.0.0.1:9102:9102"
     volumes:
@@ -108,6 +123,8 @@ services:
       NODE_LISTEN_ADDR: ":9103"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      COORDINATOR_ADDR: coordinator:9090
+      NODE_HEARTBEAT_INTERVAL: 2s
     ports:
       - "127.0.0.1:9103:9103"
     volumes:
@@ -120,6 +137,8 @@ services:
       NODE_LISTEN_ADDR: ":9104"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      COORDINATOR_ADDR: coordinator:9090
+      NODE_HEARTBEAT_INTERVAL: 2s
     ports:
       - "127.0.0.1:9104:9104"
     volumes:

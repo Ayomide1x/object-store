@@ -59,6 +59,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 @SpringBootTest(properties = {
         "spring.grpc.server.port=0",
         "coordinator.node-rpc-timeout=" + MetadataServiceCompleteUploadIT.NODE_TIMEOUT_MS + "ms",
+        "coordinator.liveness-sweep=0",
 })
 class MetadataServiceCompleteUploadIT {
 
@@ -79,11 +80,13 @@ class MetadataServiceCompleteUploadIT {
 
     private final MetadataService metadata;
     private final JdbcClient jdbc;
+    private final LivenessService liveness;
 
     @Autowired
-    MetadataServiceCompleteUploadIT(MetadataService metadata, JdbcClient jdbc) {
+    MetadataServiceCompleteUploadIT(MetadataService metadata, JdbcClient jdbc, LivenessService liveness) {
         this.metadata = metadata;
         this.jdbc = jdbc;
+        this.liveness = liveness;
     }
 
     @BeforeEach
@@ -91,6 +94,10 @@ class MetadataServiceCompleteUploadIT {
         // nodes stays: NodeRegistry seeded it at context startup.
         jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
         nodes.reset();
+        // Placement uses only ALIVE nodes; the sweeper is off, so they stay ALIVE.
+        for (String n : List.of("node1", "node2", "node3", "node4")) {
+            liveness.heartbeat(n, "test-instance");
+        }
     }
 
     @AfterEach

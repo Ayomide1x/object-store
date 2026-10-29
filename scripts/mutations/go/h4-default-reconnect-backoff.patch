@@ -1,0 +1,16 @@
+--- a/node/internal/heartbeat/heartbeat.go
++++ b/node/internal/heartbeat/heartbeat.go
+@@ -42,11 +42,8 @@
+ // beats, matching the loop's no-backoff rule.
+ func Dial(addr string, interval time.Duration) (*grpc.ClientConn, error) {
+ 	conn, err := grpc.NewClient("passthrough:///"+addr,
+-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+-		grpc.WithConnectParams(grpc.ConnectParams{
+-			Backoff:           backoff.Config{BaseDelay: interval, Multiplier: 1, Jitter: 0.1, MaxDelay: interval},
+-			MinConnectTimeout: interval,
+-		}))
++		grpc.WithTransportCredentials(insecure.NewCredentials()))
++	_ = backoff.Config{}
+ 	if err != nil {
+ 		return nil, fmt.Errorf("dial coordinator %s: %w", addr, err)
+ 	}

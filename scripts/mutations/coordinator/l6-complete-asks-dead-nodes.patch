@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -208,7 +208,7 @@
+         Map<Node, List<UUID>> request = new LinkedHashMap<>();
+         for (PlannedChunk p : plan) {
+             for (String nodeId : p.placedNodeIds()) {
+-                if (liveness.stateOf(nodeId) == LivenessTracker.State.DEAD) {
++                if (false) {
+                     skipped.add(nodeId);
+                     continue;
+                 }

@@ -39,11 +39,14 @@ public class MetadataService {
     private final MetadataRepository repository;
     private final NodeClient nodeClient;
     private final TransactionTemplate tx;
+    private final LivenessTracker liveness;
 
-    public MetadataService(MetadataRepository repository, NodeClient nodeClient, TransactionTemplate tx) {
+    public MetadataService(MetadataRepository repository, NodeClient nodeClient, TransactionTemplate tx,
+            LivenessTracker liveness) {
         this.repository = repository;
         this.nodeClient = nodeClient;
         this.tx = tx;
+        this.liveness = liveness;
     }
 
     /** One chunk of an upload plan, with the nodes the client must write it to. */
@@ -63,11 +66,11 @@ public class MetadataService {
      * object is unreachable from any key until it is completed. Whether the
      * key already exists does not matter: completing overwrites it.
      *
-     * <p>Placement rotates through the registered nodes (sorted by ID) from a
-     * random start per object: chunk i goes to nodes start+i, start+i+1 and
-     * start+i+2. Each chunk leaves out one node, and each node holds about
-     * (n-1)/n of an object's chunks. There is no liveness until stage 6, so
-     * stopped nodes are placed like any other.
+     * <p>Placement rotates through the ALIVE nodes (sorted by ID) from a random
+     * start per object: chunk i goes to nodes start+i, start+i+1 and
+     * start+i+2. With exactly 2 ALIVE nodes each chunk goes to both (quorum is
+     * still reachable; stage 7 tops up); with fewer, initiate fails with
+     * UNAVAILABLE. A 0-byte object places nothing, so it needs no node.
      */
     @Transactional
     public UploadPlan initiateUpload(String key, long sizeBytes) {
@@ -76,19 +79,25 @@ public class MetadataService {
             throw RequestException.invalid(
                     "size_bytes %d outside [0, %d]".formatted(sizeBytes, MAX_OBJECT_SIZE));
         }
-        List<Node> nodes = repository.listNodes();
-        if (nodes.size() < MIN_REPLICAS) {
-            throw new RequestException(Status.Code.UNAVAILABLE,
-                    "%d storage nodes registered, need at least %d".formatted(nodes.size(), MIN_REPLICAS));
+        List<Node> registered = repository.listNodes();
+        List<Node> nodes = registered.stream()
+                .filter(n -> liveness.stateOf(n.nodeId()) == LivenessTracker.State.ALIVE).toList();
+        int count = chunkCount(sizeBytes);
+        if (count > 0 && nodes.size() < MIN_REPLICAS) {
+            throw new RequestException(Status.Code.UNAVAILABLE, "%d of %d storage nodes alive, need %d"
+                    .formatted(nodes.size(), registered.size(), MIN_REPLICAS));
+        }
+        if (count > 0 && nodes.size() < REPLICATION) {
+            log.atWarn().addKeyValue("key", key).addKeyValue("alive_nodes", nodes.size())
+                    .log("placing on fewer nodes than the replication target");
         }
         int width = Math.min(REPLICATION, nodes.size());
-        int start = ThreadLocalRandom.current().nextInt(nodes.size());
+        int start = nodes.isEmpty() ? 0 : ThreadLocalRandom.current().nextInt(nodes.size());
 
         UUID objectId = UUID.randomUUID();
         repository.insertPendingObject(objectId, key, sizeBytes);
 
         List<ChunkPlacement> chunks = new ArrayList<>();
-        int count = chunkCount(sizeBytes);
         for (int index = 0; index < count; index++) {
             long chunkSize = Math.min(CHUNK_SIZE, sizeBytes - index * CHUNK_SIZE);
             UUID chunkId = UUID.randomUUID();
@@ -191,9 +200,18 @@ public class MetadataService {
         for (Node node : repository.listNodes()) {
             nodesById.put(node.nodeId(), node);
         }
+        // DEAD placed nodes are not asked: a stopped one would fail fast anyway,
+        // and a hung one would cost the whole deadline. SUSPECT and UNKNOWN nodes
+        // are asked; a brief blip shouldn't refuse a commit. Not asking is an
+        // under-count, which invariant 3 allows.
+        Set<String> skipped = new HashSet<>();
         Map<Node, List<UUID>> request = new LinkedHashMap<>();
         for (PlannedChunk p : plan) {
             for (String nodeId : p.placedNodeIds()) {
+                if (liveness.stateOf(nodeId) == LivenessTracker.State.DEAD) {
+                    skipped.add(nodeId);
+                    continue;
+                }
                 request.computeIfAbsent(nodesById.get(nodeId), n -> new ArrayList<>()).add(p.chunkId());
             }
         }
@@ -211,7 +229,7 @@ public class MetadataService {
             for (String nodeId : p.placedNodeIds()) {
                 Map<UUID, ChunkStat> nodeStats = stats.get(nodeId);
                 ChunkStat s = nodeStats == null ? null : nodeStats.get(chunk.chunkId());
-                String why = rejection(s, p, chunk);
+                String why = skipped.contains(nodeId) ? "DEAD, not asked" : rejection(s, p, chunk);
                 if (why == null) {
                     ok.add(nodeId);
                 } else {

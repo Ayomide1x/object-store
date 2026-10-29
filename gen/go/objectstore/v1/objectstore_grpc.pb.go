@@ -23,6 +23,7 @@ const (
 	CoordinatorService_CompleteUpload_FullMethodName   = "/objectstore.v1.CoordinatorService/CompleteUpload"
 	CoordinatorService_GetObject_FullMethodName        = "/objectstore.v1.CoordinatorService/GetObject"
 	CoordinatorService_ReportBadReplica_FullMethodName = "/objectstore.v1.CoordinatorService/ReportBadReplica"
+	CoordinatorService_Heartbeat_FullMethodName        = "/objectstore.v1.CoordinatorService/Heartbeat"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -50,6 +51,12 @@ type CoordinatorServiceClient interface {
 	// The coordinator marks the replica BAD only if the node itself confirms it
 	// (VerifyChunk); the verdict says what happened. Reading never depends on it.
 	ReportBadReplica(ctx context.Context, in *ReportBadReplicaRequest, opts ...grpc.CallOption) (*ReportBadReplicaResponse, error)
+	// Heartbeat tells the coordinator a node is alive. Nodes call it on an
+	// interval; the coordinator judges liveness by its own clock at receipt.
+	// An unregistered node_id fails with NOT_FOUND; a second process claiming
+	// a node_id that is still beating fails with FAILED_PRECONDITION. Rejected
+	// beats do not count as signs of life.
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -100,6 +107,16 @@ func (c *coordinatorServiceClient) ReportBadReplica(ctx context.Context, in *Rep
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -125,6 +142,12 @@ type CoordinatorServiceServer interface {
 	// The coordinator marks the replica BAD only if the node itself confirms it
 	// (VerifyChunk); the verdict says what happened. Reading never depends on it.
 	ReportBadReplica(context.Context, *ReportBadReplicaRequest) (*ReportBadReplicaResponse, error)
+	// Heartbeat tells the coordinator a node is alive. Nodes call it on an
+	// interval; the coordinator judges liveness by its own clock at receipt.
+	// An unregistered node_id fails with NOT_FOUND; a second process claiming
+	// a node_id that is still beating fails with FAILED_PRECONDITION. Rejected
+	// beats do not count as signs of life.
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -146,6 +169,9 @@ func (UnimplementedCoordinatorServiceServer) GetObject(context.Context, *GetObje
 }
 func (UnimplementedCoordinatorServiceServer) ReportBadReplica(context.Context, *ReportBadReplicaRequest) (*ReportBadReplicaResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportBadReplica not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -240,6 +266,24 @@ func _CoordinatorService_ReportBadReplica_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -262,6 +306,10 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportBadReplica",
 			Handler:    _CoordinatorService_ReportBadReplica_Handler,
+		},
+		{
+			MethodName: "Heartbeat",
+			Handler:    _CoordinatorService_Heartbeat_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

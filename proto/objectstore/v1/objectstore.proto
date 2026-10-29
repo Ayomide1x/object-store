@@ -27,6 +27,39 @@ service CoordinatorService {
   // The coordinator marks the replica BAD only if the node itself confirms it
   // (VerifyChunk); the verdict says what happened. Reading never depends on it.
   rpc ReportBadReplica(ReportBadReplicaRequest) returns (ReportBadReplicaResponse);
+  // Heartbeat tells the coordinator a node is alive. Nodes call it on an
+  // interval; the coordinator judges liveness by its own clock at receipt.
+  // An unregistered node_id fails with NOT_FOUND; a second process claiming
+  // a node_id that is still beating fails with FAILED_PRECONDITION. Rejected
+  // beats do not count as signs of life.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// NodeLiveness is a node's state as the coordinator sees it from heartbeats.
+// It can be wrong (a node can be up but unable to reach the coordinator), so
+// it orders and excludes, but never alone decides what data exists.
+enum NodeLiveness {
+  NODE_LIVENESS_UNSPECIFIED = 0;
+  // Beating within the SUSPECT threshold.
+  NODE_LIVENESS_ALIVE = 1;
+  // Missed beats past the SUSPECT threshold.
+  NODE_LIVENESS_SUSPECT = 2;
+  // Missed beats past the DEAD threshold, or recovering from DEAD.
+  NODE_LIVENESS_DEAD = 3;
+  // Not heard from since the coordinator started.
+  NODE_LIVENESS_UNKNOWN = 4;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  // Random per node process; tells a restart apart from two processes
+  // claiming one node_id.
+  string instance_id = 2;
+}
+
+message HeartbeatResponse {
+  // The node's state as the coordinator sees it after this beat.
+  NodeLiveness liveness = 1;
 }
 
 message InitiateUploadRequest {
@@ -55,6 +88,9 @@ message NodeLocation {
   string node_id = 1;
   // Address reachable by the caller (a client-facing address for clients).
   string address = 2;
+  // The node's liveness when the response was built. Readers try ALIVE
+  // replicas first and DEAD ones last, but never skip a listed replica.
+  NodeLiveness liveness = 3;
 }
 
 message CompleteUploadRequest {

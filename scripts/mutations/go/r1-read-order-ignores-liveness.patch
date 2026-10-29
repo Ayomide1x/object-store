@@ -1,0 +1,11 @@
+--- a/client/internal/download/download.go
++++ b/client/internal/download/download.go
+@@ -129,7 +129,7 @@
+ 	if d.demoted[r.NodeID] {
+ 		return 3
+ 	}
+-	switch r.Liveness {
++	switch objectstorev1.NodeLiveness(0) {
+ 	case objectstorev1.NodeLiveness_NODE_LIVENESS_SUSPECT, objectstorev1.NodeLiveness_NODE_LIVENESS_UNKNOWN:
+ 		return 1
+ 	case objectstorev1.NodeLiveness_NODE_LIVENESS_DEAD:

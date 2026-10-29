@@ -9,6 +9,14 @@
 #   2. Delete the first replica's file: get IDENTICAL; marked BAD (missing).
 #   3. Stop the first replica's node: get IDENTICAL; nothing marked BAD.
 #   4. Pause it: get finishes within the read deadline; nothing marked BAD.
+#      Since stage 6, steps 3 and 4 check a precondition, as stage 4 step 3
+#      does: right before the get, the node's persisted state must still be
+#      ALIVE (detection takes 6 s of silence; the get starts at once). If it is
+#      not, the step fails as "inconclusive, rerun", because a node already
+#      listed DEAD is read last and the get would not exercise failover. A pass
+#      therefore always means the get really failed over from the stopped or
+#      paused node. Liveness-ordered reads are covered by
+#      stage6-liveness-check.sh and TestDeadReplicasAreReadLast.
 #   5. Corrupt 2 of 3 replicas of a chunk: get IDENTICAL from the third;
 #      the two are BAD, the third HEALTHY.
 #   6. Corrupt all 3: get fails loudly naming each replica, no output file; all
@@ -24,6 +32,9 @@ osctl="$root/bin/osctl"
 compose=(docker compose -f "$root/docker-compose.yml")
 source "$root/scripts/lib/osctl.sh"
 source "$root/scripts/lib/volume.sh"
+source "$root/scripts/lib/liveness.sh"
+# up --wait means the coordinator is serving; uploads need ALIVE nodes.
+wait_alive 4
 work="$(mktemp -d)"
 run="$$"
 deadline=10
@@ -54,6 +65,17 @@ chunk_of() { sql "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) 
 replicas_of() { sql "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$1' ORDER BY node_id"; }
 state_of() { sql "SELECT state || coalesce(' (' || bad_reason || ')', '') FROM chunk_replicas WHERE chunk_id = '$1' AND node_id = '$2'"; }
 bad_count() { sql "SELECT count(*) FROM chunk_replicas WHERE state = 'BAD'"; }
+node_state() { sql "SELECT state FROM nodes WHERE node_id = '$1'"; }
+# still_alive NODE: the precondition for steps 3 and 4.
+still_alive() {
+  local st
+  st="$(node_state "$1")"
+  if [[ "$st" == ALIVE ]]; then
+    ok "precondition: the coordinator still sees $1 ALIVE"
+  else
+    fail "precondition: $1 is already $st, so the get would not fail over from it; inconclusive, rerun"
+  fi
+}
 # The node a get's log says served CHUNK.
 read_from() { sed -n "s/.*msg=\"chunk read\".*chunk_id=$2 node_id=\\([^ ]*\\).*/\\1/p" "$1" | tail -1; }
 
@@ -111,13 +133,15 @@ first="$(replicas_of "$c0" | head -1)"
 before="$(bad_count)"
 echo "   chunk 0 read first from $first; stopping it"
 "${compose[@]}" stop "$first" >/dev/null 2>&1
+still_alive "$first"
 get_identical "failover/three-$run" "$work/s3" "$work/get3.log"
 grep -q "failing over.*node_id=$first\|node_id=$first.*failing over" "$work/get3.log" \
-  && ok "the get failed over from $first" || fail "no failover from $first in the log"
+  && ok "the get failed over from the stopped node $first" || fail "no failover from $first in the log"
 [[ "$(bad_count)" == "$before" ]] && ok "nothing marked BAD (a stopped node is not a bad replica)" \
   || fail "a replica was marked BAD"
 grep -q "bad replica reported" "$work/get3.log" && fail "a report was sent for a stopped node" || ok "no report sent"
 "${compose[@]}" up -d --wait "$first" >/dev/null 2>&1
+wait_alive 1 "$first" || fail "$first not ALIVE after restart"
 
 echo
 echo "4. pause the first replica's node"
@@ -129,6 +153,7 @@ t0="$(now)"; osctl_run get "failover/four-$run" "$work/out4"; baseline="$(python
 before="$(bad_count)"
 echo "   chunk 0 read first from $first; baseline get ${baseline}s; pausing it"
 "${compose[@]}" pause "$first" >/dev/null
+still_alive "$first"
 t0="$(now)"
 get_identical "failover/four-$run" "$work/s4" "$work/get4.log"
 elapsed="$(python3 -c "print(round($(now) - $t0, 2))")"
@@ -137,7 +162,11 @@ echo "   get took ${elapsed}s (limit ${limit}s = ${deadline}s deadline + ${basel
 python3 -c "import sys; sys.exit(0 if $elapsed < $limit else 1)" && ok "finished within the read deadline" \
   || fail "took longer than the limit"
 [[ "$(bad_count)" == "$before" ]] && ok "nothing marked BAD" || fail "a replica was marked BAD"
+grep -q "failing over.*node_id=$first\|node_id=$first.*failing over" "$work/get4.log" \
+  && ok "the get failed over from the paused node $first after its read deadline" \
+  || fail "no failover from $first in the log"
 "${compose[@]}" unpause "$first" >/dev/null
+wait_alive 1 "$first" || fail "$first not ALIVE after unpause"
 
 echo
 echo "5. corrupt 2 of 3 replicas of chunk 1"

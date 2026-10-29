@@ -23,7 +23,11 @@ iterations="${1:-10}"
 size_mib="${2:-100}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
+compose=(docker compose -f "$root/docker-compose.yml")
 source "$root/scripts/lib/osctl.sh"
+source "$root/scripts/lib/liveness.sh"
+# up --wait means the coordinator is serving; uploads need ALIVE nodes.
+wait_alive 4
 key="overwrite-check"
 work="$(mktemp -d)"
 

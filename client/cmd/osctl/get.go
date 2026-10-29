@@ -48,7 +48,8 @@ func get(ctx context.Context, log *slog.Logger, coordAddr, key, path string) err
 	for _, c := range obj.GetChunks() {
 		chunk := download.Chunk{ID: c.GetChunkId(), Index: c.GetIndex(), Size: c.GetSizeBytes(), SHA256: c.GetSha256()}
 		for _, r := range c.GetReplicas() {
-			chunk.Replicas = append(chunk.Replicas, download.Replica{NodeID: r.GetNodeId(), Address: r.GetAddress()})
+			chunk.Replicas = append(chunk.Replicas,
+				download.Replica{NodeID: r.GetNodeId(), Address: r.GetAddress(), Liveness: r.GetLiveness()})
 		}
 		chunks = append(chunks, chunk)
 	}

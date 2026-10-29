@@ -24,6 +24,9 @@ osctl="$root/bin/osctl"
 compose=(docker compose -f "$root/docker-compose.yml")
 source "$root/scripts/lib/osctl.sh"
 source "$root/scripts/lib/volume.sh"
+source "$root/scripts/lib/liveness.sh"
+# up --wait means the coordinator is serving; uploads need ALIVE nodes.
+wait_alive 4
 work="$(mktemp -d)"
 offset=$((56 + 1000000)) # past the 56-byte header, inside the data
 

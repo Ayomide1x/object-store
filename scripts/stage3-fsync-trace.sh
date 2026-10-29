@@ -22,6 +22,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
 source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
+source "$root/scripts/lib/liveness.sh"
+# up --wait means the coordinator is serving; uploads need ALIVE nodes.
+wait_alive 4
 work="$(mktemp -d)"
 tracer="stage3-fsync-trace-$$"
 
