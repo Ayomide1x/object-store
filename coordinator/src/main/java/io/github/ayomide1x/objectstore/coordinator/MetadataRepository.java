@@ -133,6 +133,14 @@ public class MetadataRepository {
                 .update();
     }
 
+    /** Records a chunk's SHA-256. Set once: a chunk's hash never changes. */
+    public void recordChunkHash(UUID chunkId, byte[] sha256) {
+        jdbc.sql("UPDATE chunks SET sha256 = :sha256 WHERE chunk_id = :chunkId AND sha256 IS NULL")
+                .param("chunkId", chunkId)
+                .param("sha256", sha256)
+                .update();
+    }
+
     public void markCommitted(UUID objectId) {
         jdbc.sql("""
                 UPDATE objects SET status = 'COMMITTED', committed_at = clock_timestamp()
@@ -166,11 +174,12 @@ public class MetadataRepository {
      * still resolves.
      */
     public Optional<StoredObject> findObjectByKey(String key) {
-        record Row(UUID objectId, long objectSize, UUID chunkId, int chunkIndex, long chunkSize, Node node) {
+        record Row(UUID objectId, long objectSize, UUID chunkId, int chunkIndex, long chunkSize, byte[] sha256,
+                Node node) {
         }
         List<Row> rows = jdbc.sql("""
                 SELECT o.object_id, o.size_bytes AS object_size,
-                       c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size,
+                       c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size, c.sha256,
                        n.node_id, n.internal_addr, n.client_addr
                 FROM keys k
                 JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'
@@ -187,6 +196,7 @@ public class MetadataRepository {
                         rs.getObject("chunk_id", UUID.class),
                         rs.getInt("chunk_index"),
                         rs.getLong("chunk_size"),
+                        rs.getBytes("sha256"),
                         rs.getString("node_id") == null ? null
                                 : new Node(rs.getString("node_id"), rs.getString("internal_addr"),
                                         rs.getString("client_addr"))))
@@ -201,7 +211,8 @@ public class MetadataRepository {
                 continue; // the single row of an object with no chunks
             }
             StoredObject.Chunk chunk = chunks.computeIfAbsent(row.chunkId(),
-                    id -> new StoredObject.Chunk(id, row.chunkIndex(), row.chunkSize(), new ArrayList<>()));
+                    id -> new StoredObject.Chunk(id, row.chunkIndex(), row.chunkSize(), row.sha256(),
+                            new ArrayList<>()));
             if (row.node() != null) {
                 chunk.replicas().add(row.node());
             }

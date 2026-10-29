@@ -61,6 +61,9 @@ message CompletedChunk {
   int64 size_bytes = 3;
   // Only nodes that acknowledged the write (invariant 3).
   repeated string acked_node_ids = 4;
+  // SHA-256 of the chunk data, as verified by the acknowledging nodes. Required:
+  // a complete without it is rejected.
+  bytes sha256 = 5;
 }
 
 message CompleteUploadResponse {}
@@ -80,12 +83,17 @@ message ChunkInfo {
   int32 index = 2;
   int64 size_bytes = 3;
   repeated NodeLocation replicas = 4;
+  // SHA-256 of the chunk data. Readers verify each chunk end to end against it.
+  bytes sha256 = 5;
 }
 
 // StorageNodeService stores and serves chunk bytes. Every stream is framed in
-// messages of at most 1 MiB of data.
+// messages of at most 1 MiB of data. Every byte served has been checked against
+// its SHA-256 first.
 service StorageNodeService {
-  // WriteChunk takes exactly one header frame first, then data frames.
+  // WriteChunk takes exactly one header frame, then data frames, then exactly
+  // one trailer frame carrying the SHA-256 of the data. The chunk becomes
+  // visible only after the hash matches and the file is durable.
   rpc WriteChunk(stream WriteChunkRequest) returns (WriteChunkResponse);
   rpc ReadChunk(ReadChunkRequest) returns (stream ReadChunkResponse);
 }
@@ -94,6 +102,7 @@ message WriteChunkRequest {
   oneof frame {
     WriteChunkHeader header = 1;
     bytes data = 2;
+    WriteChunkTrailer trailer = 3;
   }
 }
 
@@ -104,9 +113,18 @@ message WriteChunkHeader {
   int64 size_bytes = 3;
 }
 
+// WriteChunkTrailer is the last frame of a write. The sender hashes the data
+// as it streams it, so the file is read only once.
+message WriteChunkTrailer {
+  // SHA-256 of the chunk data: exactly 32 bytes.
+  bytes sha256 = 1;
+}
+
 message WriteChunkResponse {
   string chunk_id = 1;
   int64 bytes_written = 2;
+  // The SHA-256 the node verified and stored.
+  bytes sha256 = 3;
 }
 
 message ReadChunkRequest {

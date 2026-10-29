@@ -3,6 +3,9 @@ package io.github.ayomide1x.objectstore.coordinator;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -277,7 +280,16 @@ class MetadataServiceCompleteUploadIT {
                         Status.Code.INVALID_ARGUMENT, "node node2 was not a placement target"),
                 Arguments.of("ack from unknown node", (Function<Fixture, Request>) f ->
                         f.withChunks(List.of(f.chunk(0), withAcks(f.chunk(1), List.of("node9")))),
-                        Status.Code.INVALID_ARGUMENT, "node node9 was not a placement target"));
+                        Status.Code.INVALID_ARGUMENT, "node node9 was not a placement target"),
+                Arguments.of("sha256 missing", (Function<Fixture, Request>) f ->
+                        f.withChunks(List.of(f.chunk(0), withSha(f.chunk(1), new byte[0]))),
+                        Status.Code.INVALID_ARGUMENT, "sha256 is 0 bytes, want 32"),
+                Arguments.of("sha256 31 bytes", (Function<Fixture, Request>) f ->
+                        f.withChunks(List.of(f.chunk(0), withSha(f.chunk(1), new byte[31]))),
+                        Status.Code.INVALID_ARGUMENT, "sha256 is 31 bytes, want 32"),
+                Arguments.of("sha256 33 bytes", (Function<Fixture, Request>) f ->
+                        f.withChunks(List.of(f.chunk(0), withSha(f.chunk(1), new byte[33]))),
+                        Status.Code.INVALID_ARGUMENT, "sha256 is 33 bytes, want 32"));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -307,6 +319,26 @@ class MetadataServiceCompleteUploadIT {
         assertThat(metadata.getObject("v")).isEmpty();
     }
 
+    /** Mutation: completeUpload does not record the chunk hashes. */
+    @Test
+    void checksumsAreRecordedAndReturnedByGetObject() {
+        long size = 2 * CHUNK + 3;
+        UploadPlan plan = metadata.initiateUpload("hashed", size);
+        assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE object_id = :id AND sha256 IS NULL")
+                .param("id", plan.objectId()).query(Long.class).single())
+                .as("hashes are unknown while PENDING").isEqualTo(3);
+
+        complete(plan, "hashed", size);
+
+        List<byte[]> want = completedChunks(plan).stream().map(CompletedChunk::sha256).toList();
+        assertThat(jdbc.sql("SELECT sha256 FROM chunks WHERE object_id = :id ORDER BY chunk_index")
+                .param("id", plan.objectId()).query((rs, i) -> rs.getBytes(1)).list())
+                .containsExactlyElementsOf(want);
+        assertThat(metadata.getObject("hashed").orElseThrow().chunks())
+                .extracting(StoredObject.Chunk::sha256)
+                .containsExactlyElementsOf(want);
+    }
+
     @Test
     void completingCommittedObjectAgainIsNoOp() {
         UploadPlan plan = metadata.initiateUpload("again", CHUNK + 10);
@@ -331,24 +363,41 @@ class MetadataServiceCompleteUploadIT {
         metadata.completeUpload(r.objectId(), r.key(), r.sizeBytes(), r.chunks());
     }
 
-    /** The completion a well-behaved client sends: every chunk acknowledged by every placed node. */
+    /**
+     * The completion a well-behaved client sends: every chunk acknowledged by
+     * every placed node, with a SHA-256. The coordinator never sees bytes, so
+     * any 32 bytes stand in for the hash; this one is derived from the chunk
+     * ID so each chunk's differs.
+     */
     private static List<CompletedChunk> completedChunks(UploadPlan plan) {
         return plan.chunks().stream()
                 .map(c -> new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(),
-                        c.nodes().stream().map(Node::nodeId).toList()))
+                        c.nodes().stream().map(Node::nodeId).toList(), fakeSha(c.chunkId())))
                 .toList();
     }
 
+    private static byte[] fakeSha(UUID chunkId) {
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(chunkId.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     private static CompletedChunk withIndex(CompletedChunk c, int index) {
-        return new CompletedChunk(c.chunkId(), index, c.sizeBytes(), c.ackedNodeIds());
+        return new CompletedChunk(c.chunkId(), index, c.sizeBytes(), c.ackedNodeIds(), c.sha256());
     }
 
     private static CompletedChunk withSize(CompletedChunk c, long size) {
-        return new CompletedChunk(c.chunkId(), c.index(), size, c.ackedNodeIds());
+        return new CompletedChunk(c.chunkId(), c.index(), size, c.ackedNodeIds(), c.sha256());
     }
 
     private static CompletedChunk withAcks(CompletedChunk c, List<String> acks) {
-        return new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), acks);
+        return new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), acks, c.sha256());
+    }
+
+    private static CompletedChunk withSha(CompletedChunk c, byte[] sha256) {
+        return new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), c.ackedNodeIds(), sha256);
     }
 
     private static List<UUID> chunkIds(UploadPlan plan) {

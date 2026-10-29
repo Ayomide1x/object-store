@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +17,8 @@ const maxFrameSize = 1 << 20
 
 // put uploads a file: initiate (the coordinator returns the full chunk plan),
 // stream each chunk to its node in order, then complete with the nodes'
-// acknowledgements. The file is read one frame at a time, never whole.
+// acknowledgements and each chunk's SHA-256. The file is read once, one frame
+// at a time, and hashed as it streams.
 func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -54,17 +57,18 @@ func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) err
 
 		// A SectionReader reads only this chunk's byte range of the file.
 		section := io.NewSectionReader(f, offset, chunk.GetSizeBytes())
-		written, err := writeChunk(ctx, node.GetAddress(), objectID, chunk.GetChunkId(), section, chunk.GetSizeBytes())
+		written, sum, err := writeChunk(ctx, node.GetAddress(), objectID, chunk.GetChunkId(), section, chunk.GetSizeBytes())
 		if err != nil {
 			return fmt.Errorf("write chunk %d (%s) to %s: %w", chunk.GetIndex(), chunk.GetChunkId(), node.GetNodeId(), err)
 		}
-		clog.Info("chunk written", "index", chunk.GetIndex(), "bytes", written)
+		clog.Info("chunk written", "index", chunk.GetIndex(), "bytes", written, "sha256", fmt.Sprintf("%x", sum))
 
 		completed = append(completed, &objectstorev1.CompletedChunk{
 			ChunkId:      chunk.GetChunkId(),
 			Index:        chunk.GetIndex(),
 			SizeBytes:    chunk.GetSizeBytes(),
 			AckedNodeIds: []string{node.GetNodeId()},
+			Sha256:       sum,
 		})
 		offset += chunk.GetSizeBytes()
 	}
@@ -101,26 +105,31 @@ func checkPlan(chunks []*objectstorev1.ChunkPlacement, size int64) error {
 	return nil
 }
 
-// writeChunk streams size bytes from r to the node as one header frame
-// followed by data frames of at most maxFrameSize.
-func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader, size int64) (int64, error) {
+// writeChunk streams size bytes from r to the node: one header frame, data
+// frames of at most maxFrameSize, then a trailer with the SHA-256 of the bytes
+// sent, computed while sending. It returns the bytes written and that hash,
+// after checking the node verified the same hash.
+func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader, size int64) (int64, []byte, error) {
 	conn, err := dial(addr)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer conn.Close()
 
 	stream, err := objectstorev1.NewStorageNodeServiceClient(conn).WriteChunk(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("open stream: %w", err)
+		return 0, nil, fmt.Errorf("open stream: %w", err)
 	}
 	err = stream.Send(&objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Header{
 		Header: &objectstorev1.WriteChunkHeader{ChunkId: chunkID, ObjectId: objectID, SizeBytes: size},
 	}})
 	if err != nil {
-		return 0, closeWithStatus(stream, fmt.Errorf("send header: %w", err))
+		return 0, nil, closeWithStatus(stream, fmt.Errorf("send header: %w", err))
 	}
 
+	// Everything read from r also goes through the hasher.
+	hasher := sha256.New()
+	r = io.TeeReader(r, hasher)
 	var sent int64
 	for {
 		// A fresh buffer per frame: gRPC forbids modifying a message after Send.
@@ -129,7 +138,7 @@ func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader
 		if n > 0 {
 			err := stream.Send(&objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Data{Data: buf[:n]}})
 			if err != nil {
-				return 0, closeWithStatus(stream, fmt.Errorf("send frame: %w", err))
+				return 0, nil, closeWithStatus(stream, fmt.Errorf("send frame: %w", err))
 			}
 			sent += int64(n)
 		}
@@ -137,24 +146,37 @@ func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader
 			break
 		}
 		if readErr != nil {
-			return 0, fmt.Errorf("read source: %w", readErr)
+			return 0, nil, fmt.Errorf("read source: %w", readErr)
 		}
 	}
 	// A file that shrank since stat yields fewer bytes than planned. The node
 	// would reject the chunk anyway; failing here gives the clearer error.
 	if sent != size {
 		_, _ = stream.CloseAndRecv()
-		return 0, fmt.Errorf("source ended after %d of %d bytes (file changed during upload?)", sent, size)
+		return 0, nil, fmt.Errorf("source ended after %d of %d bytes (file changed during upload?)", sent, size)
+	}
+
+	sum := hasher.Sum(nil)
+	err = stream.Send(&objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Trailer{
+		Trailer: &objectstorev1.WriteChunkTrailer{Sha256: sum},
+	}})
+	if err != nil {
+		return 0, nil, closeWithStatus(stream, fmt.Errorf("send trailer: %w", err))
 	}
 
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if resp.GetBytesWritten() != size {
-		return 0, fmt.Errorf("node wrote %d bytes, expected %d", resp.GetBytesWritten(), size)
+		return 0, nil, fmt.Errorf("node wrote %d bytes, expected %d", resp.GetBytesWritten(), size)
 	}
-	return resp.GetBytesWritten(), nil
+	// A node that verified a different hash (or none: an older node) has not
+	// acknowledged these bytes.
+	if !bytes.Equal(resp.GetSha256(), sum) {
+		return 0, nil, fmt.Errorf("node verified sha256 %x, sent %x", resp.GetSha256(), sum)
+	}
+	return resp.GetBytesWritten(), sum, nil
 }
 
 // closeWithStatus is called when Send fails. Send returns io.EOF when the

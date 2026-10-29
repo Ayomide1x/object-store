@@ -23,6 +23,7 @@ public class MetadataService {
 
     static final long CHUNK_SIZE = 4L << 20;
     static final long MAX_OBJECT_SIZE = 5L << 30;
+    static final int SHA256_LENGTH = 32;
 
     private static final Logger log = LoggerFactory.getLogger(MetadataService.class);
 
@@ -40,8 +41,8 @@ public class MetadataService {
     public record UploadPlan(UUID objectId, List<ChunkPlacement> chunks) {
     }
 
-    /** A chunk the client wrote, with the nodes that acknowledged it. */
-    public record CompletedChunk(UUID chunkId, int index, long sizeBytes, List<String> ackedNodeIds) {
+    /** A chunk the client wrote, its SHA-256, and the nodes that acknowledged it. */
+    public record CompletedChunk(UUID chunkId, int index, long sizeBytes, List<String> ackedNodeIds, byte[] sha256) {
     }
 
     /**
@@ -105,6 +106,7 @@ public class MetadataService {
         validateAgainstPlan(objectId, repository.plannedChunks(objectId), chunks, sizeBytes);
 
         for (CompletedChunk chunk : chunks) {
+            repository.recordChunkHash(chunk.chunkId(), chunk.sha256());
             for (String nodeId : chunk.ackedNodeIds()) {
                 repository.insertReplica(chunk.chunkId(), nodeId);
             }
@@ -140,8 +142,10 @@ public class MetadataService {
 
     /**
      * Requires the request to describe exactly the issued plan: the same chunk
-     * IDs, each with its allocated index and size, and acknowledgements only
-     * from nodes the chunk was placed on.
+     * IDs, each with its allocated index and size, acknowledgements only from
+     * nodes the chunk was placed on, and a 32-byte SHA-256. The coordinator
+     * never sees the bytes, so it can check only that a hash is present and
+     * well formed; the nodes verified it against the data.
      */
     private static void validateAgainstPlan(UUID objectId, List<PlannedChunk> plan, List<CompletedChunk> chunks,
             long sizeBytes) {
@@ -172,6 +176,11 @@ public class MetadataService {
             if (chunk.sizeBytes() != p.sizeBytes()) {
                 throw RequestException.invalid("chunk %s has size %d, allocated %d"
                         .formatted(chunk.chunkId(), chunk.sizeBytes(), p.sizeBytes()));
+            }
+            int shaLength = chunk.sha256() == null ? 0 : chunk.sha256().length;
+            if (shaLength != SHA256_LENGTH) {
+                throw RequestException.invalid("chunk %s sha256 is %d bytes, want %d"
+                        .formatted(chunk.chunkId(), shaLength, SHA256_LENGTH));
             }
             if (chunk.ackedNodeIds().isEmpty()) {
                 throw RequestException.invalid("chunk %s has no acknowledged replicas".formatted(chunk.chunkId()));

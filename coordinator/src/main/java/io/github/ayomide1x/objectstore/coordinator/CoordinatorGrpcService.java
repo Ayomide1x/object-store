@@ -14,6 +14,7 @@ import io.github.ayomide1x.objectstore.v1.GetObjectResponse;
 import io.github.ayomide1x.objectstore.v1.InitiateUploadRequest;
 import io.github.ayomide1x.objectstore.v1.InitiateUploadResponse;
 import io.github.ayomide1x.objectstore.v1.NodeLocation;
+import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
@@ -64,7 +65,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
             List<MetadataService.CompletedChunk> chunks = request.getChunksList().stream()
                     .map(c -> new MetadataService.CompletedChunk(
                             parseUuid("chunk_id", c.getChunkId()), c.getIndex(), c.getSizeBytes(),
-                            c.getAckedNodeIdsList()))
+                            c.getAckedNodeIdsList(), c.getSha256().toByteArray()))
                     .toList();
             metadata.completeUpload(parseUuid("object_id", request.getObjectId()), request.getKey(),
                     request.getSizeBytes(), chunks);
@@ -86,6 +87,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                         .setChunkId(c.chunkId().toString())
                         .setIndex(c.index())
                         .setSizeBytes(c.sizeBytes())
+                        .setSha256(ByteString.copyFrom(c.sha256()))
                         .addAllReplicas(c.replicas().stream().map(CoordinatorGrpcService::clientLocation).toList()));
             }
             return b.build();

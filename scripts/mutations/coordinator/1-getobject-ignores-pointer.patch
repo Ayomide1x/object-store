@@ -1,8 +1,8 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
-@@ -172,12 +172,12 @@
+@@ -181,12 +181,12 @@
                  SELECT o.object_id, o.size_bytes AS object_size,
-                        c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size,
+                        c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size, c.sha256,
                         n.node_id, n.internal_addr, n.client_addr
 -                FROM keys k
 -                JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'

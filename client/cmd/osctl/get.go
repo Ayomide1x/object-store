@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +16,8 @@ import (
 
 // get downloads an object into path. Chunks are written in index order to a
 // temp file in the same directory, which is fsynced and renamed over path
-// only after every chunk arrived with its expected size. A failed get never
-// leaves a partial file at path.
+// only after every chunk arrived with its expected size and SHA-256. A failed
+// get never leaves a partial file at path.
 func get(ctx context.Context, log *slog.Logger, coordAddr, key, path string) error {
 	conn, err := dial(coordAddr)
 	if err != nil {
@@ -46,12 +48,20 @@ func get(ctx context.Context, log *slog.Logger, coordAddr, key, path string) err
 			return fmt.Errorf("chunk %d (%s) has no replicas", chunk.GetIndex(), chunk.GetChunkId())
 		}
 		replica := chunk.GetReplicas()[0]
-		n, err := readChunk(ctx, replica.GetAddress(), chunk.GetChunkId(), tmp)
+		// Hash the bytes as they go to disk, and check them end to end against
+		// the coordinator's record. Failover to another replica is stage 5;
+		// until then a bad chunk fails the whole get.
+		hasher := sha256.New()
+		n, err := readChunk(ctx, replica.GetAddress(), chunk.GetChunkId(), io.MultiWriter(tmp, hasher))
 		if err != nil {
 			return fmt.Errorf("read chunk %d (%s) from %s: %w", chunk.GetIndex(), chunk.GetChunkId(), replica.GetNodeId(), err)
 		}
 		if n != chunk.GetSizeBytes() {
 			return fmt.Errorf("chunk %d (%s): got %d bytes, expected %d", chunk.GetIndex(), chunk.GetChunkId(), n, chunk.GetSizeBytes())
+		}
+		if got := hasher.Sum(nil); !bytes.Equal(got, chunk.GetSha256()) {
+			return fmt.Errorf("chunk %d (%s) from %s: sha256 %x, coordinator recorded %x",
+				chunk.GetIndex(), chunk.GetChunkId(), replica.GetNodeId(), got, chunk.GetSha256())
 		}
 		log.Info("chunk read", "chunk_id", chunk.GetChunkId(), "node_id", replica.GetNodeId(), "index", chunk.GetIndex(), "bytes", n)
 		total += n
@@ -75,12 +85,16 @@ func get(ctx context.Context, log *slog.Logger, coordAddr, key, path string) err
 }
 
 // checkChunkList rejects a chunk list whose indexes are not exactly 0..n-1 in
-// order, or whose sizes do not sum to the object size.
+// order, whose sizes do not sum to the object size, or that lacks a SHA-256
+// for any chunk (an older coordinator): unverifiable data is not downloaded.
 func checkChunkList(chunks []*objectstorev1.ChunkInfo, size int64) error {
 	var total int64
 	for i, c := range chunks {
 		if int(c.GetIndex()) != i {
 			return fmt.Errorf("chunk list out of order or has a gap: position %d has index %d", i, c.GetIndex())
+		}
+		if len(c.GetSha256()) != sha256.Size {
+			return fmt.Errorf("chunk %d (%s) has no sha256 to verify against", i, c.GetChunkId())
 		}
 		total += c.GetSizeBytes()
 	}

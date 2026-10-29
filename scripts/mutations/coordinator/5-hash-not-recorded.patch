@@ -1,0 +1,10 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -106,7 +106,6 @@
+         validateAgainstPlan(objectId, repository.plannedChunks(objectId), chunks, sizeBytes);
+ 
+         for (CompletedChunk chunk : chunks) {
+-            repository.recordChunkHash(chunk.chunkId(), chunk.sha256());
+             for (String nodeId : chunk.ackedNodeIds()) {
+                 repository.insertReplica(chunk.chunkId(), nodeId);
+             }

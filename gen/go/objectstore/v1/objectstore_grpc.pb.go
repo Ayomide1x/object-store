@@ -224,9 +224,12 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // StorageNodeService stores and serves chunk bytes. Every stream is framed in
-// messages of at most 1 MiB of data.
+// messages of at most 1 MiB of data. Every byte served has been checked against
+// its SHA-256 first.
 type StorageNodeServiceClient interface {
-	// WriteChunk takes exactly one header frame first, then data frames.
+	// WriteChunk takes exactly one header frame, then data frames, then exactly
+	// one trailer frame carrying the SHA-256 of the data. The chunk becomes
+	// visible only after the hash matches and the file is durable.
 	WriteChunk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WriteChunkRequest, WriteChunkResponse], error)
 	ReadChunk(ctx context.Context, in *ReadChunkRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReadChunkResponse], error)
 }
@@ -276,9 +279,12 @@ type StorageNodeService_ReadChunkClient = grpc.ServerStreamingClient[ReadChunkRe
 // for forward compatibility.
 //
 // StorageNodeService stores and serves chunk bytes. Every stream is framed in
-// messages of at most 1 MiB of data.
+// messages of at most 1 MiB of data. Every byte served has been checked against
+// its SHA-256 first.
 type StorageNodeServiceServer interface {
-	// WriteChunk takes exactly one header frame first, then data frames.
+	// WriteChunk takes exactly one header frame, then data frames, then exactly
+	// one trailer frame carrying the SHA-256 of the data. The chunk becomes
+	// visible only after the hash matches and the file is durable.
 	WriteChunk(grpc.ClientStreamingServer[WriteChunkRequest, WriteChunkResponse]) error
 	ReadChunk(*ReadChunkRequest, grpc.ServerStreamingServer[ReadChunkResponse]) error
 	mustEmbedUnimplementedStorageNodeServiceServer()

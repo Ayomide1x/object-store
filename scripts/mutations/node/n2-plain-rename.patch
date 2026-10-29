@@ -1,0 +1,19 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -72,9 +72,14 @@
+ func defaultOps() ops {
+ 	return ops{
+ 		syncFile: (*os.File).Sync,
+-		link:     os.Link,
++		link:     os.Rename,
+ 		syncDir:  syncDir,
+-		remove:   os.Remove,
++		remove: func(path string) error {
++			if err := os.Remove(path); !errors.Is(err, os.ErrNotExist) {
++				return err
++			}
++			return nil
++		},
+ 	}
+ }
+ 

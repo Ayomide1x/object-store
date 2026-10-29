@@ -2,7 +2,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +16,7 @@ import (
 
 const (
 	// MaxChunkSize is the largest chunk a node accepts.
-	MaxChunkSize = 4 << 20
+	MaxChunkSize = chunkstore.MaxChunkSize
 	// MaxFrameSize is the largest data frame sent or accepted on a stream.
 	MaxFrameSize = 1 << 20
 )
@@ -29,16 +28,20 @@ type Server struct {
 	nodeID string
 	store  *chunkstore.Store
 	log    *slog.Logger
+	// readSlots bounds concurrent reads. Each read holds a whole chunk in
+	// memory (up to 4 MiB) while verifying it, so this caps read memory.
+	readSlots chan struct{}
 }
 
-// New returns a Server that stores chunks in store.
-func New(nodeID string, store *chunkstore.Store, log *slog.Logger) *Server {
-	return &Server{nodeID: nodeID, store: store, log: log}
+// New returns a Server that stores chunks in store and serves at most
+// maxReads reads at once.
+func New(nodeID string, store *chunkstore.Store, log *slog.Logger, maxReads int) *Server {
+	return &Server{nodeID: nodeID, store: store, log: log, readSlots: make(chan struct{}, maxReads)}
 }
 
-// WriteChunk receives one header frame followed by data frames and writes the
-// chunk to a new file. Any framing or size violation fails the RPC and removes
-// the partial file.
+// WriteChunk receives one header frame, data frames, then one trailer frame
+// with the data's SHA-256. The chunk becomes visible under its final name
+// only if the size and hash match and the file is durable.
 func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkServer) error {
 	ctx := stream.Context()
 
@@ -59,119 +62,145 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 
 	log := s.log.With("node_id", s.nodeID, "object_id", header.GetObjectId(), "chunk_id", header.GetChunkId())
 
-	f, err := s.store.Create(ctx, header.GetChunkId())
+	// Fail fast before receiving the data. This is not the guarantee: the
+	// final link in Commit is what refuses to replace a chunk.
+	exists, err := s.store.Exists(ctx, header.GetChunkId())
 	switch {
 	case errors.Is(err, chunkstore.ErrInvalidID):
 		return status.Error(codes.InvalidArgument, err.Error())
-	case errors.Is(err, chunkstore.ErrExists):
-		log.Warn("write rejected: chunk exists")
-		return status.Error(codes.AlreadyExists, err.Error())
 	case err != nil:
-		log.Error("create chunk file", "error", err)
+		log.Error("check chunk exists", "error", err)
+		return status.Error(codes.Internal, err.Error())
+	case exists:
+		log.Warn("write rejected: chunk exists")
+		return status.Errorf(codes.AlreadyExists, "chunk %s already exists", header.GetChunkId())
+	}
+
+	w, err := s.store.NewWriter(ctx, header.GetChunkId())
+	if err != nil {
+		log.Error("start chunk write", "error", err)
 		return status.Error(codes.Internal, err.Error())
 	}
 
-	written, err := receiveData(stream, f, header.GetSizeBytes())
-	closeErr := f.Close()
-	if err == nil && closeErr != nil {
-		err = status.Errorf(codes.Internal, "close chunk file: %v", closeErr)
-	}
+	sum, err := receiveData(stream, w, header.GetSizeBytes())
 	if err != nil {
-		// Use a fresh context: the stream's may already be cancelled, and the
-		// partial file must still go.
-		if rmErr := s.store.Remove(context.WithoutCancel(ctx), header.GetChunkId()); rmErr != nil {
-			log.Error("remove partial chunk", "error", rmErr)
-		}
-		log.Warn("write failed", "error", err, "bytes_received", written)
+		w.Abort()
+		log.Warn("write failed", "error", err, "bytes_received", w.Written())
 		return err
 	}
 
-	log.Info("chunk written", "bytes", written)
+	err = w.Commit(ctx, sum)
+	switch {
+	case errors.Is(err, chunkstore.ErrChecksumMismatch):
+		// The request contradicts itself; the client still has the data and
+		// may retry. Nothing exists under the final name.
+		log.Warn("write rejected: checksum mismatch", "error", err)
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, chunkstore.ErrExists):
+		log.Warn("write rejected: chunk exists at link")
+		return status.Error(codes.AlreadyExists, err.Error())
+	case err != nil:
+		log.Error("commit chunk", "error", err)
+		return status.Error(codes.Internal, err.Error())
+	}
+
+	log.Info("chunk written", "bytes", w.Written(), "sha256", fmt.Sprintf("%x", sum))
 	return stream.SendAndClose(&objectstorev1.WriteChunkResponse{
 		ChunkId:      header.GetChunkId(),
-		BytesWritten: written,
+		BytesWritten: w.Written(),
+		Sha256:       sum,
 	})
 }
 
-// receiveData copies data frames from stream into w until the client closes
-// the stream. It returns a gRPC status error if the frames are malformed or
-// their total differs from want.
-func receiveData(stream objectstorev1.StorageNodeService_WriteChunkServer, w io.Writer, want int64) (int64, error) {
+// receiveData copies data frames into w until the trailer frame, then
+// requires the stream to end. It returns the trailer's SHA-256, or a gRPC
+// status error if the frames are malformed or their total differs from want.
+func receiveData(stream objectstorev1.StorageNodeService_WriteChunkServer, w io.Writer, want int64) ([]byte, error) {
 	var got int64
-	for {
+	var trailer *objectstorev1.WriteChunkTrailer
+	for trailer == nil {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			break
+			return nil, status.Error(codes.InvalidArgument, "stream ended without trailer frame")
 		}
 		if err != nil {
-			return got, fmt.Errorf("receive frame: %w", err)
+			return nil, fmt.Errorf("receive frame: %w", err)
 		}
-		var data []byte
 		switch frame := req.GetFrame().(type) {
 		case *objectstorev1.WriteChunkRequest_Data:
-			data = frame.Data
+			if len(frame.Data) > MaxFrameSize {
+				return nil, status.Errorf(codes.InvalidArgument, "frame of %d bytes exceeds %d", len(frame.Data), MaxFrameSize)
+			}
+			if got+int64(len(frame.Data)) > want {
+				return nil, status.Errorf(codes.InvalidArgument, "received more than size_bytes %d", want)
+			}
+			if _, err := w.Write(frame.Data); err != nil {
+				return nil, status.Errorf(codes.Internal, "write chunk: %v", err)
+			}
+			got += int64(len(frame.Data))
+		case *objectstorev1.WriteChunkRequest_Trailer:
+			trailer = frame.Trailer
 		case *objectstorev1.WriteChunkRequest_Header:
-			return got, status.Error(codes.InvalidArgument, "header frame repeated")
+			return nil, status.Error(codes.InvalidArgument, "header frame repeated")
 		default:
-			return got, status.Error(codes.InvalidArgument, "empty frame")
+			return nil, status.Error(codes.InvalidArgument, "empty frame")
 		}
-		if len(data) > MaxFrameSize {
-			return got, status.Errorf(codes.InvalidArgument, "frame of %d bytes exceeds %d", len(data), MaxFrameSize)
+	}
+
+	// The trailer must be the last frame.
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return nil, fmt.Errorf("receive after trailer: %w", err)
 		}
-		if got+int64(len(data)) > want {
-			return got, status.Errorf(codes.InvalidArgument, "received more than size_bytes %d", want)
-		}
-		if _, err := w.Write(data); err != nil {
-			return got, status.Errorf(codes.Internal, "write chunk file: %v", err)
-		}
-		got += int64(len(data))
+		return nil, status.Error(codes.InvalidArgument, "frame after trailer")
 	}
 	if got != want {
-		return got, status.Errorf(codes.InvalidArgument, "received %d bytes, header said %d", got, want)
+		return nil, status.Errorf(codes.InvalidArgument, "received %d bytes, header said %d", got, want)
 	}
-	return got, nil
+	if len(trailer.GetSha256()) != 32 {
+		return nil, status.Errorf(codes.InvalidArgument, "trailer sha256 is %d bytes, want 32", len(trailer.GetSha256()))
+	}
+	return trailer.GetSha256(), nil
 }
 
-// ReadChunk streams a chunk back in frames of at most MaxFrameSize.
+// ReadChunk verifies the whole chunk before sending its first frame, then
+// streams it in frames of at most MaxFrameSize. A chunk that fails
+// verification is never sent: the caller gets DATA_LOSS and no data.
 func (s *Server) ReadChunk(req *objectstorev1.ReadChunkRequest, stream objectstorev1.StorageNodeService_ReadChunkServer) error {
 	ctx := stream.Context()
 	log := s.log.With("node_id", s.nodeID, "chunk_id", req.GetChunkId())
 
-	f, err := s.store.Open(ctx, req.GetChunkId())
+	select {
+	case s.readSlots <- struct{}{}:
+		defer func() { <-s.readSlots }()
+	default:
+		log.Warn("read rejected: concurrent read limit reached", "limit", cap(s.readSlots))
+		return status.Errorf(codes.ResourceExhausted, "node %s is serving %d reads; retry later", s.nodeID, cap(s.readSlots))
+	}
+
+	data, err := s.store.Read(ctx, req.GetChunkId())
 	switch {
 	case errors.Is(err, chunkstore.ErrInvalidID):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, chunkstore.ErrNotFound):
 		log.Warn("read of missing chunk")
 		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, chunkstore.ErrCorrupt):
+		log.Error("chunk failed verification; refusing to serve it", "error", err)
+		return status.Error(codes.DataLoss, err.Error())
 	case err != nil:
-		log.Error("open chunk file", "error", err)
+		log.Error("read chunk", "error", err)
 		return status.Error(codes.Internal, err.Error())
 	}
-	defer f.Close()
 
-	var sent int64
-	for {
-		// A fresh buffer per frame: gRPC forbids modifying a message after Send.
-		buf := make([]byte, MaxFrameSize)
-		n, err := io.ReadFull(f, buf)
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			err = io.EOF
-		}
-		if n > 0 {
-			if sendErr := stream.Send(&objectstorev1.ReadChunkResponse{Data: buf[:n]}); sendErr != nil {
-				return fmt.Errorf("send frame of chunk %s: %w", req.GetChunkId(), sendErr)
-			}
-			sent += int64(n)
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			log.Error("read chunk file", "error", err)
-			return status.Errorf(codes.Internal, "read chunk file: %v", err)
+	// data is never modified after this point, so sending slices of it is
+	// safe (gRPC forbids modifying a message after Send).
+	for off := 0; off < len(data); off += MaxFrameSize {
+		end := min(off+MaxFrameSize, len(data))
+		if err := stream.Send(&objectstorev1.ReadChunkResponse{Data: data[off:end]}); err != nil {
+			return fmt.Errorf("send frame of chunk %s: %w", req.GetChunkId(), err)
 		}
 	}
-	log.Info("chunk read", "bytes", sent)
+	log.Info("chunk read", "bytes", len(data))
 	return nil
 }

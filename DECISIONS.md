@@ -214,3 +214,115 @@ Verified on a clean `down -v`:
 
 **Because:** the probe runs where the listener is, needs only bash (present in `eclipse-temurin:25-jre`, Ubuntu-based), and makes the stack itself define readiness.
 **Breaks if:** the coordinator starts accepting connections before it can serve, for example if the gRPC server is ever started before migrations or registration. Or if the coordinator's runtime image moves to one without bash (for example distroless). Or if readiness needs more than "listening," such as a lost database connection. A TCP probe doesn't see that; the gRPC health service would.
+
+## The chunk checksum travels in a trailer frame, hashed while streaming (stage 3)
+**Chose:** `WriteChunkRequest.frame` gains `WriteChunkTrailer trailer = 3` (`bytes sha256 = 1`, exactly 32 bytes). A write is exactly one header, then data frames, then exactly one trailer, then end of stream. Data after the trailer, a repeated or missing trailer, or a digest that isn't 32 bytes → `INVALID_ARGUMENT`. The client hashes through an `io.TeeReader` as it sends, so the file is read once. Other new fields: `WriteChunkResponse.sha256 = 3` (the hash the node verified), `CompletedChunk.sha256 = 5`, `ChunkInfo.sha256 = 5`. All of these are additions, which pass `buf breaking` (WIRE_JSON). A deliberate renumber was checked to fail.
+**Over:** the hash in the header frame.
+**Because:** a header hash means reading each chunk twice or buffering 4 MiB on the client. The node gains nothing from knowing the hash early: it must receive every byte before it can compare, and it writes to a temp file meanwhile either way.
+**Breaks if:** the node ever needs to reject a write before receiving it, based on its hash (for example deduplication, which is out of scope).
+
+## Node write path: temp → fsync → link (no-replace) → fsync dir → unlink; temps cleaned before listening (stage 3)
+**Supersedes:** "Node rejects malformed writes and never overwrites a chunk" (stage 1). The never-overwrite guarantee moves from `O_EXCL` on the final name to `link()` failing with `EEXIST`, and the crash gap that entry flagged is closed.
+**Chose:** a write streams into `/data/tmp/chunk-<id>-*`, hashing as it goes. On the trailer, in `chunkstore.Writer.Commit`:
+1. compare the hash; on a mismatch remove the temp file (nothing ever existed under the final name);
+2. write the header, `fsync` the temp file, close it;
+3. `link(temp, /data/chunks/<id>)`; `EEXIST` → remove the temp file, `ALREADY_EXISTS`, and the existing chunk is untouched;
+4. `fsync /data/chunks`;
+5. `unlink` the temp name;
+6. acknowledge.
+
+An `Exists` check at the header frame fails fast but is not the guarantee. At startup, before the listener opens, the node deletes everything in `/data/tmp` and logs each removal with its `chunk_id`. `/data/tmp` and `/data/chunks` are on the same volume, so `link()` works.
+
+**Crash at any point:** before the link, only a temp file exists (removed at startup, never acknowledged). After the link, the final file is complete, because it was fsynced before it got the name. A leftover temp name is just a second link, removed at startup. No point leaves a partial file under a final name.
+**Over:** plain `rename()`, which silently replaces an existing file and so breaks invariant 4; `renameat2(RENAME_NOREPLACE)`, which is Linux-only (macOS needs `renameatx_np(RENAME_EXCL)`), so `go test` on the Mac would exercise different code from the container; temp files as dotfiles inside `/data/chunks`.
+**Because:** `link()` + `unlink()` is POSIX and refuses to replace on both platforms. Its cost, a moment with two names for one inode, is harmless.
+**Breaks if:** two node processes share one data directory (startup cleanup would delete the other's in-flight temps), or the volume's filesystem lacks hard links.
+
+## Self-describing chunk files: 56-byte header with magic, chunk ID and SHA-256 (stage 3)
+**Chose:** each chunk file is `"OSCHUNK1"` (8 bytes, also the format version) + the chunk ID as 16 UUID bytes + the SHA-256 of the data (32 bytes) + the data.
+**Over:** a separate hash file per chunk (two files, not created atomically: a crash between them leaves a chunk without a hash); extended attributes (support varies across Docker Desktop volumes and overlayfs); having the reader supply the expected hash from `GetObject` (the node couldn't verify anything on its own, and every caller, including stage 7 peer copies, would have to carry the hash).
+**Because:** the node can verify any chunk by itself, before serving a client or a peer (invariant 5). The chunk ID in the header catches a *misplaced* file: an intact chunk sitting under another chunk's name. Its own hash would pass, so only the ID check catches it, and in stage 7 node-to-node copies no client is checking.
+**Breaks if:** the format must change. The magic is the version, so a reader would have to accept both versions during a migration.
+
+## Reads verify the whole chunk in memory before the first frame; DATA_LOSS on mismatch (stage 3)
+**Chose:** `ReadChunk` reads the whole file into one buffer (at most 56 B + 4 MiB; anything else is corrupt), checks the magic, that the header's chunk ID equals the requested ID, and the SHA-256. Only then does it send ≤ 1 MiB slices of that same buffer. Any failure → `DATA_LOSS`, an error log line with `chunk_id` and `node_id`, and zero frames sent.
+**Over:** two passes over the file (hash, then send, each with a 1 MiB buffer), where the bytes sent wouldn't be the bytes verified, because a media error or page-cache eviction between passes could serve unverified data; verifying per frame (needs per-frame hashes, and still sends bad frames before the end is checked).
+**Because:** invariant 5 is about the bytes that actually go out, so verify-then-send must use one buffer.
+**Breaks if:** chunks grow well beyond 4 MiB, or memory per read matters more than strict verification. See the next entry for the bound.
+
+## Concurrent reads bounded by a semaphore; RESOURCE_EXHAUSTED when full (stage 3)
+**Chose:** a buffered channel of capacity `NODE_MAX_CONCURRENT_READS` (default 32) in the `Server` struct. A read takes a slot without waiting, or fails at once with `RESOURCE_EXHAUSTED`, and gives the slot back when it finishes. Read memory is capped at about N × 4 MiB (128 MiB by default).
+**Over:** unbounded reads (memory grows with demand until the node is OOM-killed); a waiting semaphore (requests pile up and hold their connections open, hiding overload from clients).
+**Because:** failing fast tells the caller to back off or try elsewhere (stage 5 failover). The semaphore lives in the struct, so there's no package-level mutable state.
+**Breaks if:** legitimate load regularly exceeds N, so clients see spurious errors. Writes are not bounded: each one holds only a 1 MiB frame, but write concurrency is still unlimited.
+
+## A write whose hash doesn't match returns INVALID_ARGUMENT (stage 3)
+**Chose:** `INVALID_ARGUMENT` when the received bytes don't match the trailer's SHA-256. The temp file is removed and nothing exists under the final name.
+**Over:** `DATA_LOSS`.
+**Because:** the request contradicts itself, and the client still has the data and can retry. gRPC defines `DATA_LOSS` as *unrecoverable* loss, which describes corrupt stored data on read. S3 (`BadDigest`, HTTP 400) and GCS make the same choice.
+**Breaks if:** clients treat `INVALID_ARGUMENT` as permanent and don't retry what was really corruption in transit. Stage 4's write path decides retry behaviour.
+
+## Checksums recorded at CompleteUpload from the client's report (stage 3)
+**Amends:** the "still trusted from the client" list in "Coordinator-computed chunk boundaries; CompleteUpload validates against the issued plan" (stage 2).
+**Chose:** migration V3 adds `chunks.sha256 bytea CHECK (octet_length(sha256) = 32)`. It's `NULL` while PENDING and set once at `CompleteUpload` (`... WHERE sha256 IS NULL`), in the same transaction as the replica rows, the status change and the key swap. `CompleteUpload` rejects a chunk whose `sha256` isn't exactly 32 bytes. `GetObject` returns each chunk's hash.
+**Still trusted from the client until stage 4:** that a placed node acknowledged the chunk, and that the hash reported is the one the node verified. The client checks the node's `WriteChunkResponse.sha256` against its own hash, but the coordinator hears only the client. The coordinator can't verify the hash itself: it never sees the bytes.
+**Over:** recording the hash at initiate (it isn't known yet); nodes reporting hashes to the coordinator directly (that's stage 4's ack-reporting question).
+**Because:** this is the minimum that gives every committed chunk a recorded hash for the end-to-end check.
+**Breaks if:** a buggy client reports a wrong hash. Every later `get` of that chunk then fails its end-to-end check: loud, but the object is unreadable.
+
+## V3 requires a clean volume, enforced by a guard in the migration (stage 3)
+**Chose:** V3 begins with a block that raises `stage 3 requires a clean volume: N existing chunks have no checksum. Run: docker compose down -v` if any `chunks` rows exist, so the coordinator refuses to start. Checked against a stage 2 schema with one chunk (it raised), and with none (it applied).
+**Over:** serving pre-stage-3 chunks unverified (breaks invariant 5); hashing existing files now ("trust on first hash", which would bless any corruption already on disk); keeping `NULL`-hash chunks that can never be read.
+**Because:** a hard upgrade boundary is explicit and loud. The alternatives are silently unsafe or silently broken.
+**Breaks if:** a deployment has data worth keeping across this upgrade. That would need a migration tool that rewrites chunk files using hashes from a trusted source, which doesn't exist here.
+
+## Absent checksum fields fail closed (stage 3)
+**Chose:** a missing checksum is rejected everywhere, never read as "skip the check":
+- a write with no trailer → `INVALID_ARGUMENT`;
+- a stage 2 node sees the trailer as an empty frame and rejects the write;
+- a `CompletedChunk` with no `sha256` → `INVALID_ARGUMENT`;
+- `osctl` refuses a `GetObject` chunk list where any chunk lacks a 32-byte hash, and refuses a `WriteChunkResponse` whose hash differs from its own or is missing.
+
+**Over:** treating an absent hash as unverified-but-allowed.
+**Because:** "new fields must be safe when absent" means, for integrity fields, that absence must never weaken the check.
+**Breaks if:** a mixed-version deployment must keep working across the upgrade. Every pairing of old and new fails here, deliberately.
+
+## get verifies every chunk end to end against the coordinator's hash (stage 3)
+**Chose:** `osctl get` writes each chunk through an `io.MultiWriter(tempFile, sha256)` and compares the result with `ChunkInfo.sha256` before moving on. A mismatch or a node `DATA_LOSS` fails the whole `get` loudly, naming the chunk and node, and no output file is created. Failover to another replica is stage 5.
+**Over:** trusting the node's own check.
+**Because:** the node's check catches corruption on disk. The client check catches what the node can't see: the wrong chunk served, a node bug, corruption in transit. It costs a streaming hash and no buffering.
+**Breaks if:** never in correctness terms. Until stage 5, one bad replica makes the object unreadable.
+
+## Write durability order is checked by a Go test seam and by a syscall trace (stage 3)
+**Chose:** `chunkstore.Store` routes its four durability calls (`syncFile`, `link`, `syncDir`, `remove`) through function fields. `TestCommitDurabilityOrder` wraps them and asserts the exact sequence: sync temp → link tmp→chunks/<id> → sync dir chunks → unlink tmp. `scripts/stage3-fsync-trace.sh` attaches `strace` (side container, `--pid container:<node1>`, `SYS_PTRACE`) to the real binary and checks the same order from the syscalls (`fsync`, `linkat`, `fsync`, `unlinkat`) for each chunk of an upload. Mutation N3 (both fsyncs removed) is caught by the test, and by the trace against a node built with N3 applied (FAIL on both chunks, exit 1).
+**Over:** the trace alone; no check at all (the page cache makes a missing fsync invisible to any ordinary test).
+**Because:** the seam catches a missing or reordered call in `go test` in milliseconds. The trace proves the shipped binary makes the real syscalls. Neither can prove fsync is *sufficient* on a given disk; that needs power-loss testing (e.g. dm-flakey, CrashMonkey), which is out of scope.
+**Breaks if:** someone adds a durability call that bypasses `ops`. The seam test would not see it, though the trace would.
+
+## Node mutation script; coordinator script extended with M5 (stage 3)
+**Extends:** "Atomicity is proven by a fault-injection trigger test; mutations as patches" (stage 2). Patches now live in `scripts/mutations/coordinator/` and `scripts/mutations/node/`.
+**Chose:** `scripts/node-mutation-check.sh` applies each node patch, runs `go test -json ./node/...`, and reports failed tests. A mutation that doesn't compile is reported as `BUILD FAILED`, never as detected.
+
+| Mutation | Must be caught by |
+|---|---|
+| N1 skip read hash check | `TestReadChunkCorruptSendsNothing` |
+| N2 plain rename (and the unlink tolerates the vanished temp) | `TestWriteChunkNeverReplacesAtFinalStep`, alone |
+| N3 no fsync (file and directory) | `TestCommitDurabilityOrder`, alone |
+| N4 skip write hash check | `TestWriteChunkFraming/checksum_mismatch` |
+| N5 no temp cleanup | `TestCleanTemps` |
+| N6 link before comparing | `TestWriteChunkFraming/checksum_mismatch` |
+| N7 skip chunk-ID check on read | `TestReadChunkCorruptSendsNothing/valid_chunk_file_under_another_chunk's_name`, alone |
+| N8 no read limit | `TestReadChunkConcurrencyLimit`, alone |
+| M5 (coordinator) hash not recorded | `checksumsAreRecordedAndReturnedByGetObject`, alone |
+
+N2 is written as a *faithful* rename refactor. A bare `os.Rename` swap made every write fail at the following unlink, which "detected" it through all 25 tests without proving anything about replacement. `TestWriteChunkNeverReplacesAtFinalStep` waits for the server's temp file to appear, which shows the up-front `Exists` check has passed, and only then plants the final file, so the test exercises `link()` itself.
+**Because:** each guarantee is shown to be load-bearing by a test that fails without it.
+**Breaks if:** code changes stop a patch from applying. The script then fails at `git apply --check`, never silently.
+
+## Stage 3 acceptance scripts reach the distroless node's volume through side containers (stage 3)
+**Chose:** the node image has no shell, so the scripts run `alpine:3` with `--volumes-from <node1>` to read and modify `/data` (busybox `dd`, `od`, `sha256sum`), which also works while node1 is stopped.
+- `stage3-corrupt-check.sh` flips one data byte, expects `DataLoss`, no output file and a node log line, then **flips it back** (even on failure) and checks the object reads back identical.
+- `stage3-crash-check.sh` uses a `docker:cli` watcher with the Docker socket that busy-waits inside node1's volume for a temp file, then SIGKILLs node1 within milliseconds. It then checks every final chunk file (magic, ID, hash) and that this run's temp file is removed and logged after restart. It **fails if the kill landed too late**: a successful put, no temp file, or a `COMMITTED` object at step h each fail the run (checked by forcing a late kill).
+**Over:** a debug shell in the node image; polling `/data/tmp` from the host with one `docker run` per poll (~300 ms per poll, longer than a whole 100 MiB upload).
+**Because:** the production image stays minimal, and each script leaves the volume valid for the next. An earlier version of the corruption check didn't restore its byte, and the crash check correctly flagged that chunk as BAD.
+**Breaks if:** the Docker socket isn't at `/var/run/docker.sock` inside the Docker VM, or the upload outruns the watcher on a much faster machine. The PENDING check then fails the run, never passes it.

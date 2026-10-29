@@ -1,0 +1,22 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -243,9 +243,6 @@
+ 	if _, err := w.file.WriteAt(header, 0); err != nil {
+ 		return fmt.Errorf("write header for chunk %s: %w", w.chunkID, err)
+ 	}
+-	if err := w.store.ops.syncFile(w.file); err != nil {
+-		return fmt.Errorf("sync chunk %s: %w", w.chunkID, err)
+-	}
+ 	if err := w.file.Close(); err != nil {
+ 		return fmt.Errorf("close chunk %s: %w", w.chunkID, err)
+ 	}
+@@ -263,9 +260,6 @@
+ 	// The chunk is now complete under its final name. A failure from here on
+ 	// is reported, but the final file stays: it is valid, and removing it
+ 	// could race with a reader.
+-	if err := w.store.ops.syncDir(w.store.chunks); err != nil {
+-		return fmt.Errorf("sync chunks dir after chunk %s: %w", w.chunkID, err)
+-	}
+ 	if err := w.store.ops.remove(w.file.Name()); err != nil {
+ 		return fmt.Errorf("unlink temp of chunk %s: %w", w.chunkID, err)
+ 	}

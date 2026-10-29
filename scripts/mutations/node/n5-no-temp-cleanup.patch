@@ -1,0 +1,11 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -116,7 +116,7 @@
+ 		return nil, fmt.Errorf("list %s: %w", s.tmp, err)
+ 	}
+ 	var removed []string
+-	for _, e := range entries {
++	for _, e := range entries[:0] {
+ 		if err := os.RemoveAll(filepath.Join(s.tmp, e.Name())); err != nil {
+ 			return removed, fmt.Errorf("remove stray temp %s: %w", e.Name(), err)
+ 		}

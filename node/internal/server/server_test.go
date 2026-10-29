@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,11 +23,19 @@ import (
 	"github.com/Ayomide1x/object-store/node/internal/chunkstore"
 )
 
-const testChunkID = "0b6f0d8e-7a64-4a8e-9b3a-2a1c7f0e5d11"
+const (
+	testChunkID  = "0b6f0d8e-7a64-4a8e-9b3a-2a1c7f0e5d11"
+	otherChunkID = "7d1e2f3a-4b5c-4d6e-8f70-112233445566"
+)
 
-// startServer runs a Server on an in-memory listener and returns a client
-// for it plus the chunk directory.
-func startServer(t *testing.T) (objectstorev1.StorageNodeServiceClient, string) {
+// testNode is a Server on an in-memory listener.
+type testNode struct {
+	client objectstorev1.StorageNodeServiceClient
+	srv    *Server
+	dir    string
+}
+
+func startServer(t *testing.T, maxReads int) testNode {
 	t.Helper()
 	dir := t.TempDir()
 	store, err := chunkstore.New(dir)
@@ -33,12 +43,13 @@ func startServer(t *testing.T) (objectstorev1.StorageNodeServiceClient, string) 
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New("test-node", store, log, maxReads)
 
 	lis := bufconn.Listen(16 << 20)
-	srv := grpc.NewServer()
-	objectstorev1.RegisterStorageNodeServiceServer(srv, New("test-node", store, log))
-	go srv.Serve(lis)
-	t.Cleanup(srv.Stop)
+	gs := grpc.NewServer()
+	objectstorev1.RegisterStorageNodeServiceServer(gs, srv)
+	go gs.Serve(lis)
+	t.Cleanup(gs.Stop)
 
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
@@ -48,7 +59,18 @@ func startServer(t *testing.T) (objectstorev1.StorageNodeServiceClient, string) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return objectstorev1.NewStorageNodeServiceClient(conn), dir
+	return testNode{client: objectstorev1.NewStorageNodeServiceClient(conn), srv: srv, dir: dir}
+}
+
+func (n testNode) finalPath(id string) string { return filepath.Join(n.dir, "chunks", id) }
+
+func (n testNode) tempCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(n.dir, "tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
 }
 
 func header(size int64) *objectstorev1.WriteChunkRequest {
@@ -61,11 +83,22 @@ func data(b []byte) *objectstorev1.WriteChunkRequest {
 	return &objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Data{Data: b}}
 }
 
-// write sends frames and returns the RPC's final error.
-func write(ctx context.Context, c objectstorev1.StorageNodeServiceClient, frames []*objectstorev1.WriteChunkRequest) error {
+func trailer(sum []byte) *objectstorev1.WriteChunkRequest {
+	return &objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Trailer{
+		Trailer: &objectstorev1.WriteChunkTrailer{Sha256: sum},
+	}}
+}
+
+func sha(b []byte) []byte {
+	s := sha256.Sum256(b)
+	return s[:]
+}
+
+// write sends frames and returns the response and the RPC's final error.
+func write(ctx context.Context, c objectstorev1.StorageNodeServiceClient, frames []*objectstorev1.WriteChunkRequest) (*objectstorev1.WriteChunkResponse, error) {
 	stream, err := c.WriteChunk(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, f := range frames {
 		// A Send error means the server already failed the RPC; the real
@@ -74,63 +107,170 @@ func write(ctx context.Context, c objectstorev1.StorageNodeServiceClient, frames
 			break
 		}
 	}
-	_, err = stream.CloseAndRecv()
-	return err
+	return stream.CloseAndRecv()
+}
+
+// writeValid stores b as chunk id through the RPC.
+func writeValid(t *testing.T, n testNode, id string, b []byte) {
+	t.Helper()
+	frames := []*objectstorev1.WriteChunkRequest{
+		{Frame: &objectstorev1.WriteChunkRequest_Header{Header: &objectstorev1.WriteChunkHeader{ChunkId: id, SizeBytes: int64(len(b))}}},
+	}
+	for off := 0; off < len(b); off += MaxFrameSize {
+		frames = append(frames, data(b[off:min(off+MaxFrameSize, len(b))]))
+	}
+	frames = append(frames, trailer(sha(b)))
+	if _, err := write(t.Context(), n.client, frames); err != nil {
+		t.Fatalf("write %s: %v", id, err)
+	}
+}
+
+// read returns the frames received before the stream ended, and its error.
+func read(ctx context.Context, c objectstorev1.StorageNodeServiceClient, id string) ([][]byte, error) {
+	stream, err := c.ReadChunk(ctx, &objectstorev1.ReadChunkRequest{ChunkId: id})
+	if err != nil {
+		return nil, err
+	}
+	var frames [][]byte
+	for {
+		resp, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return frames, nil
+		}
+		if err != nil {
+			return frames, err
+		}
+		frames = append(frames, resp.GetData())
+	}
 }
 
 func TestWriteChunkFraming(t *testing.T) {
 	oneMiB := bytes.Repeat([]byte{'a'}, MaxFrameSize)
+	abc := []byte("abc")
 
+	type frames = []*objectstorev1.WriteChunkRequest
 	tests := []struct {
 		name     string
-		frames   []*objectstorev1.WriteChunkRequest
+		frames   frames
 		wantCode codes.Code
-		wantFile bool
 	}{
-		{"zero bytes", []*objectstorev1.WriteChunkRequest{header(0)}, codes.OK, true},
-		{"one frame", []*objectstorev1.WriteChunkRequest{header(3), data([]byte("abc"))}, codes.OK, true},
-		{"full chunk in 1 MiB frames", []*objectstorev1.WriteChunkRequest{header(MaxChunkSize), data(oneMiB), data(oneMiB), data(oneMiB), data(oneMiB)}, codes.OK, true},
-		{"no frames", nil, codes.InvalidArgument, false},
-		{"data before header", []*objectstorev1.WriteChunkRequest{data([]byte("abc")), header(3)}, codes.InvalidArgument, false},
-		{"header repeated", []*objectstorev1.WriteChunkRequest{header(3), header(3), data([]byte("abc"))}, codes.InvalidArgument, false},
-		{"empty frame", []*objectstorev1.WriteChunkRequest{header(3), {}}, codes.InvalidArgument, false},
-		{"too few bytes", []*objectstorev1.WriteChunkRequest{header(4), data([]byte("abc"))}, codes.InvalidArgument, false},
-		{"too many bytes", []*objectstorev1.WriteChunkRequest{header(2), data([]byte("abc"))}, codes.InvalidArgument, false},
-		{"size over 4 MiB", []*objectstorev1.WriteChunkRequest{header(MaxChunkSize + 1)}, codes.InvalidArgument, false},
-		{"frame over 1 MiB", []*objectstorev1.WriteChunkRequest{header(MaxFrameSize + 1), data(append(oneMiB, 'a'))}, codes.InvalidArgument, false},
+		{"zero bytes", frames{header(0), trailer(sha(nil))}, codes.OK},
+		{"one frame", frames{header(3), data(abc), trailer(sha(abc))}, codes.OK},
+		{"full chunk in 1 MiB frames", frames{header(MaxChunkSize), data(oneMiB), data(oneMiB), data(oneMiB), data(oneMiB),
+			trailer(sha(bytes.Repeat([]byte{'a'}, MaxChunkSize)))}, codes.OK},
+		{"no frames", nil, codes.InvalidArgument},
+		{"data before header", frames{data(abc), header(3), trailer(sha(abc))}, codes.InvalidArgument},
+		{"header repeated", frames{header(3), header(3), data(abc), trailer(sha(abc))}, codes.InvalidArgument},
+		{"empty frame", frames{header(3), {}, trailer(sha(abc))}, codes.InvalidArgument},
+		{"too few bytes", frames{header(4), data(abc), trailer(sha(abc))}, codes.InvalidArgument},
+		{"too many bytes", frames{header(2), data(abc), trailer(sha(abc))}, codes.InvalidArgument},
+		{"size over 4 MiB", frames{header(MaxChunkSize + 1)}, codes.InvalidArgument},
+		{"frame over 1 MiB", frames{header(MaxFrameSize + 1), data(append(oneMiB, 'a'))}, codes.InvalidArgument},
+		{"missing trailer", frames{header(3), data(abc)}, codes.InvalidArgument},
+		{"trailer repeated", frames{header(3), data(abc), trailer(sha(abc)), trailer(sha(abc))}, codes.InvalidArgument},
+		{"data after trailer", frames{header(3), data(abc), trailer(sha(abc)), data(abc)}, codes.InvalidArgument},
+		{"digest 31 bytes", frames{header(3), data(abc), trailer(sha(abc)[:31])}, codes.InvalidArgument},
+		{"digest missing", frames{header(3), data(abc), trailer(nil)}, codes.InvalidArgument},
+		{"checksum mismatch", frames{header(3), data(abc), trailer(sha([]byte("abd")))}, codes.InvalidArgument},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, dir := startServer(t)
-			err := write(t.Context(), client, tt.frames)
+			n := startServer(t, 4)
+			_, err := write(t.Context(), n.client, tt.frames)
 			if got := status.Code(err); got != tt.wantCode {
 				t.Fatalf("code = %v, want %v (err: %v)", got, tt.wantCode, err)
 			}
-			_, statErr := os.Stat(filepath.Join(dir, testChunkID))
-			if exists := statErr == nil; exists != tt.wantFile {
-				t.Errorf("chunk file exists = %v, want %v", exists, tt.wantFile)
+			_, statErr := os.Stat(n.finalPath(testChunkID))
+			if exists, want := statErr == nil, tt.wantCode == codes.OK; exists != want {
+				t.Errorf("final chunk file exists = %v, want %v", exists, want)
+			}
+			if c := n.tempCount(t); c != 0 {
+				t.Errorf("tmp has %d entries after the write, want 0", c)
 			}
 		})
 	}
 }
 
-func TestWriteChunkNeverOverwrites(t *testing.T) {
-	client, dir := startServer(t)
-	ctx := t.Context()
-
-	if err := write(ctx, client, []*objectstorev1.WriteChunkRequest{header(3), data([]byte("old"))}); err != nil {
-		t.Fatalf("first write: %v", err)
-	}
-	err := write(ctx, client, []*objectstorev1.WriteChunkRequest{header(3), data([]byte("new"))})
-	if got := status.Code(err); got != codes.AlreadyExists {
-		t.Fatalf("second write code = %v, want AlreadyExists", got)
-	}
-	got, err := os.ReadFile(filepath.Join(dir, testChunkID))
+func TestWriteChunkStoresHeaderAndReturnsHash(t *testing.T) {
+	n := startServer(t, 4)
+	b := []byte("hello chunk")
+	resp, err := write(t.Context(), n.client, []*objectstorev1.WriteChunkRequest{header(int64(len(b))), data(b), trailer(sha(b))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "old" {
-		t.Errorf("chunk content = %q, want %q", got, "old")
+	if !bytes.Equal(resp.GetSha256(), sha(b)) || resp.GetBytesWritten() != int64(len(b)) {
+		t.Errorf("response = %x/%d, want %x/%d", resp.GetSha256(), resp.GetBytesWritten(), sha(b), len(b))
+	}
+	file, err := os.ReadFile(n.finalPath(testChunkID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idBytes := []byte{0x0b, 0x6f, 0x0d, 0x8e, 0x7a, 0x64, 0x4a, 0x8e, 0x9b, 0x3a, 0x2a, 0x1c, 0x7f, 0x0e, 0x5d, 0x11}
+	want := append(append(append([]byte("OSCHUNK1"), idBytes...), sha(b)...), b...)
+	if !bytes.Equal(file, want) {
+		t.Errorf("chunk file =\n  %x\nwant\n  %x", file, want)
+	}
+}
+
+// The fast path rejects a write whose chunk already exists before any data.
+func TestWriteChunkExistingChunkRejectedUpFront(t *testing.T) {
+	n := startServer(t, 4)
+	writeValid(t, n, testChunkID, []byte("old"))
+	_, err := write(t.Context(), n.client, []*objectstorev1.WriteChunkRequest{header(3), data([]byte("new")), trailer(sha([]byte("new")))})
+	if got := status.Code(err); got != codes.AlreadyExists {
+		t.Fatalf("code = %v, want AlreadyExists", got)
+	}
+	got, err := read(t.Context(), n.client, testChunkID)
+	if err != nil || len(got) != 1 || string(got[0]) != "old" {
+		t.Errorf("read after rejected overwrite = %q, %v; want [old]", got, err)
+	}
+}
+
+// TestWriteChunkNeverReplacesAtFinalStep plants a file under the final name
+// after the server has passed its up-front existence check, so only the
+// final link step stands between the write and the planted file.
+func TestWriteChunkNeverReplacesAtFinalStep(t *testing.T) {
+	n := startServer(t, 4)
+	ctx := t.Context()
+	stream, err := n.client.WriteChunk(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := []byte("new data")
+	for _, f := range []*objectstorev1.WriteChunkRequest{header(int64(len(b))), data(b)} {
+		if err := stream.Send(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The temp file appears only after the existence check passed.
+	deadline := time.Now().Add(5 * time.Second)
+	for n.tempCount(t) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("server never created a temp file")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	planted := []byte("planted: must survive")
+	if err := os.WriteFile(n.finalPath(testChunkID), planted, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := stream.Send(trailer(sha(b))); err != nil {
+		t.Fatal(err)
+	}
+	_, err = stream.CloseAndRecv()
+	if got := status.Code(err); got != codes.AlreadyExists {
+		t.Fatalf("code = %v, want AlreadyExists (err: %v)", got, err)
+	}
+	got, err := os.ReadFile(n.finalPath(testChunkID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, planted) {
+		t.Errorf("planted file was replaced: now %q", got)
+	}
+	if c := n.tempCount(t); c != 0 {
+		t.Errorf("tmp has %d entries, want 0", c)
 	}
 }
 
@@ -147,50 +287,128 @@ func TestReadChunkFrames(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, dir := startServer(t)
+			n := startServer(t, 4)
 			want := bytes.Repeat([]byte{'z'}, tt.size)
-			if err := os.WriteFile(filepath.Join(dir, testChunkID), want, 0o644); err != nil {
-				t.Fatal(err)
-			}
+			writeValid(t, n, testChunkID, want)
 
-			stream, err := client.ReadChunk(t.Context(), &objectstorev1.ReadChunkRequest{ChunkId: testChunkID})
+			frames, err := read(t.Context(), n.client, testChunkID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var got []byte
-			frames := 0
-			for {
-				resp, err := stream.Recv()
-				if errors.Is(err, io.EOF) {
-					break
+			for _, f := range frames {
+				if len(f) > MaxFrameSize {
+					t.Fatalf("frame of %d bytes exceeds %d", len(f), MaxFrameSize)
 				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(resp.GetData()) > MaxFrameSize {
-					t.Fatalf("frame of %d bytes exceeds %d", len(resp.GetData()), MaxFrameSize)
-				}
-				got = append(got, resp.GetData()...)
-				frames++
 			}
-			if !bytes.Equal(got, want) {
+			if got := bytes.Join(frames, nil); !bytes.Equal(got, want) {
 				t.Errorf("read %d bytes, want %d identical bytes", len(got), len(want))
 			}
-			if frames != tt.wantFrames {
-				t.Errorf("frames = %d, want %d", frames, tt.wantFrames)
+			if len(frames) != tt.wantFrames {
+				t.Errorf("frames = %d, want %d", len(frames), tt.wantFrames)
+			}
+		})
+	}
+}
+
+// TestReadChunkCorruptSendsNothing damages a stored chunk in each way the
+// header guards against. Every case must fail with DATA_LOSS before a single
+// frame is sent (invariant 5).
+func TestReadChunkCorruptSendsNothing(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789"), 300_000) // 3 MB: several frames
+	tests := []struct {
+		name   string
+		damage func(t *testing.T, n testNode) // leaves a damaged file at testChunkID
+	}{
+		{"data byte flipped", func(t *testing.T, n testNode) {
+			flip(t, n.finalPath(testChunkID), chunkstore.HeaderSize+2_500_000)
+		}},
+		{"stored hash byte flipped", func(t *testing.T, n testNode) { flip(t, n.finalPath(testChunkID), 30) }},
+		{"magic damaged", func(t *testing.T, n testNode) { flip(t, n.finalPath(testChunkID), 0) }},
+		{"truncated below header", func(t *testing.T, n testNode) {
+			if err := os.Truncate(n.finalPath(testChunkID), chunkstore.HeaderSize-1); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"truncated data", func(t *testing.T, n testNode) {
+			if err := os.Truncate(n.finalPath(testChunkID), chunkstore.HeaderSize+100); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"valid chunk file under another chunk's name", func(t *testing.T, n testNode) {
+			// A misplaced file: intact, but it is not testChunkID's chunk.
+			writeValid(t, n, otherChunkID, payload)
+			if err := os.Remove(n.finalPath(testChunkID)); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(n.finalPath(otherChunkID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(n.finalPath(testChunkID), b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := startServer(t, 4)
+			writeValid(t, n, testChunkID, payload)
+			tt.damage(t, n)
+
+			frames, err := read(t.Context(), n.client, testChunkID)
+			if got := status.Code(err); got != codes.DataLoss {
+				t.Fatalf("code = %v, want DataLoss (err: %v)", got, err)
+			}
+			if len(frames) != 0 {
+				t.Errorf("received %d frames before the error, want 0", len(frames))
 			}
 		})
 	}
 }
 
 func TestReadChunkMissing(t *testing.T) {
-	client, _ := startServer(t)
-	stream, err := client.ReadChunk(t.Context(), &objectstorev1.ReadChunkRequest{ChunkId: testChunkID})
+	n := startServer(t, 4)
+	_, err := read(t.Context(), n.client, testChunkID)
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("code = %v, want NotFound", got)
+	}
+}
+
+func TestReadChunkConcurrencyLimit(t *testing.T) {
+	n := startServer(t, 2)
+	writeValid(t, n, testChunkID, []byte("x"))
+
+	// Occupy every slot, as two in-flight reads would.
+	n.srv.readSlots <- struct{}{}
+	n.srv.readSlots <- struct{}{}
+	_, err := read(t.Context(), n.client, testChunkID)
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code with all slots taken = %v, want ResourceExhausted", got)
+	}
+
+	<-n.srv.readSlots
+	if _, err := read(t.Context(), n.client, testChunkID); err != nil {
+		t.Fatalf("read after a slot freed: %v", err)
+	}
+	if got := len(n.srv.readSlots); got != 1 {
+		t.Errorf("slots in use after read = %d, want 1 (the read must release its slot)", got)
+	}
+}
+
+// flip inverts one byte of a file in place.
+func flip(t *testing.T, path string, offset int64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = stream.Recv()
-	if got := status.Code(err); got != codes.NotFound {
-		t.Fatalf("code = %v, want NotFound", got)
+	defer f.Close()
+	b := make([]byte, 1)
+	if _, err := f.ReadAt(b, offset); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xff
+	if _, err := f.WriteAt(b, offset); err != nil {
+		t.Fatal(err)
 	}
 }

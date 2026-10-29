@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mutation check for the coordinator integration tests.
 #
-# For each patch in scripts/mutations/: apply it, run the integration tests,
+# For each patch in scripts/mutations/coordinator/: apply it, run the integration tests,
 # report which tests failed, and revert. Each mutation names the test that must
 # catch it. Finally, run the unmutated suite.
 #
@@ -22,6 +22,7 @@ expected_test() {
     2-no-transaction) echo "failedOverwriteLeavesOldObjectIntact()" ;;
     3-read-then-write-swap) echo "concurrentOverwritesAllSucceedAndLeaveOnePointer()" ;;
     4-inner-join-chunks) echo "zeroByteObjectResolvesWithEmptyChunkList()" ;;
+    5-hash-not-recorded) echo "checksumsAreRecordedAndReturnedByGetObject()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }
@@ -51,7 +52,7 @@ EOF
 }
 
 status=0
-for patch in scripts/mutations/*.patch; do
+for patch in scripts/mutations/coordinator/*.patch; do
   name="$(basename "$patch" .patch)"
   target="$(expected_test "$name")"
   git apply --check "$patch"

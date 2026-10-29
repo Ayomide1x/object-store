@@ -1,0 +1,16 @@
+--- a/node/internal/server/server.go
++++ b/node/internal/server/server.go
+@@ -170,13 +170,6 @@
+ 	ctx := stream.Context()
+ 	log := s.log.With("node_id", s.nodeID, "chunk_id", req.GetChunkId())
+ 
+-	select {
+-	case s.readSlots <- struct{}{}:
+-		defer func() { <-s.readSlots }()
+-	default:
+-		log.Warn("read rejected: concurrent read limit reached", "limit", cap(s.readSlots))
+-		return status.Errorf(codes.ResourceExhausted, "node %s is serving %d reads; retry later", s.nodeID, cap(s.readSlots))
+-	}
+ 
+ 	data, err := s.store.Read(ctx, req.GetChunkId())
+ 	switch {

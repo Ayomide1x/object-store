@@ -1,0 +1,22 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -232,9 +232,6 @@
+ 		return err
+ 	}
+ 	got := w.hasher.Sum(nil)
+-	if !bytes.Equal(got, want) {
+-		return fmt.Errorf("chunk %s: data hashes to %x, expected %x: %w", w.chunkID, got, want, ErrChecksumMismatch)
+-	}
+ 
+ 	header := make([]byte, 0, HeaderSize)
+ 	header = append(header, magic...)
+@@ -259,6 +256,9 @@
+ 			return fmt.Errorf("link chunk %s: %w", w.chunkID, ErrExists)
+ 		}
+ 		return fmt.Errorf("link chunk %s: %w", w.chunkID, err)
++	}
++	if !bytes.Equal(got, want) {
++		return fmt.Errorf("chunk %s: data hashes to %x, expected %x: %w", w.chunkID, got, want, ErrChecksumMismatch)
+ 	}
+ 	// The chunk is now complete under its final name. A failure from here on
+ 	// is reported, but the final file stays: it is valid, and removing it

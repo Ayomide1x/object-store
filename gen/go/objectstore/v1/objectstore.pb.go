@@ -322,7 +322,10 @@ type CompletedChunk struct {
 	Index     int32                  `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`
 	SizeBytes int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	// Only nodes that acknowledged the write (invariant 3).
-	AckedNodeIds  []string `protobuf:"bytes,4,rep,name=acked_node_ids,json=ackedNodeIds,proto3" json:"acked_node_ids,omitempty"`
+	AckedNodeIds []string `protobuf:"bytes,4,rep,name=acked_node_ids,json=ackedNodeIds,proto3" json:"acked_node_ids,omitempty"`
+	// SHA-256 of the chunk data, as verified by the acknowledging nodes. Required:
+	// a complete without it is rejected.
+	Sha256        []byte `protobuf:"bytes,5,opt,name=sha256,proto3" json:"sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -381,6 +384,13 @@ func (x *CompletedChunk) GetSizeBytes() int64 {
 func (x *CompletedChunk) GetAckedNodeIds() []string {
 	if x != nil {
 		return x.AckedNodeIds
+	}
+	return nil
+}
+
+func (x *CompletedChunk) GetSha256() []byte {
+	if x != nil {
+		return x.Sha256
 	}
 	return nil
 }
@@ -526,11 +536,13 @@ func (x *GetObjectResponse) GetChunks() []*ChunkInfo {
 }
 
 type ChunkInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ChunkId       string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
-	Index         int32                  `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`
-	SizeBytes     int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	Replicas      []*NodeLocation        `protobuf:"bytes,4,rep,name=replicas,proto3" json:"replicas,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ChunkId   string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	Index     int32                  `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`
+	SizeBytes int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	Replicas  []*NodeLocation        `protobuf:"bytes,4,rep,name=replicas,proto3" json:"replicas,omitempty"`
+	// SHA-256 of the chunk data. Readers verify each chunk end to end against it.
+	Sha256        []byte `protobuf:"bytes,5,opt,name=sha256,proto3" json:"sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -593,12 +605,20 @@ func (x *ChunkInfo) GetReplicas() []*NodeLocation {
 	return nil
 }
 
+func (x *ChunkInfo) GetSha256() []byte {
+	if x != nil {
+		return x.Sha256
+	}
+	return nil
+}
+
 type WriteChunkRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Frame:
 	//
 	//	*WriteChunkRequest_Header
 	//	*WriteChunkRequest_Data
+	//	*WriteChunkRequest_Trailer
 	Frame         isWriteChunkRequest_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -659,6 +679,15 @@ func (x *WriteChunkRequest) GetData() []byte {
 	return nil
 }
 
+func (x *WriteChunkRequest) GetTrailer() *WriteChunkTrailer {
+	if x != nil {
+		if x, ok := x.Frame.(*WriteChunkRequest_Trailer); ok {
+			return x.Trailer
+		}
+	}
+	return nil
+}
+
 type isWriteChunkRequest_Frame interface {
 	isWriteChunkRequest_Frame()
 }
@@ -671,9 +700,15 @@ type WriteChunkRequest_Data struct {
 	Data []byte `protobuf:"bytes,2,opt,name=data,proto3,oneof"`
 }
 
+type WriteChunkRequest_Trailer struct {
+	Trailer *WriteChunkTrailer `protobuf:"bytes,3,opt,name=trailer,proto3,oneof"`
+}
+
 func (*WriteChunkRequest_Header) isWriteChunkRequest_Frame() {}
 
 func (*WriteChunkRequest_Data) isWriteChunkRequest_Frame() {}
+
+func (*WriteChunkRequest_Trailer) isWriteChunkRequest_Frame() {}
 
 type WriteChunkHeader struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
@@ -736,17 +771,66 @@ func (x *WriteChunkHeader) GetSizeBytes() int64 {
 	return 0
 }
 
+// WriteChunkTrailer is the last frame of a write. The sender hashes the data
+// as it streams it, so the file is read only once.
+type WriteChunkTrailer struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// SHA-256 of the chunk data: exactly 32 bytes.
+	Sha256        []byte `protobuf:"bytes,1,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WriteChunkTrailer) Reset() {
+	*x = WriteChunkTrailer{}
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WriteChunkTrailer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WriteChunkTrailer) ProtoMessage() {}
+
+func (x *WriteChunkTrailer) ProtoReflect() protoreflect.Message {
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WriteChunkTrailer.ProtoReflect.Descriptor instead.
+func (*WriteChunkTrailer) Descriptor() ([]byte, []int) {
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *WriteChunkTrailer) GetSha256() []byte {
+	if x != nil {
+		return x.Sha256
+	}
+	return nil
+}
+
 type WriteChunkResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ChunkId       string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
-	BytesWritten  int64                  `protobuf:"varint,2,opt,name=bytes_written,json=bytesWritten,proto3" json:"bytes_written,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ChunkId      string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	BytesWritten int64                  `protobuf:"varint,2,opt,name=bytes_written,json=bytesWritten,proto3" json:"bytes_written,omitempty"`
+	// The SHA-256 the node verified and stored.
+	Sha256        []byte `protobuf:"bytes,3,opt,name=sha256,proto3" json:"sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WriteChunkResponse) Reset() {
 	*x = WriteChunkResponse{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -758,7 +842,7 @@ func (x *WriteChunkResponse) String() string {
 func (*WriteChunkResponse) ProtoMessage() {}
 
 func (x *WriteChunkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[12]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -771,7 +855,7 @@ func (x *WriteChunkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteChunkResponse.ProtoReflect.Descriptor instead.
 func (*WriteChunkResponse) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{12}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *WriteChunkResponse) GetChunkId() string {
@@ -788,6 +872,13 @@ func (x *WriteChunkResponse) GetBytesWritten() int64 {
 	return 0
 }
 
+func (x *WriteChunkResponse) GetSha256() []byte {
+	if x != nil {
+		return x.Sha256
+	}
+	return nil
+}
+
 type ReadChunkRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ChunkId       string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
@@ -797,7 +888,7 @@ type ReadChunkRequest struct {
 
 func (x *ReadChunkRequest) Reset() {
 	*x = ReadChunkRequest{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -809,7 +900,7 @@ func (x *ReadChunkRequest) String() string {
 func (*ReadChunkRequest) ProtoMessage() {}
 
 func (x *ReadChunkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[13]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -822,7 +913,7 @@ func (x *ReadChunkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadChunkRequest.ProtoReflect.Descriptor instead.
 func (*ReadChunkRequest) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{13}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ReadChunkRequest) GetChunkId() string {
@@ -841,7 +932,7 @@ type ReadChunkResponse struct {
 
 func (x *ReadChunkResponse) Reset() {
 	*x = ReadChunkResponse{}
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -853,7 +944,7 @@ func (x *ReadChunkResponse) String() string {
 func (*ReadChunkResponse) ProtoMessage() {}
 
 func (x *ReadChunkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_objectstore_v1_objectstore_proto_msgTypes[14]
+	mi := &file_objectstore_v1_objectstore_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -866,7 +957,7 @@ func (x *ReadChunkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadChunkResponse.ProtoReflect.Descriptor instead.
 func (*ReadChunkResponse) Descriptor() ([]byte, []int) {
-	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{14}
+	return file_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ReadChunkResponse) GetData() []byte {
@@ -902,13 +993,14 @@ const file_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x126\n" +
-	"\x06chunks\x18\x04 \x03(\v2\x1e.objectstore.v1.CompletedChunkR\x06chunks\"\x86\x01\n" +
+	"\x06chunks\x18\x04 \x03(\v2\x1e.objectstore.v1.CompletedChunkR\x06chunks\"\x9e\x01\n" +
 	"\x0eCompletedChunk\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x05R\x05index\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12$\n" +
-	"\x0eacked_node_ids\x18\x04 \x03(\tR\fackedNodeIds\"\x18\n" +
+	"\x0eacked_node_ids\x18\x04 \x03(\tR\fackedNodeIds\x12\x16\n" +
+	"\x06sha256\x18\x05 \x01(\fR\x06sha256\"\x18\n" +
 	"\x16CompleteUploadResponse\"$\n" +
 	"\x10GetObjectRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\"\x82\x01\n" +
@@ -916,25 +1008,30 @@ const file_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\tobject_id\x18\x01 \x01(\tR\bobjectId\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\x121\n" +
-	"\x06chunks\x18\x03 \x03(\v2\x19.objectstore.v1.ChunkInfoR\x06chunks\"\x95\x01\n" +
+	"\x06chunks\x18\x03 \x03(\v2\x19.objectstore.v1.ChunkInfoR\x06chunks\"\xad\x01\n" +
 	"\tChunkInfo\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x05R\x05index\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x128\n" +
-	"\breplicas\x18\x04 \x03(\v2\x1c.objectstore.v1.NodeLocationR\breplicas\"n\n" +
+	"\breplicas\x18\x04 \x03(\v2\x1c.objectstore.v1.NodeLocationR\breplicas\x12\x16\n" +
+	"\x06sha256\x18\x05 \x01(\fR\x06sha256\"\xad\x01\n" +
 	"\x11WriteChunkRequest\x12:\n" +
 	"\x06header\x18\x01 \x01(\v2 .objectstore.v1.WriteChunkHeaderH\x00R\x06header\x12\x14\n" +
-	"\x04data\x18\x02 \x01(\fH\x00R\x04dataB\a\n" +
+	"\x04data\x18\x02 \x01(\fH\x00R\x04data\x12=\n" +
+	"\atrailer\x18\x03 \x01(\v2!.objectstore.v1.WriteChunkTrailerH\x00R\atrailerB\a\n" +
 	"\x05frame\"i\n" +
 	"\x10WriteChunkHeader\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12\x1b\n" +
 	"\tobject_id\x18\x02 \x01(\tR\bobjectId\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\"T\n" +
+	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\"+\n" +
+	"\x11WriteChunkTrailer\x12\x16\n" +
+	"\x06sha256\x18\x01 \x01(\fR\x06sha256\"l\n" +
 	"\x12WriteChunkResponse\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12#\n" +
-	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"-\n" +
+	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\x12\x16\n" +
+	"\x06sha256\x18\x03 \x01(\fR\x06sha256\"-\n" +
 	"\x10ReadChunkRequest\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\"'\n" +
 	"\x11ReadChunkResponse\x12\x12\n" +
@@ -961,7 +1058,7 @@ func file_objectstore_v1_objectstore_proto_rawDescGZIP() []byte {
 	return file_objectstore_v1_objectstore_proto_rawDescData
 }
 
-var file_objectstore_v1_objectstore_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_objectstore_v1_objectstore_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_objectstore_v1_objectstore_proto_goTypes = []any{
 	(*InitiateUploadRequest)(nil),  // 0: objectstore.v1.InitiateUploadRequest
 	(*InitiateUploadResponse)(nil), // 1: objectstore.v1.InitiateUploadResponse
@@ -975,9 +1072,10 @@ var file_objectstore_v1_objectstore_proto_goTypes = []any{
 	(*ChunkInfo)(nil),              // 9: objectstore.v1.ChunkInfo
 	(*WriteChunkRequest)(nil),      // 10: objectstore.v1.WriteChunkRequest
 	(*WriteChunkHeader)(nil),       // 11: objectstore.v1.WriteChunkHeader
-	(*WriteChunkResponse)(nil),     // 12: objectstore.v1.WriteChunkResponse
-	(*ReadChunkRequest)(nil),       // 13: objectstore.v1.ReadChunkRequest
-	(*ReadChunkResponse)(nil),      // 14: objectstore.v1.ReadChunkResponse
+	(*WriteChunkTrailer)(nil),      // 12: objectstore.v1.WriteChunkTrailer
+	(*WriteChunkResponse)(nil),     // 13: objectstore.v1.WriteChunkResponse
+	(*ReadChunkRequest)(nil),       // 14: objectstore.v1.ReadChunkRequest
+	(*ReadChunkResponse)(nil),      // 15: objectstore.v1.ReadChunkResponse
 }
 var file_objectstore_v1_objectstore_proto_depIdxs = []int32{
 	2,  // 0: objectstore.v1.InitiateUploadResponse.chunks:type_name -> objectstore.v1.ChunkPlacement
@@ -986,21 +1084,22 @@ var file_objectstore_v1_objectstore_proto_depIdxs = []int32{
 	9,  // 3: objectstore.v1.GetObjectResponse.chunks:type_name -> objectstore.v1.ChunkInfo
 	3,  // 4: objectstore.v1.ChunkInfo.replicas:type_name -> objectstore.v1.NodeLocation
 	11, // 5: objectstore.v1.WriteChunkRequest.header:type_name -> objectstore.v1.WriteChunkHeader
-	0,  // 6: objectstore.v1.CoordinatorService.InitiateUpload:input_type -> objectstore.v1.InitiateUploadRequest
-	4,  // 7: objectstore.v1.CoordinatorService.CompleteUpload:input_type -> objectstore.v1.CompleteUploadRequest
-	7,  // 8: objectstore.v1.CoordinatorService.GetObject:input_type -> objectstore.v1.GetObjectRequest
-	10, // 9: objectstore.v1.StorageNodeService.WriteChunk:input_type -> objectstore.v1.WriteChunkRequest
-	13, // 10: objectstore.v1.StorageNodeService.ReadChunk:input_type -> objectstore.v1.ReadChunkRequest
-	1,  // 11: objectstore.v1.CoordinatorService.InitiateUpload:output_type -> objectstore.v1.InitiateUploadResponse
-	6,  // 12: objectstore.v1.CoordinatorService.CompleteUpload:output_type -> objectstore.v1.CompleteUploadResponse
-	8,  // 13: objectstore.v1.CoordinatorService.GetObject:output_type -> objectstore.v1.GetObjectResponse
-	12, // 14: objectstore.v1.StorageNodeService.WriteChunk:output_type -> objectstore.v1.WriteChunkResponse
-	14, // 15: objectstore.v1.StorageNodeService.ReadChunk:output_type -> objectstore.v1.ReadChunkResponse
-	11, // [11:16] is the sub-list for method output_type
-	6,  // [6:11] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	12, // 6: objectstore.v1.WriteChunkRequest.trailer:type_name -> objectstore.v1.WriteChunkTrailer
+	0,  // 7: objectstore.v1.CoordinatorService.InitiateUpload:input_type -> objectstore.v1.InitiateUploadRequest
+	4,  // 8: objectstore.v1.CoordinatorService.CompleteUpload:input_type -> objectstore.v1.CompleteUploadRequest
+	7,  // 9: objectstore.v1.CoordinatorService.GetObject:input_type -> objectstore.v1.GetObjectRequest
+	10, // 10: objectstore.v1.StorageNodeService.WriteChunk:input_type -> objectstore.v1.WriteChunkRequest
+	14, // 11: objectstore.v1.StorageNodeService.ReadChunk:input_type -> objectstore.v1.ReadChunkRequest
+	1,  // 12: objectstore.v1.CoordinatorService.InitiateUpload:output_type -> objectstore.v1.InitiateUploadResponse
+	6,  // 13: objectstore.v1.CoordinatorService.CompleteUpload:output_type -> objectstore.v1.CompleteUploadResponse
+	8,  // 14: objectstore.v1.CoordinatorService.GetObject:output_type -> objectstore.v1.GetObjectResponse
+	13, // 15: objectstore.v1.StorageNodeService.WriteChunk:output_type -> objectstore.v1.WriteChunkResponse
+	15, // 16: objectstore.v1.StorageNodeService.ReadChunk:output_type -> objectstore.v1.ReadChunkResponse
+	12, // [12:17] is the sub-list for method output_type
+	7,  // [7:12] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_objectstore_v1_objectstore_proto_init() }
@@ -1011,6 +1110,7 @@ func file_objectstore_v1_objectstore_proto_init() {
 	file_objectstore_v1_objectstore_proto_msgTypes[10].OneofWrappers = []any{
 		(*WriteChunkRequest_Header)(nil),
 		(*WriteChunkRequest_Data)(nil),
+		(*WriteChunkRequest_Trailer)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1018,7 +1118,7 @@ func file_objectstore_v1_objectstore_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_objectstore_v1_objectstore_proto_rawDesc), len(file_objectstore_v1_objectstore_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   15,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

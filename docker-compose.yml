@@ -53,7 +53,8 @@ services:
     environment:
       NODE_ID: node1               # must match an entry in COORDINATOR_NODES
       NODE_LISTEN_ADDR: ":9101"    # same port inside the container and on the host
-      NODE_DATA_DIR: /data         # chunk files go in /data/chunks
+      NODE_DATA_DIR: /data         # chunk files in /data/chunks, in-progress writes in /data/tmp
+      NODE_MAX_CONCURRENT_READS: "32"  # reads beyond this get RESOURCE_EXHAUSTED; each holds up to 4 MiB
     ports:
       - "127.0.0.1:9101:9101"
     volumes:
