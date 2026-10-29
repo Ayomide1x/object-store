@@ -1,16 +1,19 @@
 package io.github.ayomide1x.objectstore.coordinator;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
+import io.github.ayomide1x.objectstore.coordinator.MetadataRepository.ObjectRow;
+import io.github.ayomide1x.objectstore.coordinator.MetadataRepository.PlannedChunk;
 import io.grpc.Status;
-import org.postgresql.util.PSQLException;
-import org.postgresql.util.ServerErrorMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,10 +21,10 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class MetadataService {
 
-    static final long MAX_CHUNK_SIZE = 4L << 20;
+    static final long CHUNK_SIZE = 4L << 20;
+    static final long MAX_OBJECT_SIZE = 5L << 30;
 
     private static final Logger log = LoggerFactory.getLogger(MetadataService.class);
-    private static final String KEY_CONSTRAINT = "objects_key_unique";
 
     private final MetadataRepository repository;
 
@@ -29,8 +32,12 @@ public class MetadataService {
         this.repository = repository;
     }
 
-    /** IDs and target nodes for a new upload. Nothing is persisted yet. */
-    public record Placement(UUID objectId, UUID chunkId, List<Node> nodes) {
+    /** One chunk of an upload plan, with the nodes the client must write it to. */
+    public record ChunkPlacement(UUID chunkId, int index, long sizeBytes, List<Node> nodes) {
+    }
+
+    /** The plan for a new upload, as recorded in Postgres. */
+    public record UploadPlan(UUID objectId, List<ChunkPlacement> chunks) {
     }
 
     /** A chunk the client wrote, with the nodes that acknowledged it. */
@@ -38,69 +45,87 @@ public class MetadataService {
     }
 
     /**
-     * Allocates IDs and picks a node. Deliberately does not check whether the
-     * key exists: that check would race with concurrent puts. The unique
-     * constraint enforces it at completion instead.
+     * Records a PENDING object with its full chunk plan and placement. The
+     * object is unreachable from any key until it is completed. Whether the
+     * key already exists does not matter: completing overwrites it.
      */
-    public Placement initiateUpload(String key, long sizeBytes) {
+    @Transactional
+    public UploadPlan initiateUpload(String key, long sizeBytes) {
         requireKey(key);
-        if (sizeBytes < 0 || sizeBytes > MAX_CHUNK_SIZE) {
+        if (sizeBytes < 0 || sizeBytes > MAX_OBJECT_SIZE) {
             throw RequestException.invalid(
-                    "size_bytes %d outside [0, %d]; stage 1 stores one chunk".formatted(sizeBytes, MAX_CHUNK_SIZE));
+                    "size_bytes %d outside [0, %d]".formatted(sizeBytes, MAX_OBJECT_SIZE));
         }
         List<Node> nodes = repository.listNodes();
         if (nodes.isEmpty()) {
             throw new RequestException(Status.Code.UNAVAILABLE, "no storage nodes registered");
         }
-        return new Placement(UUID.randomUUID(), UUID.randomUUID(), List.of(nodes.getFirst()));
+        List<Node> targets = List.of(nodes.getFirst());
+
+        UUID objectId = UUID.randomUUID();
+        repository.insertPendingObject(objectId, key, sizeBytes);
+
+        List<ChunkPlacement> chunks = new ArrayList<>();
+        int count = chunkCount(sizeBytes);
+        for (int index = 0; index < count; index++) {
+            long chunkSize = Math.min(CHUNK_SIZE, sizeBytes - index * CHUNK_SIZE);
+            UUID chunkId = UUID.randomUUID();
+            repository.insertChunk(chunkId, objectId, index, chunkSize);
+            for (Node node : targets) {
+                repository.insertPlacement(chunkId, node.nodeId());
+            }
+            chunks.add(new ChunkPlacement(chunkId, index, chunkSize, targets));
+        }
+        return new UploadPlan(objectId, chunks);
     }
 
     /**
-     * Records the object, its chunk and the acknowledged replicas in one
-     * transaction. Any failure, including a duplicate key, rolls back all of it.
+     * Validates the request against the plan issued at initiate, then records
+     * the acknowledged replicas, marks the object COMMITTED and points the key
+     * at it, all in one transaction. Completing an already COMMITTED object is
+     * a successful no-op, so a client may retry after a lost response.
      */
     @Transactional
     public void completeUpload(UUID objectId, String key, long sizeBytes, List<CompletedChunk> chunks) {
-        requireKey(key);
-        if (chunks.size() != 1) {
-            throw RequestException.invalid("stage 1 objects have exactly one chunk, got " + chunks.size());
+        ObjectRow object = repository.lockObject(objectId)
+                .orElseThrow(() -> new RequestException(Status.Code.NOT_FOUND,
+                        "object %s not found".formatted(objectId)));
+        if (object.status() == MetadataRepository.Status.COMMITTED) {
+            log.atInfo().addKeyValue("object_id", objectId).log("complete of committed object is a no-op");
+            return;
         }
-        CompletedChunk chunk = chunks.getFirst();
-        if (chunk.index() != 0) {
-            throw RequestException.invalid("chunk index must be 0, got " + chunk.index());
+        // proto3 cannot tell an absent int64 from 0, so both must always match.
+        if (!object.key().equals(key)) {
+            throw RequestException.invalid("key '%s' does not match upload key '%s'".formatted(key, object.key()));
         }
-        if (chunk.sizeBytes() != sizeBytes || sizeBytes < 0 || sizeBytes > MAX_CHUNK_SIZE) {
+        if (object.sizeBytes() != sizeBytes) {
             throw RequestException.invalid(
-                    "chunk size %d does not match object size %d".formatted(chunk.sizeBytes(), sizeBytes));
+                    "size_bytes %d does not match upload size %d".formatted(sizeBytes, object.sizeBytes()));
         }
-        if (chunk.ackedNodeIds().isEmpty()) {
-            throw RequestException.invalid("chunk %s has no acknowledged replicas".formatted(chunk.chunkId()));
-        }
+        validateAgainstPlan(objectId, repository.plannedChunks(objectId), chunks, sizeBytes);
 
-        try {
-            repository.insertObject(objectId, key, sizeBytes);
-            repository.insertChunk(chunk.chunkId(), objectId, chunk.index(), chunk.sizeBytes());
+        for (CompletedChunk chunk : chunks) {
             for (String nodeId : chunk.ackedNodeIds()) {
                 repository.insertReplica(chunk.chunkId(), nodeId);
             }
-        } catch (DuplicateKeyException e) {
-            if (KEY_CONSTRAINT.equals(constraintName(e))) {
-                throw new RequestException(Status.Code.ALREADY_EXISTS, "key '%s' already exists".formatted(key));
-            }
-            throw new RequestException(Status.Code.ALREADY_EXISTS,
-                    "object or chunk id already recorded (%s)".formatted(constraintName(e)));
-        } catch (DataIntegrityViolationException e) {
-            throw RequestException.invalid("upload references unknown data (%s)".formatted(constraintName(e)));
         }
+        repository.markCommitted(objectId);
+        repository.swapKey(object.key(), objectId);
 
-        for (String nodeId : chunk.ackedNodeIds()) {
-            log.atInfo()
-                    .addKeyValue("object_id", objectId)
-                    .addKeyValue("chunk_id", chunk.chunkId())
-                    .addKeyValue("node_id", nodeId)
-                    .addKeyValue("key", key)
-                    .log("replica recorded");
+        for (CompletedChunk chunk : chunks) {
+            for (String nodeId : chunk.ackedNodeIds()) {
+                log.atInfo()
+                        .addKeyValue("object_id", objectId)
+                        .addKeyValue("chunk_id", chunk.chunkId())
+                        .addKeyValue("node_id", nodeId)
+                        .log("replica recorded");
+            }
         }
+        log.atInfo()
+                .addKeyValue("object_id", objectId)
+                .addKeyValue("key", object.key())
+                .addKeyValue("chunks", chunks.size())
+                .log("object committed");
     }
 
     @Transactional(readOnly = true)
@@ -109,20 +134,69 @@ public class MetadataService {
         return repository.findObjectByKey(key);
     }
 
+    static int chunkCount(long sizeBytes) {
+        return Math.toIntExact((sizeBytes + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    }
+
+    /**
+     * Requires the request to describe exactly the issued plan: the same chunk
+     * IDs, each with its allocated index and size, and acknowledgements only
+     * from nodes the chunk was placed on.
+     */
+    private static void validateAgainstPlan(UUID objectId, List<PlannedChunk> plan, List<CompletedChunk> chunks,
+            long sizeBytes) {
+        if (chunks.size() != plan.size()) {
+            throw RequestException.invalid(
+                    "object %s has %d chunks, request has %d".formatted(objectId, plan.size(), chunks.size()));
+        }
+        Map<UUID, PlannedChunk> planned = new HashMap<>();
+        for (PlannedChunk p : plan) {
+            planned.put(p.chunkId(), p);
+        }
+
+        Set<UUID> seen = new HashSet<>();
+        long total = 0;
+        for (CompletedChunk chunk : chunks) {
+            PlannedChunk p = planned.get(chunk.chunkId());
+            if (p == null) {
+                throw RequestException.invalid(
+                        "chunk %s was not allocated to object %s".formatted(chunk.chunkId(), objectId));
+            }
+            if (!seen.add(chunk.chunkId())) {
+                throw RequestException.invalid("chunk %s listed twice".formatted(chunk.chunkId()));
+            }
+            if (chunk.index() != p.index()) {
+                throw RequestException.invalid("chunk %s has index %d, allocated %d"
+                        .formatted(chunk.chunkId(), chunk.index(), p.index()));
+            }
+            if (chunk.sizeBytes() != p.sizeBytes()) {
+                throw RequestException.invalid("chunk %s has size %d, allocated %d"
+                        .formatted(chunk.chunkId(), chunk.sizeBytes(), p.sizeBytes()));
+            }
+            if (chunk.ackedNodeIds().isEmpty()) {
+                throw RequestException.invalid("chunk %s has no acknowledged replicas".formatted(chunk.chunkId()));
+            }
+            if (new HashSet<>(chunk.ackedNodeIds()).size() != chunk.ackedNodeIds().size()) {
+                throw RequestException.invalid("chunk %s lists a node twice".formatted(chunk.chunkId()));
+            }
+            for (String nodeId : chunk.ackedNodeIds()) {
+                if (!p.placedNodeIds().contains(nodeId)) {
+                    throw RequestException.invalid(
+                            "node %s was not a placement target for chunk %s".formatted(nodeId, chunk.chunkId()));
+                }
+            }
+            total += chunk.sizeBytes();
+        }
+        // Implied by the checks above, since allocated sizes sum to the object
+        // size; kept as a direct statement of the invariant.
+        if (total != sizeBytes) {
+            throw RequestException.invalid("chunk sizes sum to %d, object size is %d".formatted(total, sizeBytes));
+        }
+    }
+
     private static void requireKey(String key) {
         if (key == null || key.isEmpty()) {
             throw RequestException.invalid("key is required");
         }
-    }
-
-    /** The Postgres constraint behind an integrity violation, or null. */
-    private static String constraintName(Throwable e) {
-        for (Throwable t = e; t != null; t = t.getCause()) {
-            if (t instanceof PSQLException psql) {
-                ServerErrorMessage msg = psql.getServerErrorMessage();
-                return msg == null ? null : msg.getConstraint();
-            }
-        }
-        return null;
     }
 }

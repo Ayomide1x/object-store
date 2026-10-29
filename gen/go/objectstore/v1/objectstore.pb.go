@@ -74,9 +74,10 @@ func (x *InitiateUploadRequest) GetSizeBytes() int64 {
 }
 
 type InitiateUploadResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ObjectId      string                 `protobuf:"bytes,1,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
-	Chunk         *ChunkPlacement        `protobuf:"bytes,2,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	ObjectId string                 `protobuf:"bytes,1,opt,name=object_id,json=objectId,proto3" json:"object_id,omitempty"`
+	// Ordered by index. Empty for a 0-byte object.
+	Chunks        []*ChunkPlacement `protobuf:"bytes,3,rep,name=chunks,proto3" json:"chunks,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -118,17 +119,20 @@ func (x *InitiateUploadResponse) GetObjectId() string {
 	return ""
 }
 
-func (x *InitiateUploadResponse) GetChunk() *ChunkPlacement {
+func (x *InitiateUploadResponse) GetChunks() []*ChunkPlacement {
 	if x != nil {
-		return x.Chunk
+		return x.Chunks
 	}
 	return nil
 }
 
 type ChunkPlacement struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ChunkId       string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
-	Nodes         []*NodeLocation        `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	ChunkId string                 `protobuf:"bytes,1,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	Nodes   []*NodeLocation        `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	Index   int32                  `protobuf:"varint,3,opt,name=index,proto3" json:"index,omitempty"`
+	// Chunk boundaries are decided by the coordinator.
+	SizeBytes     int64 `protobuf:"varint,4,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -175,6 +179,20 @@ func (x *ChunkPlacement) GetNodes() []*NodeLocation {
 		return x.Nodes
 	}
 	return nil
+}
+
+func (x *ChunkPlacement) GetIndex() int32 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *ChunkPlacement) GetSizeBytes() int64 {
+	if x != nil {
+		return x.SizeBytes
+	}
+	return 0
 }
 
 type NodeLocation struct {
@@ -866,13 +884,16 @@ const file_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\x15InitiateUploadRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"k\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"z\n" +
 	"\x16InitiateUploadResponse\x12\x1b\n" +
-	"\tobject_id\x18\x01 \x01(\tR\bobjectId\x124\n" +
-	"\x05chunk\x18\x02 \x01(\v2\x1e.objectstore.v1.ChunkPlacementR\x05chunk\"_\n" +
+	"\tobject_id\x18\x01 \x01(\tR\bobjectId\x126\n" +
+	"\x06chunks\x18\x03 \x03(\v2\x1e.objectstore.v1.ChunkPlacementR\x06chunksJ\x04\b\x02\x10\x03R\x05chunk\"\x94\x01\n" +
 	"\x0eChunkPlacement\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x122\n" +
-	"\x05nodes\x18\x02 \x03(\v2\x1c.objectstore.v1.NodeLocationR\x05nodes\"A\n" +
+	"\x05nodes\x18\x02 \x03(\v2\x1c.objectstore.v1.NodeLocationR\x05nodes\x12\x14\n" +
+	"\x05index\x18\x03 \x01(\x05R\x05index\x12\x1d\n" +
+	"\n" +
+	"size_bytes\x18\x04 \x01(\x03R\tsizeBytes\"A\n" +
 	"\fNodeLocation\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\"\x9d\x01\n" +
@@ -959,7 +980,7 @@ var file_objectstore_v1_objectstore_proto_goTypes = []any{
 	(*ReadChunkResponse)(nil),      // 14: objectstore.v1.ReadChunkResponse
 }
 var file_objectstore_v1_objectstore_proto_depIdxs = []int32{
-	2,  // 0: objectstore.v1.InitiateUploadResponse.chunk:type_name -> objectstore.v1.ChunkPlacement
+	2,  // 0: objectstore.v1.InitiateUploadResponse.chunks:type_name -> objectstore.v1.ChunkPlacement
 	3,  // 1: objectstore.v1.ChunkPlacement.nodes:type_name -> objectstore.v1.NodeLocation
 	5,  // 2: objectstore.v1.CompleteUploadRequest.chunks:type_name -> objectstore.v1.CompletedChunk
 	9,  // 3: objectstore.v1.GetObjectResponse.chunks:type_name -> objectstore.v1.ChunkInfo

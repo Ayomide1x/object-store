@@ -11,13 +11,11 @@ import (
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 )
 
-const (
-	maxChunkSize = 4 << 20
-	maxFrameSize = 1 << 20
-)
+const maxFrameSize = 1 << 20
 
-// put uploads a file of at most one chunk: initiate, stream the chunk to the
-// chosen node, then complete with the node's acknowledgement.
+// put uploads a file: initiate (the coordinator returns the full chunk plan),
+// stream each chunk to its node in order, then complete with the nodes'
+// acknowledgements. The file is read one frame at a time, never whole.
 func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -29,9 +27,6 @@ func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) err
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
 	size := info.Size()
-	if size > maxChunkSize {
-		return fmt.Errorf("%s is %d bytes; stage 1 supports at most %d", path, size, maxChunkSize)
-	}
 
 	conn, err := dial(coordAddr)
 	if err != nil {
@@ -45,34 +40,64 @@ func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) err
 		return fmt.Errorf("initiate upload of %q: %w", key, err)
 	}
 	objectID := initResp.GetObjectId()
-	chunk := initResp.GetChunk()
-	if len(chunk.GetNodes()) == 0 {
-		return fmt.Errorf("initiate upload of %q: coordinator returned no nodes", key)
+	log = log.With("object_id", objectID)
+	if err := checkPlan(initResp.GetChunks(), size); err != nil {
+		return fmt.Errorf("initiate upload of %q: %w", key, err)
 	}
-	node := chunk.GetNodes()[0]
-	log = log.With("object_id", objectID, "chunk_id", chunk.GetChunkId(), "node_id", node.GetNodeId())
 
-	written, err := writeChunk(ctx, node.GetAddress(), objectID, chunk.GetChunkId(), f, size)
-	if err != nil {
-		return fmt.Errorf("write chunk %s to %s: %w", chunk.GetChunkId(), node.GetNodeId(), err)
+	// Chunks go up one after another; parallel upload is deferred (see DECISIONS.md).
+	var completed []*objectstorev1.CompletedChunk
+	var offset int64
+	for _, chunk := range initResp.GetChunks() {
+		node := chunk.GetNodes()[0]
+		clog := log.With("chunk_id", chunk.GetChunkId(), "node_id", node.GetNodeId())
+
+		// A SectionReader reads only this chunk's byte range of the file.
+		section := io.NewSectionReader(f, offset, chunk.GetSizeBytes())
+		written, err := writeChunk(ctx, node.GetAddress(), objectID, chunk.GetChunkId(), section, chunk.GetSizeBytes())
+		if err != nil {
+			return fmt.Errorf("write chunk %d (%s) to %s: %w", chunk.GetIndex(), chunk.GetChunkId(), node.GetNodeId(), err)
+		}
+		clog.Info("chunk written", "index", chunk.GetIndex(), "bytes", written)
+
+		completed = append(completed, &objectstorev1.CompletedChunk{
+			ChunkId:      chunk.GetChunkId(),
+			Index:        chunk.GetIndex(),
+			SizeBytes:    chunk.GetSizeBytes(),
+			AckedNodeIds: []string{node.GetNodeId()},
+		})
+		offset += chunk.GetSizeBytes()
 	}
-	log.Info("chunk written", "bytes", written)
 
 	_, err = coord.CompleteUpload(ctx, &objectstorev1.CompleteUploadRequest{
 		ObjectId:  objectID,
 		Key:       key,
 		SizeBytes: size,
-		Chunks: []*objectstorev1.CompletedChunk{{
-			ChunkId:      chunk.GetChunkId(),
-			Index:        0,
-			SizeBytes:    size,
-			AckedNodeIds: []string{node.GetNodeId()},
-		}},
+		Chunks:    completed,
 	})
 	if err != nil {
 		return fmt.Errorf("complete upload of %q: %w", key, err)
 	}
-	log.Info("upload complete", "key", key, "bytes", size)
+	log.Info("upload complete", "key", key, "bytes", size, "chunks", len(completed))
+	return nil
+}
+
+// checkPlan rejects a chunk plan that does not cover exactly size bytes with
+// indexes 0..n-1 in order, each placed on at least one node.
+func checkPlan(chunks []*objectstorev1.ChunkPlacement, size int64) error {
+	var total int64
+	for i, c := range chunks {
+		if int(c.GetIndex()) != i {
+			return fmt.Errorf("chunk plan out of order: position %d has index %d", i, c.GetIndex())
+		}
+		if len(c.GetNodes()) == 0 {
+			return fmt.Errorf("chunk %d (%s) has no nodes", i, c.GetChunkId())
+		}
+		total += c.GetSizeBytes()
+	}
+	if total != size {
+		return fmt.Errorf("chunk plan covers %d bytes, file is %d", total, size)
+	}
 	return nil
 }
 
@@ -96,6 +121,7 @@ func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader
 		return 0, closeWithStatus(stream, fmt.Errorf("send header: %w", err))
 	}
 
+	var sent int64
 	for {
 		// A fresh buffer per frame: gRPC forbids modifying a message after Send.
 		buf := make([]byte, maxFrameSize)
@@ -105,6 +131,7 @@ func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader
 			if err != nil {
 				return 0, closeWithStatus(stream, fmt.Errorf("send frame: %w", err))
 			}
+			sent += int64(n)
 		}
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			break
@@ -112,6 +139,12 @@ func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader
 		if readErr != nil {
 			return 0, fmt.Errorf("read source: %w", readErr)
 		}
+	}
+	// A file that shrank since stat yields fewer bytes than planned. The node
+	// would reject the chunk anyway; failing here gives the clearer error.
+	if sent != size {
+		_, _ = stream.CloseAndRecv()
+		return 0, fmt.Errorf("source ended after %d of %d bytes (file changed during upload?)", sent, size)
 	}
 
 	resp, err := stream.CloseAndRecv()

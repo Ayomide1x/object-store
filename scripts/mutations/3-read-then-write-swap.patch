@@ -1,0 +1,26 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -149,14 +149,15 @@
+      * wins.
+      */
+     public void swapKey(String key, UUID objectId) {
+-        jdbc.sql("""
+-                INSERT INTO keys (key, object_id) VALUES (:key, :objectId)
+-                ON CONFLICT (key) DO UPDATE
+-                SET object_id = EXCLUDED.object_id, updated_at = clock_timestamp()
+-                """)
+-                .param("key", key)
+-                .param("objectId", objectId)
+-                .update();
++        boolean exists = jdbc.sql("SELECT count(*) FROM keys WHERE key = :key")
++                .param("key", key).query(Long.class).single() > 0;
++        if (exists) {
++            jdbc.sql("UPDATE keys SET object_id = :objectId, updated_at = clock_timestamp() WHERE key = :key")
++                    .param("key", key).param("objectId", objectId).update();
++        } else {
++            jdbc.sql("INSERT INTO keys (key, object_id) VALUES (:key, :objectId)")
++                    .param("key", key).param("objectId", objectId).update();
++        }
+     }
+ 
+     /**

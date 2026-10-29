@@ -31,6 +31,17 @@ services:
       COORDINATOR_NODES: "node1|node1:9101|127.0.0.1:9101"
     ports:
       - "127.0.0.1:9090:9090"
+    # Healthy once the gRPC server accepts connections, which happens only after
+    # Flyway migrations and node registration finish. The probe runs inside the
+    # container, so it reaches the real listener, not Docker's host port proxy.
+    # `docker compose up --wait` blocks on this.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9090"]
+      start_period: 60s     # JVM start + Flyway; failures here don't count
+      start_interval: 1s    # probe rate during start_period
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy

@@ -30,10 +30,13 @@ const (
 //
 // CoordinatorService owns all metadata. It never carries object bytes.
 type CoordinatorServiceClient interface {
-	// InitiateUpload allocates IDs and chooses placement. It persists nothing.
+	// InitiateUpload records a PENDING object with its full chunk plan and
+	// placement. A PENDING object is not reachable from any key.
 	InitiateUpload(ctx context.Context, in *InitiateUploadRequest, opts ...grpc.CallOption) (*InitiateUploadResponse, error)
-	// CompleteUpload records the object, its chunks and the acknowledged
-	// replicas in one transaction. Fails with ALREADY_EXISTS if the key is taken.
+	// CompleteUpload validates the request against the issued plan, records the
+	// acknowledged replicas, marks the object COMMITTED and points the key at it,
+	// all in one transaction. An existing key is overwritten. Completing an
+	// already COMMITTED object succeeds without changes.
 	CompleteUpload(ctx context.Context, in *CompleteUploadRequest, opts ...grpc.CallOption) (*CompleteUploadResponse, error)
 	// GetObject returns the chunk list and replica locations for a key.
 	GetObject(ctx context.Context, in *GetObjectRequest, opts ...grpc.CallOption) (*GetObjectResponse, error)
@@ -83,10 +86,13 @@ func (c *coordinatorServiceClient) GetObject(ctx context.Context, in *GetObjectR
 //
 // CoordinatorService owns all metadata. It never carries object bytes.
 type CoordinatorServiceServer interface {
-	// InitiateUpload allocates IDs and chooses placement. It persists nothing.
+	// InitiateUpload records a PENDING object with its full chunk plan and
+	// placement. A PENDING object is not reachable from any key.
 	InitiateUpload(context.Context, *InitiateUploadRequest) (*InitiateUploadResponse, error)
-	// CompleteUpload records the object, its chunks and the acknowledged
-	// replicas in one transaction. Fails with ALREADY_EXISTS if the key is taken.
+	// CompleteUpload validates the request against the issued plan, records the
+	// acknowledged replicas, marks the object COMMITTED and points the key at it,
+	// all in one transaction. An existing key is overwritten. Completing an
+	// already COMMITTED object succeeds without changes.
 	CompleteUpload(context.Context, *CompleteUploadRequest) (*CompleteUploadResponse, error)
 	// GetObject returns the chunk list and replica locations for a key.
 	GetObject(context.Context, *GetObjectRequest) (*GetObjectResponse, error)

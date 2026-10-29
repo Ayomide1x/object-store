@@ -14,6 +14,17 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class MetadataRepository {
 
+    /** Object lifecycle states, matching the CHECK constraint on objects.status. */
+    public enum Status { PENDING, COMMITTED }
+
+    /** An objects row, without its chunks. */
+    public record ObjectRow(UUID objectId, String key, long sizeBytes, Status status) {
+    }
+
+    /** A chunk as allocated at initiate, with the nodes it was placed on. */
+    public record PlannedChunk(UUID chunkId, int index, long sizeBytes, List<String> placedNodeIds) {
+    }
+
     private final JdbcClient jdbc;
 
     public MetadataRepository(JdbcClient jdbc) {
@@ -40,8 +51,11 @@ public class MetadataRepository {
                 .list();
     }
 
-    public void insertObject(UUID objectId, String key, long sizeBytes) {
-        jdbc.sql("INSERT INTO objects (object_id, key, size_bytes) VALUES (:objectId, :key, :sizeBytes)")
+    public void insertPendingObject(UUID objectId, String key, long sizeBytes) {
+        jdbc.sql("""
+                INSERT INTO objects (object_id, key, size_bytes, status)
+                VALUES (:objectId, :key, :sizeBytes, 'PENDING')
+                """)
                 .param("objectId", objectId)
                 .param("key", key)
                 .param("sizeBytes", sizeBytes)
@@ -60,6 +74,58 @@ public class MetadataRepository {
                 .update();
     }
 
+    public void insertPlacement(UUID chunkId, String nodeId) {
+        jdbc.sql("INSERT INTO chunk_placements (chunk_id, node_id) VALUES (:chunkId, :nodeId)")
+                .param("chunkId", chunkId)
+                .param("nodeId", nodeId)
+                .update();
+    }
+
+    /**
+     * Locks an object row for the rest of the transaction, so two completes of
+     * the same upload run one after the other.
+     */
+    public Optional<ObjectRow> lockObject(UUID objectId) {
+        return jdbc.sql("SELECT object_id, key, size_bytes, status FROM objects WHERE object_id = :id FOR UPDATE")
+                .param("id", objectId)
+                .query((rs, i) -> new ObjectRow(
+                        rs.getObject("object_id", UUID.class),
+                        rs.getString("key"),
+                        rs.getLong("size_bytes"),
+                        Status.valueOf(rs.getString("status"))))
+                .optional();
+    }
+
+    /** The chunk plan issued at initiate, in index order. */
+    public List<PlannedChunk> plannedChunks(UUID objectId) {
+        record Row(UUID chunkId, int index, long sizeBytes, String nodeId) {
+        }
+        List<Row> rows = jdbc.sql("""
+                SELECT c.chunk_id, c.chunk_index, c.size_bytes, p.node_id
+                FROM chunks c
+                LEFT JOIN chunk_placements p ON p.chunk_id = c.chunk_id
+                WHERE c.object_id = :id
+                ORDER BY c.chunk_index, p.node_id
+                """)
+                .param("id", objectId)
+                .query((rs, i) -> new Row(
+                        rs.getObject("chunk_id", UUID.class),
+                        rs.getInt("chunk_index"),
+                        rs.getLong("size_bytes"),
+                        rs.getString("node_id")))
+                .list();
+
+        Map<UUID, PlannedChunk> chunks = new LinkedHashMap<>();
+        for (Row row : rows) {
+            PlannedChunk chunk = chunks.computeIfAbsent(row.chunkId(),
+                    id -> new PlannedChunk(id, row.index(), row.sizeBytes(), new ArrayList<>()));
+            if (row.nodeId() != null) {
+                chunk.placedNodeIds().add(row.nodeId());
+            }
+        }
+        return List.copyOf(chunks.values());
+    }
+
     public void insertReplica(UUID chunkId, String nodeId) {
         jdbc.sql("INSERT INTO chunk_replicas (chunk_id, node_id) VALUES (:chunkId, :nodeId)")
                 .param("chunkId", chunkId)
@@ -67,9 +133,37 @@ public class MetadataRepository {
                 .update();
     }
 
+    public void markCommitted(UUID objectId) {
+        jdbc.sql("""
+                UPDATE objects SET status = 'COMMITTED', committed_at = clock_timestamp()
+                WHERE object_id = :id AND status = 'PENDING'
+                """)
+                .param("id", objectId)
+                .update();
+    }
+
     /**
-     * Loads an object, its chunks and their replicas in one statement, so the
-     * result is a single consistent snapshot.
+     * Points key at objectId, inserting or replacing the pointer atomically.
+     * Concurrent swaps of one key serialize on the keys row (or, for a new
+     * key, on its primary-key index entry). The transaction that commits last
+     * wins.
+     */
+    public void swapKey(String key, UUID objectId) {
+        jdbc.sql("""
+                INSERT INTO keys (key, object_id) VALUES (:key, :objectId)
+                ON CONFLICT (key) DO UPDATE
+                SET object_id = EXCLUDED.object_id, updated_at = clock_timestamp()
+                """)
+                .param("key", key)
+                .param("objectId", objectId)
+                .update();
+    }
+
+    /**
+     * Resolves a key and loads that object's chunks and replicas in one
+     * statement, so the result is a single snapshot of exactly one object.
+     * Chunks and replicas are LEFT JOINed: a 0-byte object has no chunks but
+     * still resolves.
      */
     public Optional<StoredObject> findObjectByKey(String key) {
         record Row(UUID objectId, long objectSize, UUID chunkId, int chunkIndex, long chunkSize, Node node) {
@@ -78,11 +172,12 @@ public class MetadataRepository {
                 SELECT o.object_id, o.size_bytes AS object_size,
                        c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size,
                        n.node_id, n.internal_addr, n.client_addr
-                FROM objects o
-                JOIN chunks c ON c.object_id = o.object_id
+                FROM keys k
+                JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'
+                LEFT JOIN chunks c ON c.object_id = o.object_id
                 LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
                 LEFT JOIN nodes n ON n.node_id = r.node_id
-                WHERE o.key = :key
+                WHERE k.key = :key
                 ORDER BY c.chunk_index, n.node_id
                 """)
                 .param("key", key)
@@ -102,6 +197,9 @@ public class MetadataRepository {
 
         Map<UUID, StoredObject.Chunk> chunks = new LinkedHashMap<>();
         for (Row row : rows) {
+            if (row.chunkId() == null) {
+                continue; // the single row of an object with no chunks
+            }
             StoredObject.Chunk chunk = chunks.computeIfAbsent(row.chunkId(),
                     id -> new StoredObject.Chunk(id, row.chunkIndex(), row.chunkSize(), new ArrayList<>()));
             if (row.node() != null) {

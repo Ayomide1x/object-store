@@ -89,3 +89,128 @@ On failure the node removes the partial file. Chunk IDs must be canonical lowerc
 **Over:** the default `0.0.0.0`.
 **Because:** there's no authentication (out of scope), so services must not be reachable from the LAN.
 **Breaks if:** clients on other machines need access.
+
+## Object lifecycle: plan persisted at initiate, PENDING → COMMITTED (stage 2)
+**Supersedes:** "InitiateUpload persists nothing; metadata is written at CompleteUpload" (stage 1).
+**Chose:** `InitiateUpload` inserts, in one transaction, an `objects` row with `status = 'PENDING'`, every `chunks` row (index and expected size), and a `chunk_placements` row per (chunk, target node). `CompleteUpload` then, in one transaction:
+1. locks the object row (`FOR UPDATE`);
+2. validates the request against that plan;
+3. inserts `chunk_replicas` for the acknowledged nodes;
+4. sets `status = 'COMMITTED'`;
+5. swaps the key pointer.
+
+A PENDING object is unreachable from any key.
+**Over:** a stateless initiate validated with a signed token that carries the plan; a separate `uploads` table, with `objects` rows created only at commit.
+**Because:** the coordinator needs a record of what it issued to validate against, and stage 8 GC needs a record of abandoned uploads. A status column on `objects` is the lifecycle CLAUDE.md describes, with no copy step between tables.
+**Breaks if:** abandoned PENDING uploads accumulate without bound. Their metadata and chunk files stay until stage 8 GC.
+
+## Key pointer table with last-commit-wins atomic swap (stage 2)
+**Supersedes:** "Duplicate keys rejected by the UNIQUE constraint, not an existence check" (stage 1).
+**Chose:** V2 drops `objects_key_unique` and adds `keys (key PRIMARY KEY, object_id)`. The last statement of `CompleteUpload` is `INSERT INTO keys … ON CONFLICT (key) DO UPDATE SET object_id = EXCLUDED.object_id`. A put to an existing key is an overwrite, not an error.
+- Concurrent swaps of one key serialize on the `keys` row lock, or, for a new key, on its primary-key index entry.
+- The transaction that commits last wins.
+- Lock order is always own `objects` row, then `keys` row, so there are no deadlocks.
+
+`GetObject` resolves `keys → objects` and LEFT JOINs to chunks and replicas in **one statement**, so a reader gets the complete chunk list of exactly one object. Chunk sets are fixed at initiate and chunk files are immutable, so a mix of old and new chunks cannot be expressed.
+**Over:** winning by initiate order (a conditional swap: a slow older upload would get a success response but never become visible); SERIALIZABLE isolation (needs retry loops for no added guarantee); an advisory lock on a hash of the key (redundant with the row lock; collisions serialize unrelated keys); read-then-write (`SELECT`, then `UPDATE` or `INSERT`), which races on a new key.
+**Breaks if:** clients need a deterministic winner that isn't "last to commit," for example conditional puts. That would need a version column and compare-and-swap.
+
+## committed_at and keys.updated_at do not define version order (stage 2)
+**Chose:** both columns are set with `clock_timestamp()` (wall-clock time at execution), not `now()` (transaction start time). They are informational only. **The `keys` row alone defines which version of a key is current.**
+**Over:** `now()`; ordering versions by either timestamp.
+**Because:** with `now()`, a winner whose transaction started earlier can show an earlier timestamp than the object it replaced. `clock_timestamp()` is closer to the truth, but `committed_at` is still set before the transaction blocks on the `keys` row lock. So under concurrent overwrites, the winner can still have an earlier `committed_at` than an object it replaced. Wall clocks can also step.
+**Breaks if:** someone uses either column to answer "which version is newest." Anything that needs version order must read `keys`, or a future explicit version column.
+
+## A key can only point to a COMMITTED object, enforced by a composite foreign key (stage 2)
+**Chose:** `keys (object_id, object_status)` references `objects (object_id, status)`, where `keys.object_status` is constrained to `'COMMITTED'`, backed by `UNIQUE (object_id, status)` on `objects`.
+**Over:** enforcing invariant 1 only in application code.
+**Because:** Postgres rejects a pointer to a PENDING object regardless of the code path, and it rejects moving a referenced object back out of COMMITTED.
+**Breaks if:** a later stage adds an object status that must stay readable (for example a `DELETING` state during stage 8). The FK target would have to change.
+
+## All chunks allocated up front at initiate; 5 GiB object cap (stage 2)
+**Chose:** `InitiateUpload` returns all n = ⌈size / 4 MiB⌉ placements. Objects over 5 GiB (1,280 chunks, ~115 KB response) are rejected with `INVALID_ARGUMENT`.
+**Over:** one `AllocateChunk` RPC per chunk; streaming the plan.
+**Because:** for 100 MiB (25 chunks), up front costs 2 coordinator RPCs and 2 transactions, versus 27 for per-chunk allocation. The latency difference (~25 round trips) is negligible next to the transfer. The deciding factor is that `CompleteUpload` gets a fixed, complete plan to validate against. `osctl` always knows the size from `stat`. The cap keeps the response far below the 4 MiB gRPC message limit (reached around ~45k chunks). 5 GiB matches S3's single-PUT limit.
+**Breaks if:** uploads of unknown length (stdin) or larger than 5 GiB are needed, or placement must change mid-upload when a node dies (stage 6 onward).
+
+## Coordinator-computed chunk boundaries; CompleteUpload validates against the issued plan (stage 2)
+**Chose:** the coordinator decides each chunk's index and size: 4 MiB, except a shorter last chunk. `CompleteUpload` rejects with `INVALID_ARGUMENT` unless:
+- `key` and `size_bytes` equal the stored values (proto3 can't tell an absent int64 from 0, so both must always be sent);
+- the request's chunk IDs are exactly the set allocated to this object: none missing, none extra, none from another object, no duplicates;
+- each chunk's index and size equal its allocated index and size (allocation produces 0…n−1, so this enforces contiguity);
+- chunk sizes sum to the object size;
+- each chunk's acknowledged nodes are non-empty, distinct, and a subset of that chunk's placement.
+
+An unknown `object_id` returns `NOT_FOUND`. A rejected complete writes nothing.
+**Still trusted from the client until stage 4:** that a placed node actually acknowledged the write. The coordinator never hears from the node. The bytes are unverified until stage 3.
+**Over:** client-chosen chunk boundaries; validating only counts and totals.
+**Because:** every chunk ID the coordinator records is one it issued (invariant 4), and checking against a recorded plan is the only way to catch a client that mixes up uploads.
+**Breaks if:** a buggy client reports an ack that never happened. Metadata would then overstate (invariant 3) until stage 4 moves ack reporting off the client.
+
+## Placement recorded at initiate in chunk_placements (stage 2)
+**Chose:** a `chunk_placements (chunk_id, node_id)` table written at initiate. V2 backfills it from stage 1's `chunk_replicas`.
+**Over:** an array column on `chunks`; not recording placement at all.
+**Because:** it's what lets `CompleteUpload` refuse acks from non-placed nodes, and it gives stage 4 (three targets per chunk) and stage 7 (re-replication) a place to record targets. Foreign keys tie it to `nodes`.
+**Breaks if:** placement becomes dynamic within one upload. Rows would then need updating mid-upload, which this design doesn't do.
+
+## CompleteUpload is idempotent for an already COMMITTED object (stage 2)
+**Chose:** completing an object that is already `COMMITTED` returns OK and changes nothing. That includes not moving the key pointer back if the key has since been overwritten.
+**Over:** `FAILED_PRECONDITION`.
+**Because:** a client whose complete succeeded but whose response was lost can retry safely. The object row lock serializes a retry against the original.
+**Breaks if:** a client relies on a retried complete to re-point the key. It won't.
+
+## Zero-byte objects have zero chunks (stage 2)
+**Chose:** a 0-byte object has n = ⌈0 / 4 MiB⌉ = 0 chunks. Its commit is metadata only, with no node contact. `GetObject` LEFT JOINs to chunks so it still resolves, with an empty chunk list, rather than looking like `NOT_FOUND`. Stage 1's 0-byte objects keep their one empty chunk; `get` handles either.
+**Over:** always one, possibly empty, chunk.
+**Because:** one formula for every size; no empty files or RPCs. Invariant 2 holds trivially.
+**Breaks if:** code assumes every object has at least one chunk. An inner join from objects to chunks is exactly that bug; mutation 4 checks for it.
+
+## Proto: singular InitiateUploadResponse.chunk replaced by repeated chunks (stage 2)
+**Chose:** delete `ChunkPlacement chunk = 2` with `reserved 2; reserved "chunk";`, add `repeated ChunkPlacement chunks = 3`, and add `index = 3` and `size_bytes = 4` to `ChunkPlacement`. Passes `buf breaking` (WIRE_JSON) against stage 1. Without the `reserved` lines, buf rejects the change on both number and name (checked).
+**Over:** changing field 2 to `repeated` (JSON cardinality change, flagged by WIRE_JSON; an old singular parser *merges* repeated messages into one); keeping field 2 populated with chunk 0 for old clients.
+**Because:** an old stage 1 client then sees no `chunk` and fails cleanly ("coordinator returned no nodes"), instead of uploading part of an object.
+**Breaks if:** stage 1 clients had been deployed and still needed to work.
+
+## Chunks upload sequentially in stage 2 (stage 2)
+**Chose:** `osctl put` uploads chunks one after another. Each one is read through an `io.SectionReader` over its byte range, one fresh 1 MiB frame at a time, so memory stays at a few MiB whatever the file size. `get` writes chunks in index order to a temp file, then fsyncs and renames it.
+**Over:** a bounded parallel upload (`errgroup`).
+**Because:** there's one node, loopback bandwidth isn't the bottleneck, and stage 4's choice of write mechanism (client fan-out vs. primary forwarding) may reshape this path. Parallelism now is unmeasured.
+**Breaks if:** throughput matters across real networks with several nodes.
+
+## Superseded objects are left fully intact until stage 8 (stage 2)
+**Chose:** after an overwrite, the old object stays `COMMITTED` with all its rows and chunk files. It's simply no longer referenced by `keys`. A reader that fetched its chunk list before the swap finishes normally.
+**Over:** deleting at overwrite time; recording a `superseded_at` timestamp now.
+**Because:** deleting at overwrite time would break in-flight readers, and GC is stage 8. Capturing the old object ID race-free during an upsert needs a retry loop, which is GC bookkeeping that belongs to stage 8.
+**Breaks if:** disk fills. Every overwrite leaks the old object's bytes until stage 8, which will need a grace period before deleting a superseded object's files. Superseded objects are found as "COMMITTED and not referenced by `keys`."
+
+## Atomicity is proven by a fault-injection trigger test; mutations as patches (stage 2)
+**Supersedes:** "CompleteUpload atomicity is proven by the last-insert-failure test" (stage 1). With validation now running before any write, an unknown acknowledged node is rejected before anything is written, so that test can no longer prove atomicity.
+**Chose:** `failedOverwriteLeavesOldObjectIntact` installs a test-only Postgres trigger that raises on the `keys` upsert, the last statement of `CompleteUpload`, after the replica inserts and status update have run. Production code has no hooks. The mutations are patches in `scripts/mutations/`, run by `scripts/coordinator-mutation-check.sh`:
+
+| Mutation | Must be caught by |
+|---|---|
+| 1: `GetObject` ignores the pointer and status | `overwriteIsInvisibleUntilCommit` (and every validation case, which asserts a rejected upload stays invisible) |
+| 2: no `@Transactional` on `completeUpload` | `failedOverwriteLeavesOldObjectIntact`, alone |
+| 3: read-then-write key swap | `concurrentOverwritesAllSucceedAndLeaveOnePointer`, alone |
+| 4: inner join to chunks | `zeroByteObjectResolvesWithEmptyChunkList`, alone |
+
+Each validation case asserts its error message fragment as well as the status code, so it proves the specific check it targets.
+**Over:** hand-editing code for each mutation check; rejecting at a later insert through bad input (impossible now).
+**Because:** mutation checks in a script are repeatable by anyone, and the trigger makes "failure after earlier writes" reachable.
+**Breaks if:** the order of statements in `CompleteUpload` changes so the key swap is no longer last, or code edits stop the patches from applying. The script then fails at `git apply --check`, loudly, rather than silently passing.
+
+## Coordinator readiness: in-container /dev/tcp healthcheck; `up --wait` is the only wait (stage 2)
+**Chose:** a Compose `healthcheck` on the coordinator that runs `bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090'` inside the container, with `start_period: 60s` and `start_interval: 1s`. `docker compose up --wait` is the only readiness wait in scripts and verification commands. The gRPC server binds 9090 only after Flyway migrations and node registration complete, so an accepted connection means the coordinator is ready.
+
+Verified on a clean `down -v`:
+- The first probe failed (05:15:16.403). The server started at 05:15:16.437. The next probe passed (05:15:17.417). `--wait` returned at 05:15:17.935, and Flyway was already at V2 at that point.
+- Negative control: with the probe pointed at a closed port, `up --wait --wait-timeout 15` exited 1 ("application not healthy after 15s").
+
+**Over:**
+- **No healthcheck.** Compose treats a running container as ready, so `--wait` returned before Flyway had run. A query in stage 2 verification raced V2 this way.
+- **`nc -z 127.0.0.1 9090` from the host.** On Docker Desktop the published port is served by Docker's port proxy, which accepts the TCP connection as soon as the container exists, before the coordinator listens. A host-side probe therefore reports ready too early. It also adds a second, ad hoc wait mechanism outside Compose.
+- **Grepping the logs for `Started CoordinatorApplication`.** This was used as a stopgap during stage 2 verification. It couples readiness to a log message's wording, and it only works for whoever runs the loop.
+- **A gRPC health probe binary (`grpc_health_probe`).** It's a real application-level check, but it means an extra binary in the image, with its own arm64 build to track. A TCP accept already implies startup finished.
+
+**Because:** the probe runs where the listener is, needs only bash (present in `eclipse-temurin:25-jre`, Ubuntu-based), and makes the stack itself define readiness.
+**Breaks if:** the coordinator starts accepting connections before it can serve, for example if the gRPC server is ever started before migrations or registration. Or if the coordinator's runtime image moves to one without bash (for example distroless). Or if readiness needs more than "listening," such as a lost database connection. A TCP probe doesn't see that; the gRPC health service would.

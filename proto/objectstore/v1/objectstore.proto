@@ -8,10 +8,13 @@ option java_package = "io.github.ayomide1x.objectstore.v1";
 
 // CoordinatorService owns all metadata. It never carries object bytes.
 service CoordinatorService {
-  // InitiateUpload allocates IDs and chooses placement. It persists nothing.
+  // InitiateUpload records a PENDING object with its full chunk plan and
+  // placement. A PENDING object is not reachable from any key.
   rpc InitiateUpload(InitiateUploadRequest) returns (InitiateUploadResponse);
-  // CompleteUpload records the object, its chunks and the acknowledged
-  // replicas in one transaction. Fails with ALREADY_EXISTS if the key is taken.
+  // CompleteUpload validates the request against the issued plan, records the
+  // acknowledged replicas, marks the object COMMITTED and points the key at it,
+  // all in one transaction. An existing key is overwritten. Completing an
+  // already COMMITTED object succeeds without changes.
   rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
   // GetObject returns the chunk list and replica locations for a key.
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
@@ -23,13 +26,20 @@ message InitiateUploadRequest {
 }
 
 message InitiateUploadResponse {
+  reserved 2;
+  reserved "chunk";
+
   string object_id = 1;
-  ChunkPlacement chunk = 2;
+  // Ordered by index. Empty for a 0-byte object.
+  repeated ChunkPlacement chunks = 3;
 }
 
 message ChunkPlacement {
   string chunk_id = 1;
   repeated NodeLocation nodes = 2;
+  int32 index = 3;
+  // Chunk boundaries are decided by the coordinator.
+  int64 size_bytes = 4;
 }
 
 message NodeLocation {

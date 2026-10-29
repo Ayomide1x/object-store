@@ -38,19 +38,23 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
     @Override
     public void initiateUpload(InitiateUploadRequest request, StreamObserver<InitiateUploadResponse> response) {
         respond(response, () -> {
-            MetadataService.Placement p = metadata.initiateUpload(request.getKey(), request.getSizeBytes());
+            MetadataService.UploadPlan plan = metadata.initiateUpload(request.getKey(), request.getSizeBytes());
             log.atInfo()
-                    .addKeyValue("object_id", p.objectId())
-                    .addKeyValue("chunk_id", p.chunkId())
-                    .addKeyValue("node_id", p.nodes().getFirst().nodeId())
+                    .addKeyValue("object_id", plan.objectId())
                     .addKeyValue("key", request.getKey())
+                    .addKeyValue("size_bytes", request.getSizeBytes())
+                    .addKeyValue("chunks", plan.chunks().size())
                     .log("upload initiated");
-            return InitiateUploadResponse.newBuilder()
-                    .setObjectId(p.objectId().toString())
-                    .setChunk(ChunkPlacement.newBuilder()
-                            .setChunkId(p.chunkId().toString())
-                            .addAllNodes(p.nodes().stream().map(CoordinatorGrpcService::clientLocation).toList()))
-                    .build();
+            InitiateUploadResponse.Builder b = InitiateUploadResponse.newBuilder()
+                    .setObjectId(plan.objectId().toString());
+            for (MetadataService.ChunkPlacement c : plan.chunks()) {
+                b.addChunks(ChunkPlacement.newBuilder()
+                        .setChunkId(c.chunkId().toString())
+                        .setIndex(c.index())
+                        .setSizeBytes(c.sizeBytes())
+                        .addAllNodes(c.nodes().stream().map(CoordinatorGrpcService::clientLocation).toList()));
+            }
+            return b.build();
         });
     }
 
