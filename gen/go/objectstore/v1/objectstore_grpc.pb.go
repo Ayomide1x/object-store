@@ -33,10 +33,13 @@ type CoordinatorServiceClient interface {
 	// InitiateUpload records a PENDING object with its full chunk plan and
 	// placement. A PENDING object is not reachable from any key.
 	InitiateUpload(ctx context.Context, in *InitiateUploadRequest, opts ...grpc.CallOption) (*InitiateUploadResponse, error)
-	// CompleteUpload validates the request against the issued plan, records the
-	// acknowledged replicas, marks the object COMMITTED and points the key at it,
-	// all in one transaction. An existing key is overwritten. Completing an
-	// already COMMITTED object succeeds without changes.
+	// CompleteUpload validates the request against the issued plan, asks every
+	// placed node which chunks it durably holds (StatChunks), and commits only if
+	// every chunk has at least 2 replicas whose node reports the planned size and
+	// the client's SHA-256. It then records exactly those replicas, marks the
+	// object COMMITTED and points the key at it, in one transaction. Fewer than 2
+	// verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
+	// overwritten. Completing an already COMMITTED object succeeds without changes.
 	CompleteUpload(ctx context.Context, in *CompleteUploadRequest, opts ...grpc.CallOption) (*CompleteUploadResponse, error)
 	// GetObject returns the chunk list and replica locations for a key.
 	GetObject(ctx context.Context, in *GetObjectRequest, opts ...grpc.CallOption) (*GetObjectResponse, error)
@@ -89,10 +92,13 @@ type CoordinatorServiceServer interface {
 	// InitiateUpload records a PENDING object with its full chunk plan and
 	// placement. A PENDING object is not reachable from any key.
 	InitiateUpload(context.Context, *InitiateUploadRequest) (*InitiateUploadResponse, error)
-	// CompleteUpload validates the request against the issued plan, records the
-	// acknowledged replicas, marks the object COMMITTED and points the key at it,
-	// all in one transaction. An existing key is overwritten. Completing an
-	// already COMMITTED object succeeds without changes.
+	// CompleteUpload validates the request against the issued plan, asks every
+	// placed node which chunks it durably holds (StatChunks), and commits only if
+	// every chunk has at least 2 replicas whose node reports the planned size and
+	// the client's SHA-256. It then records exactly those replicas, marks the
+	// object COMMITTED and points the key at it, in one transaction. Fewer than 2
+	// verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
+	// overwritten. Completing an already COMMITTED object succeeds without changes.
 	CompleteUpload(context.Context, *CompleteUploadRequest) (*CompleteUploadResponse, error)
 	// GetObject returns the chunk list and replica locations for a key.
 	GetObject(context.Context, *GetObjectRequest) (*GetObjectResponse, error)
@@ -217,6 +223,7 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 const (
 	StorageNodeService_WriteChunk_FullMethodName = "/objectstore.v1.StorageNodeService/WriteChunk"
 	StorageNodeService_ReadChunk_FullMethodName  = "/objectstore.v1.StorageNodeService/ReadChunk"
+	StorageNodeService_StatChunks_FullMethodName = "/objectstore.v1.StorageNodeService/StatChunks"
 )
 
 // StorageNodeServiceClient is the client API for StorageNodeService service.
@@ -232,6 +239,11 @@ type StorageNodeServiceClient interface {
 	// visible only after the hash matches and the file is durable.
 	WriteChunk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WriteChunkRequest, WriteChunkResponse], error)
 	ReadChunk(ctx context.Context, in *ReadChunkRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReadChunkResponse], error)
+	// StatChunks reports, for each requested chunk, whether this node durably
+	// holds a verified copy: a valid header naming that chunk under its final
+	// name. It reads only headers, not data. One call covers every chunk of an
+	// object placed on this node.
+	StatChunks(ctx context.Context, in *StatChunksRequest, opts ...grpc.CallOption) (*StatChunksResponse, error)
 }
 
 type storageNodeServiceClient struct {
@@ -274,6 +286,16 @@ func (c *storageNodeServiceClient) ReadChunk(ctx context.Context, in *ReadChunkR
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type StorageNodeService_ReadChunkClient = grpc.ServerStreamingClient[ReadChunkResponse]
 
+func (c *storageNodeServiceClient) StatChunks(ctx context.Context, in *StatChunksRequest, opts ...grpc.CallOption) (*StatChunksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatChunksResponse)
+	err := c.cc.Invoke(ctx, StorageNodeService_StatChunks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StorageNodeServiceServer is the server API for StorageNodeService service.
 // All implementations must embed UnimplementedStorageNodeServiceServer
 // for forward compatibility.
@@ -287,6 +309,11 @@ type StorageNodeServiceServer interface {
 	// visible only after the hash matches and the file is durable.
 	WriteChunk(grpc.ClientStreamingServer[WriteChunkRequest, WriteChunkResponse]) error
 	ReadChunk(*ReadChunkRequest, grpc.ServerStreamingServer[ReadChunkResponse]) error
+	// StatChunks reports, for each requested chunk, whether this node durably
+	// holds a verified copy: a valid header naming that chunk under its final
+	// name. It reads only headers, not data. One call covers every chunk of an
+	// object placed on this node.
+	StatChunks(context.Context, *StatChunksRequest) (*StatChunksResponse, error)
 	mustEmbedUnimplementedStorageNodeServiceServer()
 }
 
@@ -302,6 +329,9 @@ func (UnimplementedStorageNodeServiceServer) WriteChunk(grpc.ClientStreamingServ
 }
 func (UnimplementedStorageNodeServiceServer) ReadChunk(*ReadChunkRequest, grpc.ServerStreamingServer[ReadChunkResponse]) error {
 	return status.Error(codes.Unimplemented, "method ReadChunk not implemented")
+}
+func (UnimplementedStorageNodeServiceServer) StatChunks(context.Context, *StatChunksRequest) (*StatChunksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StatChunks not implemented")
 }
 func (UnimplementedStorageNodeServiceServer) mustEmbedUnimplementedStorageNodeServiceServer() {}
 func (UnimplementedStorageNodeServiceServer) testEmbeddedByValue()                            {}
@@ -342,13 +372,36 @@ func _StorageNodeService_ReadChunk_Handler(srv interface{}, stream grpc.ServerSt
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type StorageNodeService_ReadChunkServer = grpc.ServerStreamingServer[ReadChunkResponse]
 
+func _StorageNodeService_StatChunks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StatChunksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageNodeServiceServer).StatChunks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageNodeService_StatChunks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageNodeServiceServer).StatChunks(ctx, req.(*StatChunksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // StorageNodeService_ServiceDesc is the grpc.ServiceDesc for StorageNodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var StorageNodeService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "objectstore.v1.StorageNodeService",
 	HandlerType: (*StorageNodeServiceServer)(nil),
-	Methods:     []grpc.MethodDesc{},
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "StatChunks",
+			Handler:    _StorageNodeService_StatChunks_Handler,
+		},
+	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "WriteChunk",

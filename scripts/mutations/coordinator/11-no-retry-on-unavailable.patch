@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
+@@ -109,7 +109,7 @@
+         try {
+             return stub(node, deadline).statChunks(req);
+         } catch (StatusRuntimeException e) {
+-            if (e.getStatus().getCode() != Status.Code.UNAVAILABLE || deadline.isExpired()) {
++            if (true) {
+                 throw e;
+             }
+             // The cached channel may hold a stale address or a dead connection.

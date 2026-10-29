@@ -332,6 +332,52 @@ func (s *Store) Read(ctx context.Context, chunkID string) ([]byte, error) {
 	return data, nil
 }
 
+// Stat reports the data size and stored SHA-256 of a chunk, reading only its
+// header. A file exists under a final name only after its hash was verified
+// and it was fsynced (see Commit), so a valid header naming chunkID is proof
+// of a durable, verified write. Data corruption since then is caught by Read.
+// Returns ErrNotFound if there is no file, ErrCorrupt if the header is invalid
+// or names another chunk.
+func (s *Store) Stat(ctx context.Context, chunkID string) (size int64, sum []byte, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
+	path, err := s.path(chunkID)
+	if err != nil {
+		return 0, nil, err
+	}
+	idBytes, err := uuidBytes(chunkID)
+	if err != nil {
+		return 0, nil, err
+	}
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil, fmt.Errorf("stat chunk %s: %w", chunkID, ErrNotFound)
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("stat chunk %s: %w", chunkID, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, nil, fmt.Errorf("stat chunk %s: %w", chunkID, err)
+	}
+	if info.Size() < HeaderSize || info.Size() > HeaderSize+MaxChunkSize {
+		return 0, nil, fmt.Errorf("chunk %s: file is %d bytes: %w", chunkID, info.Size(), ErrCorrupt)
+	}
+	header := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return 0, nil, fmt.Errorf("read header of chunk %s: %w", chunkID, err)
+	}
+	if string(header[:idOffset]) != magic {
+		return 0, nil, fmt.Errorf("chunk %s: bad magic %q: %w", chunkID, header[:idOffset], ErrCorrupt)
+	}
+	if !bytes.Equal(header[idOffset:hashOffset], idBytes) {
+		return 0, nil, fmt.Errorf("chunk %s: header names chunk %x: %w", chunkID, header[idOffset:hashOffset], ErrCorrupt)
+	}
+	return info.Size() - HeaderSize, header[hashOffset:HeaderSize], nil
+}
+
 // path maps a chunk ID to its final file. Rejecting anything but a canonical
 // UUID keeps IDs like "../x" from escaping the directory.
 func (s *Store) path(chunkID string) (string, error) {

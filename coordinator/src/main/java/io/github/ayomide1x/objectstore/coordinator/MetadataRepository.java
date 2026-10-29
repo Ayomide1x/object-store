@@ -81,6 +81,18 @@ public class MetadataRepository {
                 .update();
     }
 
+    /** Reads an objects row without locking it. */
+    public Optional<ObjectRow> findObject(UUID objectId) {
+        return jdbc.sql("SELECT object_id, key, size_bytes, status FROM objects WHERE object_id = :id")
+                .param("id", objectId)
+                .query((rs, i) -> new ObjectRow(
+                        rs.getObject("object_id", UUID.class),
+                        rs.getString("key"),
+                        rs.getLong("size_bytes"),
+                        Status.valueOf(rs.getString("status"))))
+                .optional();
+    }
+
     /**
      * Locks an object row for the rest of the transaction, so two completes of
      * the same upload run one after the other.

@@ -65,7 +65,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
             List<MetadataService.CompletedChunk> chunks = request.getChunksList().stream()
                     .map(c -> new MetadataService.CompletedChunk(
                             parseUuid("chunk_id", c.getChunkId()), c.getIndex(), c.getSizeBytes(),
-                            c.getAckedNodeIdsList(), c.getSha256().toByteArray()))
+                            c.getSha256().toByteArray()))
                     .toList();
             metadata.completeUpload(parseUuid("object_id", request.getObjectId()), request.getKey(),
                     request.getSizeBytes(), chunks);

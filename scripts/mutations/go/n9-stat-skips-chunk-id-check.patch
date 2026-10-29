@@ -1,0 +1,11 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -372,7 +372,7 @@
+ 	if string(header[:idOffset]) != magic {
+ 		return 0, nil, fmt.Errorf("chunk %s: bad magic %q: %w", chunkID, header[:idOffset], ErrCorrupt)
+ 	}
+-	if !bytes.Equal(header[idOffset:hashOffset], idBytes) {
++	if false && !bytes.Equal(header[idOffset:hashOffset], idBytes) {
+ 		return 0, nil, fmt.Errorf("chunk %s: header names chunk %x: %w", chunkID, header[idOffset:hashOffset], ErrCorrupt)
+ 	}
+ 	return info.Size() - HeaderSize, header[hashOffset:HeaderSize], nil

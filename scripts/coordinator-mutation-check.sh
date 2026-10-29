@@ -23,6 +23,12 @@ expected_test() {
     3-read-then-write-swap) echo "concurrentOverwritesAllSucceedAndLeaveOnePointer()" ;;
     4-inner-join-chunks) echo "zeroByteObjectResolvesWithEmptyChunkList()" ;;
     5-hash-not-recorded) echo "checksumsAreRecordedAndReturnedByGetObject()" ;;
+    6-quorum-of-one) echo "commitRefusedWhenAnyChunkHasFewerThanTwoVerifiedReplicas()" ;;
+    7-record-unverified-replicas) echo '"one missing"' ;;
+    8-no-node-rpc-deadline) echo "hungNodeCostsOneDeadlineWhateverTheObjectSize()" ;;
+    9-skip-hash-comparison) echo '"one with another hash"' ;;
+    10-accept-wrong-node) echo "responseFromTheWrongNodeRecordsNothingForIt()" ;;
+    11-no-retry-on-unavailable) echo "unavailableOnceIsRetriedAndTheReplicaCounts()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

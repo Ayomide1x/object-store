@@ -1,25 +1,28 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
+	"time"
 
+	"github.com/Ayomide1x/object-store/client/internal/upload"
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 )
 
-const maxFrameSize = 1 << 20
+const defaultChunkWriteTimeout = 10 * time.Second
 
 // put uploads a file: initiate (the coordinator returns the full chunk plan),
-// stream each chunk to its node in order, then complete with the nodes'
-// acknowledgements and each chunk's SHA-256. The file is read once, one frame
-// at a time, and hashed as it streams.
+// write each chunk to all of its placed nodes in parallel, then complete. The
+// coordinator decides what was stored by asking the nodes; the client reports
+// only each chunk's SHA-256. Chunks go one after another; each replica reads
+// its own view of the file, one frame at a time, hashing as it streams.
 func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) error {
+	timeout, err := chunkWriteTimeout()
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
@@ -48,29 +51,29 @@ func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) err
 		return fmt.Errorf("initiate upload of %q: %w", key, err)
 	}
 
-	// Chunks go up one after another; parallel upload is deferred (see DECISIONS.md).
+	up := upload.New(objectID, timeout, log)
 	var completed []*objectstorev1.CompletedChunk
 	var offset int64
-	for _, chunk := range initResp.GetChunks() {
-		node := chunk.GetNodes()[0]
-		clog := log.With("chunk_id", chunk.GetChunkId(), "node_id", node.GetNodeId())
-
-		// A SectionReader reads only this chunk's byte range of the file.
-		section := io.NewSectionReader(f, offset, chunk.GetSizeBytes())
-		written, sum, err := writeChunk(ctx, node.GetAddress(), objectID, chunk.GetChunkId(), section, chunk.GetSizeBytes())
-		if err != nil {
-			return fmt.Errorf("write chunk %d (%s) to %s: %w", chunk.GetIndex(), chunk.GetChunkId(), node.GetNodeId(), err)
+	for _, c := range initResp.GetChunks() {
+		chunk := upload.Chunk{ID: c.GetChunkId(), Index: c.GetIndex(), Size: c.GetSizeBytes(), Offset: offset}
+		for _, n := range c.GetNodes() {
+			chunk.Targets = append(chunk.Targets, upload.Target{NodeID: n.GetNodeId(), Address: n.GetAddress()})
 		}
-		clog.Info("chunk written", "index", chunk.GetIndex(), "bytes", written, "sha256", fmt.Sprintf("%x", sum))
-
+		sum, acked, err := up.WriteChunk(ctx, chunk, f)
+		if err != nil {
+			// Fewer than 2 replicas: the object can't commit. It stays PENDING
+			// and the key keeps its previous version.
+			return fmt.Errorf("upload of %q abandoned: %w", key, err)
+		}
+		log.Info("chunk written", "chunk_id", c.GetChunkId(), "index", c.GetIndex(), "replicas", len(acked),
+			"nodes", acked, "sha256", fmt.Sprintf("%x", sum))
 		completed = append(completed, &objectstorev1.CompletedChunk{
-			ChunkId:      chunk.GetChunkId(),
-			Index:        chunk.GetIndex(),
-			SizeBytes:    chunk.GetSizeBytes(),
-			AckedNodeIds: []string{node.GetNodeId()},
-			Sha256:       sum,
+			ChunkId:   c.GetChunkId(),
+			Index:     c.GetIndex(),
+			SizeBytes: c.GetSizeBytes(),
+			Sha256:    sum,
 		})
-		offset += chunk.GetSizeBytes()
+		offset += c.GetSizeBytes()
 	}
 
 	_, err = coord.CompleteUpload(ctx, &objectstorev1.CompleteUploadRequest{
@@ -84,6 +87,20 @@ func put(ctx context.Context, log *slog.Logger, coordAddr, path, key string) err
 	}
 	log.Info("upload complete", "key", key, "bytes", size, "chunks", len(completed))
 	return nil
+}
+
+// chunkWriteTimeout reads OSCTL_CHUNK_WRITE_TIMEOUT, a Go duration such as
+// "10s", which bounds each replica write.
+func chunkWriteTimeout() (time.Duration, error) {
+	v := os.Getenv("OSCTL_CHUNK_WRITE_TIMEOUT")
+	if v == "" {
+		return defaultChunkWriteTimeout, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("OSCTL_CHUNK_WRITE_TIMEOUT must be a positive duration such as 10s, got %q", v)
+	}
+	return d, nil
 }
 
 // checkPlan rejects a chunk plan that does not cover exactly size bytes with
@@ -103,91 +120,4 @@ func checkPlan(chunks []*objectstorev1.ChunkPlacement, size int64) error {
 		return fmt.Errorf("chunk plan covers %d bytes, file is %d", total, size)
 	}
 	return nil
-}
-
-// writeChunk streams size bytes from r to the node: one header frame, data
-// frames of at most maxFrameSize, then a trailer with the SHA-256 of the bytes
-// sent, computed while sending. It returns the bytes written and that hash,
-// after checking the node verified the same hash.
-func writeChunk(ctx context.Context, addr, objectID, chunkID string, r io.Reader, size int64) (int64, []byte, error) {
-	conn, err := dial(addr)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer conn.Close()
-
-	stream, err := objectstorev1.NewStorageNodeServiceClient(conn).WriteChunk(ctx)
-	if err != nil {
-		return 0, nil, fmt.Errorf("open stream: %w", err)
-	}
-	err = stream.Send(&objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Header{
-		Header: &objectstorev1.WriteChunkHeader{ChunkId: chunkID, ObjectId: objectID, SizeBytes: size},
-	}})
-	if err != nil {
-		return 0, nil, closeWithStatus(stream, fmt.Errorf("send header: %w", err))
-	}
-
-	// Everything read from r also goes through the hasher.
-	hasher := sha256.New()
-	r = io.TeeReader(r, hasher)
-	var sent int64
-	for {
-		// A fresh buffer per frame: gRPC forbids modifying a message after Send.
-		buf := make([]byte, maxFrameSize)
-		n, readErr := io.ReadFull(r, buf)
-		if n > 0 {
-			err := stream.Send(&objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Data{Data: buf[:n]}})
-			if err != nil {
-				return 0, nil, closeWithStatus(stream, fmt.Errorf("send frame: %w", err))
-			}
-			sent += int64(n)
-		}
-		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-			break
-		}
-		if readErr != nil {
-			return 0, nil, fmt.Errorf("read source: %w", readErr)
-		}
-	}
-	// A file that shrank since stat yields fewer bytes than planned. The node
-	// would reject the chunk anyway; failing here gives the clearer error.
-	if sent != size {
-		_, _ = stream.CloseAndRecv()
-		return 0, nil, fmt.Errorf("source ended after %d of %d bytes (file changed during upload?)", sent, size)
-	}
-
-	sum := hasher.Sum(nil)
-	err = stream.Send(&objectstorev1.WriteChunkRequest{Frame: &objectstorev1.WriteChunkRequest_Trailer{
-		Trailer: &objectstorev1.WriteChunkTrailer{Sha256: sum},
-	}})
-	if err != nil {
-		return 0, nil, closeWithStatus(stream, fmt.Errorf("send trailer: %w", err))
-	}
-
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return 0, nil, err
-	}
-	if resp.GetBytesWritten() != size {
-		return 0, nil, fmt.Errorf("node wrote %d bytes, expected %d", resp.GetBytesWritten(), size)
-	}
-	// A node that verified a different hash (or none: an older node) has not
-	// acknowledged these bytes.
-	if !bytes.Equal(resp.GetSha256(), sum) {
-		return 0, nil, fmt.Errorf("node verified sha256 %x, sent %x", resp.GetSha256(), sum)
-	}
-	return resp.GetBytesWritten(), sum, nil
-}
-
-// closeWithStatus is called when Send fails. Send returns io.EOF when the
-// server has already ended the RPC; the server's actual error is only
-// available from CloseAndRecv.
-func closeWithStatus(stream objectstorev1.StorageNodeService_WriteChunkClient, sendErr error) error {
-	if !errors.Is(sendErr, io.EOF) {
-		return sendErr
-	}
-	if _, err := stream.CloseAndRecv(); err != nil {
-		return err
-	}
-	return sendErr
 }

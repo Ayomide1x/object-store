@@ -1,18 +1,22 @@
 package io.github.ayomide1x.objectstore.coordinator;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
 
 /**
  * Coordinator settings, bound from environment variables.
  *
- * @param nodes {@code COORDINATOR_NODES}: comma-separated
- *              {@code node_id|internal_addr|client_addr} entries
+ * @param nodes          {@code COORDINATOR_NODES}: comma-separated
+ *                       {@code node_id|internal_addr|client_addr} entries
+ * @param nodeRpcTimeout {@code COORDINATOR_NODE_RPC_TIMEOUT}: deadline for each
+ *                       call to a storage node, such as {@code 2s}
  */
 @ConfigurationProperties("coordinator")
-public record CoordinatorProperties(String nodes) {
+public record CoordinatorProperties(String nodes, @DefaultValue("2s") Duration nodeRpcTimeout) {
 
     public List<Node> parseNodes() {
         if (nodes == null || nodes.isBlank()) {

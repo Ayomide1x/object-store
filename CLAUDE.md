@@ -123,15 +123,24 @@ Strict. One stage at a time. A stage is done only when its acceptance check pass
   - Killing a node mid-write leaves no partial chunk file under its final name.
 
 **4. Replication.**
-- Compose now runs four nodes; each chunk goes to three of them. With exactly three nodes, a dead node leaves nowhere to re-replicate to.
+- Compose now runs four nodes; each chunk goes to three of them. Four, not three, so that when a node dies there is somewhere to re-replicate to (stage 7).
 - The coordinator chooses placement.
 - A write is acknowledged once the chunk is durable and verified on at least 2 of 3 replicas.
 - The write mechanism (client fan-out vs. primary-forwards-to-replicas) is decided at the start of this stage.
 - Metadata records only replicas that actually acknowledged.
 - *Accept:*
-  - With all nodes up, every chunk has 3 recorded replicas.
-  - With one node stopped, uploads still succeed with 2.
-  - With two stopped, uploads fail cleanly and nothing becomes `COMMITTED`.
+  - All 4 nodes up: every chunk has exactly 3 recorded replicas, equal to its 3 placed
+    nodes, and each replica's file passes the header, chunk-ID and SHA-256 check on its
+    own node's volume.
+  - One node stopped: uploads succeed. Each chunk's recorded replicas are exactly its
+    placed nodes minus the stopped one (2 if the stopped node was placed, otherwise 3).
+  - One node paused (hung): uploads succeed within the per-replica write deadline plus
+    normal upload time, and nothing is recorded on the paused node.
+  - Three nodes stopped: a non-empty upload fails cleanly. Nothing becomes `COMMITTED`,
+    and the key still resolves to its previous version, or to nothing.
+  - Two nodes stopped: each upload follows the per-chunk rule. It succeeds exactly when
+    every chunk has at least 2 live placed nodes, and then records exactly those
+    replicas. Otherwise it fails and nothing becomes `COMMITTED`.
 
 **5. Read path with failover.**
 - `get` reads each chunk from one replica and falls back to the next on error or checksum mismatch.
@@ -172,7 +181,7 @@ These must hold at every stage after the one that introduces them. Code that wou
 
 1. **No partial reads.** A key resolves only to a `COMMITTED` object. Readers never observe a partially uploaded or partially overwritten object.
 2. **Commit implies durability.** An object becomes `COMMITTED` only if every one of its chunks has ≥ 2 replicas that acknowledged a checksum-verified, fsynced write.
-3. **Metadata never overstates.** A replica row exists only for a replica that acknowledged. It is better to under-count, and re-replicate unnecessarily, than to over-count and lose data.
+3. **Metadata never overstates.** A replica row exists only for a replica that acknowledged. It is better to under-count, and re-replicate unnecessarily, than to over-count and lose data. Facts about a node are recorded only from a response that identifies as that node.
 4. **Chunks are immutable.** Once written under its final name, a chunk file is never modified in place. Chunk IDs are coordinator-assigned and never reused.
 5. **Every byte served is verified.** No code path returns chunk data to a client or a peer without checking its SHA-256.
 6. **Coordinator carries no object bytes.** Re-replication is node-to-node, ordered by the coordinator.

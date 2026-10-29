@@ -7,6 +7,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
+source "$root/scripts/lib/osctl.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -23,8 +24,8 @@ for c in $cases; do
   else
     head -c "$size" /dev/urandom > "$work/$name.in"
   fi
-  "$osctl" put "$work/$name.in" "roundtrip/$name" 2>/dev/null
-  "$osctl" get "roundtrip/$name" "$work/$name.out" 2>/dev/null
+  osctl_run put "$work/$name.in" "roundtrip/$name"
+  osctl_run get "roundtrip/$name" "$work/$name.out"
   chunks=$(( (size + 4 * mib - 1) / (4 * mib) ))
   if cmp -s "$work/$name.in" "$work/$name.out"; then
     printf '%-12s %10d bytes  %3d chunks  IDENTICAL\n' "$name" "$size" "$chunks"

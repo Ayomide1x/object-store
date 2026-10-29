@@ -6,7 +6,9 @@
 #
 # The Go test TestCommitDurabilityOrder checks the same order through a test
 # seam. This checks the binary actually running in the container, by attaching
-# strace from a side container that shares node1's PID namespace.
+# strace from a side container that shares node1's PID namespace. Since stage 4
+# a chunk goes to 3 of 4 nodes, so the number of links expected on node1 is
+# read from chunk_placements after the upload.
 #
 # What it cannot show: that fsync is sufficient on this disk. That needs
 # power-loss testing, which is out of scope.
@@ -18,6 +20,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
+source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
 work="$(mktemp -d)"
 tracer="stage3-fsync-trace-$$"
@@ -38,12 +41,16 @@ until docker logs "$tracer" 2>&1 | grep -q "attached"; do
   sleep 0.2
 done
 
-# 6 MiB: two chunks.
-head -c $((6 << 20)) /dev/urandom > "$work/payload"
-"$osctl" put "$work/payload" "fsync-trace/$$" 2>/dev/null
+# 12 MiB: three chunks, of which node1 is placed on two or three.
+head -c $((12 << 20)) /dev/urandom > "$work/payload"
+osctl_run put "$work/payload" "fsync-trace/$$"
 docker stop "$tracer" >/dev/null # SIGTERM: strace detaches and flushes
+expected="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tAc \
+  "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) JOIN objects o USING (object_id)
+   WHERE o.key = 'fsync-trace/$$' AND p.node_id = 'node1'")"
+echo "node1 is placed on $expected chunks of this upload"
 
-python3 -I - "$work/trace" <<'EOF'
+python3 -I - "$work/trace" "$expected" <<'EOF'
 import re, sys
 
 full = re.compile(r'^(\d+)\s+(\w+)\((.*)\)\s+=\s+(-?\d+)')
@@ -101,6 +108,8 @@ for i, (_, (temp, final), ret) in links:
     for label, good in steps:
         print(f"  {'ok  ' if good else 'FAIL'} {label}")
         ok &= good
-print("PASS" if ok and len(links) == 2 else f"FAIL ({len(links)} chunk links traced, expected 2)" if ok else "FAIL")
-sys.exit(0 if ok and len(links) == 2 else 1)
+expected = int(sys.argv[2])
+print("PASS" if ok and len(links) == expected else
+      f"FAIL ({len(links)} chunk links traced, expected {expected})" if ok else "FAIL")
+sys.exit(0 if ok and len(links) == expected else 1)
 EOF

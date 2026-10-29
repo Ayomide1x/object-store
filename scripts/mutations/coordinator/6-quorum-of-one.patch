@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -32,7 +32,7 @@
+     /** Nodes each chunk is placed on. */
+     static final int REPLICATION = 3;
+     /** Verified replicas each chunk needs before its object can commit (invariant 2). */
+-    static final int MIN_REPLICAS = 2;
++    static final int MIN_REPLICAS = 1;
+ 
+     private static final Logger log = LoggerFactory.getLogger(MetadataService.class);
+ 

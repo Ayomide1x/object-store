@@ -3,7 +3,12 @@
 //	osctl put <file> <key>
 //	osctl get <key> <file>
 //
-// OSCTL_COORDINATOR sets the coordinator address (default 127.0.0.1:9090).
+// Environment:
+//
+//	OSCTL_COORDINATOR           coordinator address (default 127.0.0.1:9090)
+//	OSCTL_CHUNK_WRITE_TIMEOUT   deadline for each replica write, a Go duration
+//	                            (default 10s). A node that misses it, or fails,
+//	                            is not tried again for the rest of that upload.
 package main
 
 import (

@@ -6,9 +6,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -16,15 +18,21 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
+import io.github.ayomide1x.objectstore.coordinator.FakeNodes.Held;
+import io.github.ayomide1x.objectstore.coordinator.FakeNodes.Mode;
+import io.github.ayomide1x.objectstore.coordinator.MetadataService.ChunkPlacement;
 import io.github.ayomide1x.objectstore.coordinator.MetadataService.CompletedChunk;
 import io.github.ayomide1x.objectstore.coordinator.MetadataService.UploadPlan;
+import io.github.ayomide1x.objectstore.v1.ChunkStat;
 import io.grpc.Status;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -32,6 +40,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -41,19 +51,29 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  * applied, because the guarantees under test (pointer swap, single-transaction
  * rollback, concurrent upserts, foreign keys) live in the database.
  *
- * <p>Two nodes are registered; placement always picks node1, so node2 is a
- * real node that is never a placement target.
+ * <p>Four in-process fake nodes answer the coordinator's StatChunks calls.
+ * {@link #holdOnPlacedNodes} makes every placed node report a chunk, as after
+ * a fully successful upload; the replication tests change that per node.
  */
 @Testcontainers
 @SpringBootTest(properties = {
         "spring.grpc.server.port=0",
-        "coordinator.nodes=node1|node1:9101|127.0.0.1:9101,node2|node2:9102|127.0.0.1:9102",
+        "coordinator.node-rpc-timeout=" + MetadataServiceCompleteUploadIT.NODE_TIMEOUT_MS + "ms",
 })
 class MetadataServiceCompleteUploadIT {
+
+    static final long NODE_TIMEOUT_MS = 500;
 
     @Container
     @ServiceConnection
     static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:18");
+
+    static final FakeNodes nodes = new FakeNodes(4);
+
+    @DynamicPropertySource
+    static void registerNodes(DynamicPropertyRegistry registry) {
+        registry.add("coordinator.nodes", nodes::nodesProperty);
+    }
 
     private static final long CHUNK = MetadataService.CHUNK_SIZE;
 
@@ -70,35 +90,53 @@ class MetadataServiceCompleteUploadIT {
     void clearObjects() {
         // nodes stays: NodeRegistry seeded it at context startup.
         jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
+        nodes.reset();
     }
 
     @AfterEach
     void dropFaultInjection() {
         jdbc.sql("DROP TRIGGER IF EXISTS fail_swap ON keys").update();
         jdbc.sql("DROP FUNCTION IF EXISTS fail_swap()").update();
+        nodes.reset();
     }
 
     @Test
-    void successfulCompleteWritesRowsAndPointsKeyAtObject() {
+    void successfulCompleteRecordsThreeReplicasPerChunkAndPointsKeyAtObject() {
         long size = 2 * CHUNK + 5;
         UploadPlan plan = metadata.initiateUpload("photos/cat.jpg", size);
 
-        assertThat(plan.chunks()).extracting(MetadataService.ChunkPlacement::sizeBytes)
-                .containsExactly(CHUNK, CHUNK, 5L);
+        assertThat(plan.chunks()).extracting(ChunkPlacement::sizeBytes).containsExactly(CHUNK, CHUNK, 5L);
         assertThat(statusOf(plan.objectId())).isEqualTo("PENDING");
 
         complete(plan, "photos/cat.jpg", size);
 
         assertThat(statusOf(plan.objectId())).isEqualTo("COMMITTED");
-        assertThat(jdbc.sql("SELECT chunk_index || ':' || size_bytes FROM chunks WHERE object_id = :id ORDER BY 1")
-                .param("id", plan.objectId()).query(String.class).list())
-                .containsExactly("0:" + CHUNK, "1:" + CHUNK, "2:5");
-        assertThat(count("""
-                SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id)
-                WHERE c.object_id = :id AND r.node_id = 'node1'
-                """, plan.objectId())).isEqualTo(3);
+        for (ChunkPlacement c : plan.chunks()) {
+            assertThat(replicasOf(c.chunkId())).as("chunk %d replicas", c.index())
+                    .containsExactlyInAnyOrderElementsOf(nodeIds(c));
+        }
         assertThat(pointer("photos/cat.jpg")).isEqualTo(plan.objectId());
         assertThat(resolvedChunkIds("photos/cat.jpg")).containsExactlyElementsOf(chunkIds(plan));
+    }
+
+    @Test
+    void placementRotatesThreeOfFourNodes() {
+        UploadPlan plan = metadata.initiateUpload("rotation", 8 * CHUNK);
+        List<String> all = List.of("node1", "node2", "node3", "node4");
+        Map<String, Integer> perNode = new java.util.HashMap<>();
+        String previousLeftOut = null;
+        for (ChunkPlacement c : plan.chunks()) {
+            List<String> ids = nodeIds(c);
+            assertThat(ids).as("chunk %d", c.index()).hasSize(3).doesNotHaveDuplicates();
+            String leftOut = all.stream().filter(n -> !ids.contains(n)).findFirst().orElseThrow();
+            if (previousLeftOut != null) {
+                // Consecutive chunks leave out consecutive nodes.
+                assertThat(leftOut).isEqualTo(all.get((all.indexOf(previousLeftOut) + 1) % 4));
+            }
+            previousLeftOut = leftOut;
+            ids.forEach(n -> perNode.merge(n, 1, Integer::sum));
+        }
+        assertThat(perNode).containsOnlyKeys(all).allSatisfy((n, count) -> assertThat(count).isEqualTo(6));
     }
 
     @Test
@@ -133,9 +171,9 @@ class MetadataServiceCompleteUploadIT {
     }
 
     /**
-     * Proves completeUpload is atomic. A test-only trigger makes the key swap,
-     * the last statement, fail after the replica inserts and status update have
-     * run. Mutation: remove @Transactional from completeUpload.
+     * Proves the commit phase is atomic. A test-only trigger makes the key
+     * swap, the last statement, fail after the replica inserts and status
+     * update have run. Mutation: run the commit phase outside its transaction.
      */
     @Test
     void failedOverwriteLeavesOldObjectIntact() {
@@ -158,9 +196,7 @@ class MetadataServiceCompleteUploadIT {
         assertThat(pointer("boom")).isEqualTo(v1.objectId());
         assertThat(resolvedChunkIds("boom")).containsExactlyElementsOf(chunkIds(v1));
         assertThat(statusOf(v2.objectId())).isEqualTo("PENDING");
-        assertThat(count("""
-                SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = :id
-                """, v2.objectId())).isZero();
+        assertThat(replicaCount(v2.objectId())).isZero();
     }
 
     /** Mutation: replace the upsert in swapKey with read-then-write (SELECT, then UPDATE or INSERT). */
@@ -177,7 +213,9 @@ class MetadataServiceCompleteUploadIT {
                 }
                 List<UploadPlan> plans = new ArrayList<>();
                 for (int i = 0; i < writers; i++) {
-                    plans.add(metadata.initiateUpload(key, 10));
+                    UploadPlan plan = metadata.initiateUpload(key, 10);
+                    holdOnPlacedNodes(plan);
+                    plans.add(plan);
                 }
 
                 CountDownLatch start = new CountDownLatch(1);
@@ -185,7 +223,7 @@ class MetadataServiceCompleteUploadIT {
                 for (UploadPlan plan : plans) {
                     futures.add(pool.submit(() -> {
                         start.await();
-                        complete(plan, key, 10);
+                        send(new Request(plan.objectId(), key, 10, completedChunks(plan)));
                         return null;
                     }));
                 }
@@ -210,6 +248,162 @@ class MetadataServiceCompleteUploadIT {
                         .containsExactlyElementsOf(chunkIds(winnerPlan));
             }
         }
+    }
+
+    /** One placed node's report for a chunk, relative to what the client sent. */
+    enum Report { MATCH, MISSING, OTHER_HASH, WRONG_SIZE, BAD_HEADER, UNREACHABLE }
+
+    static Stream<Arguments> replicaVerificationCases() {
+        return Stream.of(
+                Arguments.of("all three hold it", List.of(Report.MATCH, Report.MATCH, Report.MATCH), 3),
+                Arguments.of("one missing", List.of(Report.MATCH, Report.MISSING, Report.MATCH), 2),
+                Arguments.of("one with another hash", List.of(Report.OTHER_HASH, Report.MATCH, Report.MATCH), 2),
+                Arguments.of("one with the wrong size", List.of(Report.MATCH, Report.MATCH, Report.WRONG_SIZE), 2),
+                Arguments.of("one with a bad header", List.of(Report.MATCH, Report.BAD_HEADER, Report.MATCH), 2),
+                Arguments.of("one unreachable", List.of(Report.UNREACHABLE, Report.MATCH, Report.MATCH), 2),
+                Arguments.of("two missing", List.of(Report.MATCH, Report.MISSING, Report.MISSING), 0),
+                Arguments.of("only one matches", List.of(Report.OTHER_HASH, Report.MATCH, Report.BAD_HEADER), 0),
+                Arguments.of("client hash matches no node",
+                        List.of(Report.OTHER_HASH, Report.OTHER_HASH, Report.OTHER_HASH), 0));
+    }
+
+    /**
+     * A replica counts only if its node reports a valid header with the
+     * planned size and the client's SHA-256. Only counted replicas are
+     * recorded; fewer than 2 refuses the commit. 0 in wantRecorded means
+     * refused. Mutations: record every placed node; skip the hash comparison;
+     * quorum of 1.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("replicaVerificationCases")
+    void onlyVerifiedReplicasCount(String name, List<Report> reports, int wantRecorded) {
+        UploadPlan plan = metadata.initiateUpload("verify", 10);
+        ChunkPlacement chunk = plan.chunks().getFirst();
+        byte[] sha = fakeSha(chunk.chunkId());
+        List<String> placed = nodeIds(chunk);
+        List<String> wantNodes = new ArrayList<>();
+        for (int i = 0; i < placed.size(); i++) {
+            FakeNodes.FakeNode node = nodes.get(placed.get(i));
+            String id = chunk.chunkId().toString();
+            switch (reports.get(i)) {
+                case MATCH -> {
+                    node.held.put(id, new Held(ChunkStat.State.STATE_FOUND, 10, sha));
+                    wantNodes.add(node.nodeId);
+                }
+                case MISSING -> {
+                }
+                case OTHER_HASH -> node.held.put(id, new Held(ChunkStat.State.STATE_FOUND, 10, new byte[32]));
+                case WRONG_SIZE -> node.held.put(id, new Held(ChunkStat.State.STATE_FOUND, 11, sha));
+                case BAD_HEADER -> node.held.put(id, new Held(ChunkStat.State.STATE_BAD_HEADER, 0, null));
+                case UNREACHABLE -> node.mode = Mode.FAIL;
+            }
+        }
+        Request req = new Request(plan.objectId(), "verify", 10, completedChunks(plan));
+
+        if (wantRecorded == 0) {
+            assertThatThrownBy(() -> send(req))
+                    .isInstanceOfSatisfying(RequestException.class,
+                            e -> assertThat(e.code()).isEqualTo(Status.Code.FAILED_PRECONDITION))
+                    .hasMessageContaining("verified replicas, need 2");
+            assertThat(statusOf(plan.objectId())).isEqualTo("PENDING");
+            assertThat(replicaCount(plan.objectId())).isZero();
+            assertThat(metadata.getObject("verify")).isEmpty();
+            return;
+        }
+        send(req);
+        assertThat(replicasOf(chunk.chunkId())).containsExactlyInAnyOrderElementsOf(wantNodes).hasSize(wantRecorded);
+        assertThat(jdbc.sql("SELECT sha256 FROM chunks WHERE chunk_id = :id").param("id", chunk.chunkId())
+                .query((rs, i) -> rs.getBytes(1)).single()).as("recorded hash is the agreed value").isEqualTo(sha);
+    }
+
+    /** One short chunk is enough to refuse the whole object, and nothing is written. */
+    @Test
+    void commitRefusedWhenAnyChunkHasFewerThanTwoVerifiedReplicas() {
+        UploadPlan plan = metadata.initiateUpload("short", 3 * CHUNK);
+        holdOnPlacedNodes(plan);
+        ChunkPlacement middle = plan.chunks().get(1);
+        for (String nodeId : nodeIds(middle).subList(1, 3)) {
+            nodes.get(nodeId).held.remove(middle.chunkId().toString());
+        }
+
+        assertThatThrownBy(() -> send(new Request(plan.objectId(), "short", 3 * CHUNK, completedChunks(plan))))
+                .isInstanceOfSatisfying(RequestException.class,
+                        e -> assertThat(e.code()).isEqualTo(Status.Code.FAILED_PRECONDITION))
+                .hasMessageContaining("chunk " + middle.chunkId() + " (index 1) has 1 verified replicas, need 2");
+
+        assertThat(statusOf(plan.objectId())).isEqualTo("PENDING");
+        assertThat(replicaCount(plan.objectId())).isZero();
+        assertThat(jdbc.sql("SELECT count(*) FROM chunks WHERE object_id = :id AND sha256 IS NOT NULL")
+                .param("id", plan.objectId()).query(Long.class).single()).isZero();
+        assertThat(metadata.getObject("short")).isEmpty();
+    }
+
+    /**
+     * A hung node costs one deadline for the whole object, however many chunks
+     * it holds, because each node gets one batched call. Mutation: no deadline
+     * on the call (the @Timeout turns the hang into a failure).
+     */
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void hungNodeCostsOneDeadlineWhateverTheObjectSize() {
+        long size = 40 * CHUNK; // 40 chunks; the hung node is placed on 30 of them
+        UploadPlan plan = metadata.initiateUpload("hung", size);
+        holdOnPlacedNodes(plan);
+        nodes.get("node3").mode = Mode.HANG;
+
+        long start = System.nanoTime();
+        send(new Request(plan.objectId(), "hung", size, completedChunks(plan)));
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+        assertThat(elapsed).as("one %d ms deadline plus a margin", NODE_TIMEOUT_MS)
+                .isLessThan(Duration.ofMillis(NODE_TIMEOUT_MS + 1500));
+        assertThat(statusOf(plan.objectId())).isEqualTo("COMMITTED");
+        for (ChunkPlacement c : plan.chunks()) {
+            List<String> want = nodeIds(c).stream().filter(n -> !n.equals("node3")).toList();
+            assertThat(replicasOf(c.chunkId())).as("chunk %d", c.index()).containsExactlyInAnyOrderElementsOf(want);
+        }
+    }
+
+    /**
+     * A response that identifies as another node records nothing for the node
+     * that was called, even though it reports holding the chunk. Mutation:
+     * accept a response from the wrong node.
+     */
+    @Test
+    void responseFromTheWrongNodeRecordsNothingForIt() {
+        UploadPlan plan = metadata.initiateUpload("identity", 10);
+        holdOnPlacedNodes(plan);
+        ChunkPlacement chunk = plan.chunks().getFirst();
+        List<String> placed = nodeIds(chunk);
+        // The call meant for the third placed node is answered by a node claiming
+        // to be the first, as when a stale address reaches the wrong container.
+        String misdirected = placed.get(2);
+        nodes.get(misdirected).answerAs = placed.get(0);
+
+        send(new Request(plan.objectId(), "identity", 10, completedChunks(plan)));
+
+        assertThat(replicasOf(chunk.chunkId()))
+                .as("nothing recorded for %s", misdirected)
+                .containsExactlyInAnyOrderElementsOf(placed.subList(0, 2));
+    }
+
+    /**
+     * UNAVAILABLE once (a stale address or dead connection) is retried on a
+     * fresh channel within the same deadline, and the replica counts.
+     * Mutation: no retry on UNAVAILABLE.
+     */
+    @Test
+    void unavailableOnceIsRetriedAndTheReplicaCounts() {
+        UploadPlan plan = metadata.initiateUpload("retry", 10);
+        holdOnPlacedNodes(plan);
+        ChunkPlacement chunk = plan.chunks().getFirst();
+        FakeNodes.FakeNode flaky = nodes.get(nodeIds(chunk).get(1));
+        flaky.mode = Mode.FAIL_ONCE;
+
+        send(new Request(plan.objectId(), "retry", 10, completedChunks(plan)));
+
+        assertThat(flaky.calls.get()).as("calls to %s", flaky.nodeId).isEqualTo(2);
+        assertThat(replicasOf(chunk.chunkId())).containsExactlyInAnyOrderElementsOf(nodeIds(chunk));
     }
 
     /** What a test case does to a valid request before sending it. */
@@ -269,18 +463,6 @@ class MetadataServiceCompleteUploadIT {
                 Arguments.of("wrong chunk size", (Function<Fixture, Request>) f ->
                         f.withChunks(List.of(f.chunk(0), withSize(f.chunk(1), f.chunk(1).sizeBytes() - 1))),
                         Status.Code.INVALID_ARGUMENT, "has size 9, allocated 10"),
-                Arguments.of("no acknowledgements", (Function<Fixture, Request>) f ->
-                        f.withChunks(List.of(f.chunk(0), withAcks(f.chunk(1), List.of()))),
-                        Status.Code.INVALID_ARGUMENT, "no acknowledged replicas"),
-                Arguments.of("same node acknowledged twice", (Function<Fixture, Request>) f ->
-                        f.withChunks(List.of(f.chunk(0), withAcks(f.chunk(1), List.of("node1", "node1")))),
-                        Status.Code.INVALID_ARGUMENT, "lists a node twice"),
-                Arguments.of("ack from registered node outside placement", (Function<Fixture, Request>) f ->
-                        f.withChunks(List.of(f.chunk(0), withAcks(f.chunk(1), List.of("node1", "node2")))),
-                        Status.Code.INVALID_ARGUMENT, "node node2 was not a placement target"),
-                Arguments.of("ack from unknown node", (Function<Fixture, Request>) f ->
-                        f.withChunks(List.of(f.chunk(0), withAcks(f.chunk(1), List.of("node9")))),
-                        Status.Code.INVALID_ARGUMENT, "node node9 was not a placement target"),
                 Arguments.of("sha256 missing", (Function<Fixture, Request>) f ->
                         f.withChunks(List.of(f.chunk(0), withSha(f.chunk(1), new byte[0]))),
                         Status.Code.INVALID_ARGUMENT, "sha256 is 0 bytes, want 32"),
@@ -298,6 +480,8 @@ class MetadataServiceCompleteUploadIT {
             Status.Code want, String messagePart) {
         long size = CHUNK + 10; // two chunks
         Fixture f = new Fixture(metadata.initiateUpload("v", size), "v", size, metadata.initiateUpload("other", 10));
+        holdOnPlacedNodes(f.plan());
+        holdOnPlacedNodes(f.foreign());
         Request req = build.apply(f);
 
         if (want == Status.Code.OK) {
@@ -313,9 +497,7 @@ class MetadataServiceCompleteUploadIT {
 
         // A rejected complete writes nothing: still PENDING, no replicas, key unresolved.
         assertThat(statusOf(f.plan().objectId())).isEqualTo("PENDING");
-        assertThat(count("""
-                SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = :id
-                """, f.plan().objectId())).isZero();
+        assertThat(replicaCount(f.plan().objectId())).isZero();
         assertThat(metadata.getObject("v")).isEmpty();
     }
 
@@ -350,12 +532,12 @@ class MetadataServiceCompleteUploadIT {
         complete(plan, "again", CHUNK + 10);
 
         assertThat(pointer("again")).isEqualTo(newer.objectId());
-        assertThat(count("""
-                SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = :id
-                """, plan.objectId())).isEqualTo(2);
+        assertThat(replicaCount(plan.objectId())).isEqualTo(6);
     }
 
+    /** Completes plan as after a fully successful upload: every placed node holds every chunk. */
     private void complete(UploadPlan plan, String key, long size) {
+        holdOnPlacedNodes(plan);
         metadata.completeUpload(plan.objectId(), key, size, completedChunks(plan));
     }
 
@@ -363,16 +545,24 @@ class MetadataServiceCompleteUploadIT {
         metadata.completeUpload(r.objectId(), r.key(), r.sizeBytes(), r.chunks());
     }
 
+    /** Makes every placed node report every chunk of plan with its planned size and the client's hash. */
+    private static void holdOnPlacedNodes(UploadPlan plan) {
+        for (ChunkPlacement c : plan.chunks()) {
+            for (String nodeId : nodeIds(c)) {
+                nodes.get(nodeId).held.put(c.chunkId().toString(),
+                        new Held(ChunkStat.State.STATE_FOUND, c.sizeBytes(), fakeSha(c.chunkId())));
+            }
+        }
+    }
+
     /**
-     * The completion a well-behaved client sends: every chunk acknowledged by
-     * every placed node, with a SHA-256. The coordinator never sees bytes, so
-     * any 32 bytes stand in for the hash; this one is derived from the chunk
-     * ID so each chunk's differs.
+     * The completion a well-behaved client sends, with a SHA-256 per chunk.
+     * The coordinator never sees bytes, so any 32 bytes stand in for the hash;
+     * this one is derived from the chunk ID so each chunk's differs.
      */
     private static List<CompletedChunk> completedChunks(UploadPlan plan) {
         return plan.chunks().stream()
-                .map(c -> new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(),
-                        c.nodes().stream().map(Node::nodeId).toList(), fakeSha(c.chunkId())))
+                .map(c -> new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), fakeSha(c.chunkId())))
                 .toList();
     }
 
@@ -385,23 +575,23 @@ class MetadataServiceCompleteUploadIT {
     }
 
     private static CompletedChunk withIndex(CompletedChunk c, int index) {
-        return new CompletedChunk(c.chunkId(), index, c.sizeBytes(), c.ackedNodeIds(), c.sha256());
+        return new CompletedChunk(c.chunkId(), index, c.sizeBytes(), c.sha256());
     }
 
     private static CompletedChunk withSize(CompletedChunk c, long size) {
-        return new CompletedChunk(c.chunkId(), c.index(), size, c.ackedNodeIds(), c.sha256());
-    }
-
-    private static CompletedChunk withAcks(CompletedChunk c, List<String> acks) {
-        return new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), acks, c.sha256());
+        return new CompletedChunk(c.chunkId(), c.index(), size, c.sha256());
     }
 
     private static CompletedChunk withSha(CompletedChunk c, byte[] sha256) {
-        return new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), c.ackedNodeIds(), sha256);
+        return new CompletedChunk(c.chunkId(), c.index(), c.sizeBytes(), sha256);
+    }
+
+    private static List<String> nodeIds(ChunkPlacement c) {
+        return c.nodes().stream().map(Node::nodeId).toList();
     }
 
     private static List<UUID> chunkIds(UploadPlan plan) {
-        return plan.chunks().stream().map(MetadataService.ChunkPlacement::chunkId).toList();
+        return plan.chunks().stream().map(ChunkPlacement::chunkId).toList();
     }
 
     /** Chunk IDs the read path returns for key, in order. Checks they all belong to one object. */
@@ -412,6 +602,16 @@ class MetadataServiceCompleteUploadIT {
                 .param("ids", ids).query(UUID.class).list());
         assertThat(owners).as("owners of chunks resolved for %s", key).containsExactly(obj.objectId());
         return ids;
+    }
+
+    private List<String> replicasOf(UUID chunkId) {
+        return jdbc.sql("SELECT node_id FROM chunk_replicas WHERE chunk_id = :id ORDER BY node_id")
+                .param("id", chunkId).query(String.class).list();
+    }
+
+    private long replicaCount(UUID objectId) {
+        return count("SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = :id",
+                objectId);
     }
 
     private UUID pointer(String key) {

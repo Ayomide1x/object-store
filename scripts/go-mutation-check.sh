@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Mutation check for the node's Go tests.
+# Mutation check for the Go tests (node, client and shared packages).
 #
-# For each patch in scripts/mutations/node/: apply it, run the node tests,
+# For each patch in scripts/mutations/go/: apply it, run the Go tests,
 # report which tests failed, and revert. Each mutation names the test that must
 # catch it. A mutation that does not compile is reported as BUILD FAILED, never
 # as detected. Finally, run the unmutated tests.
 #
-# Usage: scripts/node-mutation-check.sh
+# Usage: scripts/go-mutation-check.sh
 # The mutation is always reverted, even on Ctrl-C.
 set -euo pipefail
 
@@ -25,6 +25,10 @@ expected_test() {
     n6-link-before-compare) echo "TestWriteChunkFraming" ;;
     n7-skip-chunk-id-check) echo "TestReadChunkCorruptSendsNothing" ;;
     n8-no-read-limit) echo "TestReadChunkConcurrencyLimit" ;;
+    n9-stat-skips-chunk-id-check) echo "TestStatChunks" ;;
+    c1-client-quorum-of-one) echo "TestWriteChunkQuorum" ;;
+    c2-no-write-deadline) echo "TestWriteChunkQuorum" ;;
+    c3-no-skip-after-failure) echo "TestFailedNodeSkippedForRestOfUpload" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }
@@ -38,14 +42,14 @@ revert() {
 }
 trap revert EXIT
 
-# Runs the node tests and prints "BUILD FAILED" or the names of failed tests,
+# Runs the Go tests and prints "BUILD FAILED" or the names of failed tests,
 # one per line (subtests as Parent/sub).
 run_tests() {
-  if ! go vet ./node/... >/dev/null 2>&1; then
+  if ! go vet ./... >/dev/null 2>&1; then
     echo "BUILD FAILED"
     return
   fi
-  go test -count=1 -json ./node/... 2>/dev/null | python3 -I -c '
+  go test -count=1 -json ./... 2>/dev/null | python3 -I -c '
 import json, sys
 for line in sys.stdin:
     try:
@@ -58,7 +62,7 @@ for line in sys.stdin:
 }
 
 status=0
-for patch in scripts/mutations/node/*.patch; do
+for patch in scripts/mutations/go/*.patch; do
   name="$(basename "$patch" .patch)"
   target="$(expected_test "$name")"
   git apply --check "$patch"

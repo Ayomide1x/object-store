@@ -11,8 +11,9 @@
 #   ITERATIONS  overwrites to perform (default 10)
 #   SIZE_MIB    size of A and B in MiB (default 100)
 #
-# Disk cost: every put writes SIZE_MIB of chunk files that nothing deletes until
-# stage 8 GC, so a run adds about (ITERATIONS + 1) x SIZE_MIB to node1's volume.
+# Disk cost: every put writes SIZE_MIB of chunk files three times (one per
+# replica) that nothing deletes until stage 8 GC, so a run adds about
+# 3 x (ITERATIONS + 1) x SIZE_MIB across the four node volumes.
 # Reset with: docker compose down -v && docker compose up --build -d --wait
 #
 # Needs the Compose stack up and bin/osctl built (make build).
@@ -22,6 +23,7 @@ iterations="${1:-10}"
 size_mib="${2:-100}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
+source "$root/scripts/lib/osctl.sh"
 key="overwrite-check"
 work="$(mktemp -d)"
 
@@ -39,7 +41,7 @@ head -c $((size_mib << 20)) /dev/urandom > "$work/A"
 head -c $((size_mib << 20)) /dev/urandom > "$work/B"
 sha_a="$(sha "$work/A")"
 sha_b="$(sha "$work/B")"
-"$osctl" put "$work/A" "$key" 2>/dev/null
+osctl_run put "$work/A" "$key"
 
 # Each reader appends one line per download to its log: A, B, MIX or ERROR.
 reader() {
@@ -80,13 +82,20 @@ echo
 echo "downloads: A=$a  B=$b  MIX=$mix  ERROR=$errors   (writer errors: $writer_errors)"
 if ((errors > 0)); then
   echo "reader errors (first 5):"
-  cat "$work"/reader-*.err | head -5
+  grep -hv ' level=INFO ' "$work"/reader-*.err | head -5
+fi
+if ((writer_errors > 0)); then
+  echo "writer errors (first 5):"
+  grep -v ' level=INFO ' "$work/writer.err" | head -5
 fi
 
 echo
-echo "node1 chunk volume usage:"
-node="$(docker compose -f "$root/docker-compose.yml" ps -q node1)"
-docker run --rm --volumes-from "$node" alpine:3 du -sh /data/chunks
+echo "chunk volume usage per node:"
+for n in node1 node2 node3 node4; do
+  node="$(docker compose -f "$root/docker-compose.yml" ps -q "$n")"
+  printf '  %s  ' "$n"
+  docker run --rm --volumes-from "$node" alpine:3 du -sh /data/chunks
+done
 
 if ((mix == 0 && errors == 0 && writer_errors == 0 && a > 0 && b > 0)); then
   echo "PASS: no mixed downloads; reads overlapped overwrites (both versions seen)"

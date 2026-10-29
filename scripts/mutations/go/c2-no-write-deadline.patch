@@ -1,0 +1,11 @@
+--- a/client/internal/upload/upload.go
++++ b/client/internal/upload/upload.go
+@@ -75,7 +75,7 @@
+ 		}
+ 		launched++
+ 		go func() {
+-			wctx, cancel := context.WithTimeout(ctx, u.timeout)
++			wctx, cancel := context.WithCancel(ctx)
+ 			defer cancel()
+ 			sum, err := chunkwrite.Write(wctx, t.Address,
+ 				chunkwrite.Header{ChunkID: c.ID, ObjectID: u.objectID, Size: c.Size},

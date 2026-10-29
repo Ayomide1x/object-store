@@ -11,8 +11,12 @@
 # failure, and checks the first object reads back identical. That leaves every
 # chunk on the volume valid for the next script.
 #
+# Since stage 4 each chunk has several replicas. The byte is flipped on the
+# replica get reads first (the lowest node_id, as GetObject orders them): read
+# failover is stage 5, so until then that replica decides the outcome.
+#
 # The node image is distroless (no shell), so the byte is flipped from a
-# throwaway alpine container that mounts node1's volume with --volumes-from.
+# throwaway alpine container that mounts that node's volume with --volumes-from.
 #
 # Usage: scripts/stage3-corrupt-check.sh
 # Needs the Compose stack up and bin/osctl built (make build).
@@ -20,12 +24,13 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 osctl="$root/bin/osctl"
+source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
 work="$(mktemp -d)"
-node="$("${compose[@]}" ps -q node1)"
+node=""    # container of the node holding the replica get reads first
 flipped="" # chunk ID whose byte is currently flipped
 
-# Inverts one byte of a chunk file on node1's volume.
+# Inverts one byte of a chunk file on $node's volume.
 flip() {
   docker run --rm --volumes-from "$node" alpine:3 sh -c '
     f=/data/chunks/$1; off=$2
@@ -48,13 +53,16 @@ key1="corrupt-check/one-$$"
 key2="corrupt-check/two-$$"
 head -c $((10 << 20)) /dev/urandom > "$work/one"
 head -c $((10 << 20)) /dev/urandom > "$work/two"
-"$osctl" put "$work/one" "$key1" 2>/dev/null
-"$osctl" put "$work/two" "$key2" 2>/dev/null
+osctl_run put "$work/one" "$key1"
+osctl_run put "$work/two" "$key2"
 
 chunk="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tAc \
   "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = '$key1' AND c.chunk_index = 1")"
+reader="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tAc \
+  "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$chunk' ORDER BY node_id LIMIT 1")"
+node="$("${compose[@]}" ps -q "$reader")"
 offset=$((56 + 1000000)) # past the 56-byte header, inside the data
-echo "flipping byte $offset of chunk $chunk (index 1 of $key1)"
+echo "flipping byte $offset of chunk $chunk (index 1 of $key1) on $reader, the replica get reads first"
 flip "$chunk" "$offset"
 flipped="$chunk"
 
@@ -80,16 +88,16 @@ else
   echo "  ok: no output file"
 fi
 
-if "${compose[@]}" logs node1 | grep "failed verification" | grep -q "$chunk"; then
-  echo "  ok: node logged a verification failure for chunk $chunk"
+if "${compose[@]}" logs "$reader" | grep "failed verification" | grep -q "$chunk"; then
+  echo "  ok: $reader logged a verification failure for chunk $chunk"
 else
-  echo "  FAIL: no node log line for chunk $chunk"
+  echo "  FAIL: no $reader log line for chunk $chunk"
   status=1
 fi
 
 echo
 echo "get $key2 (untouched):"
-if "$osctl" get "$key2" "$work/two.out" 2>/dev/null && cmp -s "$work/two" "$work/two.out"; then
+if osctl_run get "$key2" "$work/two.out" && cmp -s "$work/two" "$work/two.out"; then
   echo "  ok: IDENTICAL"
 else
   echo "  FAIL: untouched object did not round-trip"
@@ -100,7 +108,7 @@ echo
 echo "restoring the flipped byte:"
 flip "$chunk" "$offset" | sed 's/^/  /'
 flipped=""
-if "$osctl" get "$key1" "$work/one.out" 2>/dev/null && cmp -s "$work/one" "$work/one.out"; then
+if osctl_run get "$key1" "$work/one.out" && cmp -s "$work/one" "$work/one.out"; then
   echo "  ok: $key1 reads back IDENTICAL after restore"
 else
   echo "  FAIL: $key1 did not read back after restore"

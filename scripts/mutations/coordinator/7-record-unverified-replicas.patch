@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -231,7 +231,7 @@
+                         "chunk %s (index %d) has %d verified replicas, need %d: %s".formatted(chunk.chunkId(),
+                                 chunk.index(), ok.size(), MIN_REPLICAS, String.join("; ", rejected)));
+             }
+-            verified.put(chunk.chunkId(), ok);
++            verified.put(chunk.chunkId(), p.placedNodeIds());
+         }
+         return verified;
+     }

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -161,6 +162,42 @@ func receiveData(stream objectstorev1.StorageNodeService_WriteChunkServer, w io.
 		return nil, status.Errorf(codes.InvalidArgument, "trailer sha256 is %d bytes, want 32", len(trailer.GetSha256()))
 	}
 	return trailer.GetSha256(), nil
+}
+
+// maxStatBatch caps one StatChunks request. A 5 GiB object has 1,280 chunks;
+// the cap leaves headroom while bounding the work a single call can demand.
+const maxStatBatch = 4096
+
+// StatChunks reports, for each requested chunk, whether this node holds a
+// durable verified copy. It reads headers only. A missing or bad chunk is an
+// entry in the response, not an error: the caller needs the whole picture.
+func (s *Server) StatChunks(ctx context.Context, req *objectstorev1.StatChunksRequest) (*objectstorev1.StatChunksResponse, error) {
+	if len(req.GetChunkIds()) > maxStatBatch {
+		return nil, status.Errorf(codes.InvalidArgument, "%d chunk ids exceeds the batch limit of %d", len(req.GetChunkIds()), maxStatBatch)
+	}
+	resp := &objectstorev1.StatChunksResponse{NodeId: s.nodeID}
+	for _, id := range req.GetChunkIds() {
+		stat := &objectstorev1.ChunkStat{ChunkId: id}
+		size, sum, err := s.store.Stat(ctx, id)
+		switch {
+		case err == nil:
+			stat.State = objectstorev1.ChunkStat_STATE_FOUND
+			stat.SizeBytes = size
+			stat.Sha256 = sum
+		case errors.Is(err, chunkstore.ErrNotFound):
+			stat.State = objectstorev1.ChunkStat_STATE_MISSING
+		case errors.Is(err, chunkstore.ErrCorrupt):
+			s.log.Error("stat found a bad chunk header", "node_id", s.nodeID, "chunk_id", id, "error", err)
+			stat.State = objectstorev1.ChunkStat_STATE_BAD_HEADER
+		case errors.Is(err, chunkstore.ErrInvalidID):
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		default:
+			s.log.Error("stat chunk", "node_id", s.nodeID, "chunk_id", id, "error", err)
+			return nil, status.Errorf(codes.Internal, "stat chunk %s: %v", id, err)
+		}
+		resp.Stats = append(resp.Stats, stat)
+	}
+	return resp, nil
 }
 
 // ReadChunk verifies the whole chunk before sending its first frame, then

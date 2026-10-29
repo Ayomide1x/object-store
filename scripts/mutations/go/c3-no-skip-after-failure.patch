@@ -1,0 +1,10 @@
+--- a/client/internal/upload/upload.go
++++ b/client/internal/upload/upload.go
+@@ -95,7 +95,6 @@
+ 				r.err = fmt.Errorf("no answer within %s: %w", u.timeout, r.err)
+ 			}
+ 			log.Warn("replica write failed; node skipped for the rest of this upload", "error", r.err)
+-			u.skipped[r.nodeID] = r.err
+ 			failures = append(failures, fmt.Sprintf("%s: %v", r.nodeID, r.err))
+ 		case sum != nil && !bytes.Equal(sum, r.sum):
+ 			// Every replica reads the same byte range; different hashes mean

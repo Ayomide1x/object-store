@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
+@@ -124,7 +124,7 @@
+     }
+ 
+     private StorageNodeServiceGrpc.StorageNodeServiceBlockingStub stub(Node node, Deadline deadline) {
+-        return StorageNodeServiceGrpc.newBlockingStub(channel(node)).withDeadline(deadline);
++        return StorageNodeServiceGrpc.newBlockingStub(channel(node));
+     }
+ 
+     private ManagedChannel channel(Node node) {

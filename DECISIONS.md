@@ -326,3 +326,153 @@ N2 is written as a *faithful* rename refactor. A bare `os.Rename` swap made ever
 **Over:** a debug shell in the node image; polling `/data/tmp` from the host with one `docker run` per poll (~300 ms per poll, longer than a whole 100 MiB upload).
 **Because:** the production image stays minimal, and each script leaves the volume valid for the next. An earlier version of the corruption check didn't restore its byte, and the crash check correctly flagged that chunk as BAD.
 **Breaks if:** the Docker socket isn't at `/var/run/docker.sock` inside the Docker VM, or the upload outruns the watcher on a much faster machine. The PENDING check then fails the run, never passes it.
+
+## Client fan-out writes; per-replica writer in a shared package (stage 4)
+**Amends:** "Chunks upload sequentially in stage 2" (stage 2). Chunks are still written one after another; within a chunk, the three replicas are now written in parallel.
+**Chose:** the client streams each chunk to its three placed nodes at the same time, each over its own independent stream. Each node verifies its own trailer SHA-256 (stage 3). The per-replica writer (header → frames → trailer → ack check) is `internal/chunkwrite` at the module root, so the node can reuse it for node-to-node copies in stage 7. The fan-out and quorum logic is `client/internal/upload`.
+**Over:** primary-forwards (client → primary → secondaries, as a star or a chain).
+**Because:**
+- **Failures:** one failing replica affects only its own stream. With forwarding, a failed secondary must be reported back through the primary, and a failed primary fails all three even when two nodes are healthy.
+- **Verification:** every replica checks the same trailer on its own, and no node ever passes on bytes it handled.
+- **Bandwidth:** the cost is 3× client upload bandwidth, but nodes send nothing to each other on writes. GFS and HDFS chain writes to save client bandwidth, at the price of more complicated failure handling.
+
+**Breaks if:** clients sit behind slow uplinks, where 3× upload matters more than simple failure handling.
+
+## The coordinator verifies replicas by asking the placed nodes at CompleteUpload; the client's ack list is ignored (stage 4)
+**Supersedes:** the "still trusted from the client" part of "Coordinator-computed chunk boundaries; CompleteUpload validates against the issued plan" (stage 2), and "Checksums recorded at CompleteUpload from the client's report" (stage 3). Acks are no longer the client's word.
+**Chose:** `CompleteUpload` asks every placed node, in a `StatChunks` call, which of the object's chunks it durably holds. A replica counts only if its node reports a valid header with the planned size and the same SHA-256 as the client's `CompletedChunk.sha256`. The recorded hash is that agreed value. A node reporting a different hash or size is not counted, and is logged at error. If the client's hash matches no node, the commit is refused. `CompletedChunk.acked_node_ids` is `[deprecated = true]` and ignored. Asking every placed node, rather than the ones the client lists, also means a client bug can't lose a real replica.
+
+`CompleteUpload` has three phases:
+1. validate against the plan (reads only);
+2. call `StatChunks` outside any transaction, so no row lock is held across the network;
+3. in one transaction: lock, re-check PENDING, record exactly the verified replicas and the hash, mark COMMITTED, swap the key.
+
+**Over:**
+- **(a) Nodes report each write to the coordinator directly.** That puts the coordinator on every chunk's write path, and the node must report before acknowledging, or the complete can arrive first and be refused. Lost reports would also need handling.
+- **(b) Signed ack tokens (an HMAC with per-node secrets, relayed by the client).** No extra RPCs, but secrets have to be distributed and rotated for a threat model (buggy clients, not malicious ones) that doesn't need forgery-proof acks. It's also close to authentication, which is out of scope.
+
+**Because:** the coordinator gathers the facts itself, at the moment it commits. There's no race and no lost report, and it uses the coordinator→node path that stages 7 and 8 need anyway. A node that's dead or hung at commit time isn't counted. That's an under-count, which invariant 3 allows.
+**Breaks if:** clients are malicious (anyone can call a node's RPCs; there's no authentication), or commit latency matters more than the one node round trip.
+
+## StatChunks is one batched call per node, reading headers only (stage 4)
+**Chose:** `StatChunks(chunk_ids)` takes every chunk of the object placed on that node and returns an entry per chunk: `FOUND` (size and hash from the header), `MISSING`, or `BAD_HEADER` (bad magic, a header naming another chunk, or an impossible size). Batches are capped at 4,096 IDs; a 5 GiB object has 1,280 chunks. The node checks the magic and the chunk ID but does not re-hash the data. Since stage 3 a file exists under a final name only after its hash was verified and it was fsynced, so a valid header *is* a durable verified write. Later corruption is caught at read time.
+**Over:**
+- **Per-chunk `StatChunk` calls, capped at 16 in flight.** A hung node holding about 960 chunks of a 5 GiB object would cost about 60 rounds of the 2 s deadline, around 120 s. Batched, it costs one deadline whatever the object's size. `hungNodeCostsOneDeadlineWhateverTheObjectSize` checks this with 40 chunks: it returns within the 500 ms test deadline plus a margin.
+- **Re-hashing at commit.** That's 300 MiB of reads to commit a 100 MiB object, to recheck something the write path already proved.
+
+**Breaks if:** one object's chunks on a single node exceed the batch cap. That needs objects far beyond the 5 GiB limit.
+
+## Commit quorum: at least 2 verified replicas per chunk, else FAILED_PRECONDITION (stage 4)
+**Chose:** `MIN_REPLICAS = 2`, enforced by the coordinator. Any chunk with fewer verified replicas refuses the whole commit with `FAILED_PRECONDITION`, naming the chunk and each node's reason ("missing", "bad header", "sha256 differs from the client's", "no answer"). Nothing is written, and the object stays PENDING. The client applies the same rule per chunk, and gives up on the upload as soon as a chunk gets fewer than 2 acks.
+**Over:** `UNAVAILABLE` (it suggests retrying the same call, which won't help unless the nodes recover and the client rewrites the bytes); committing with fewer replicas and leaving stage 7 to repair them (that breaks invariant 2).
+**Because:** invariant 2 (commit implies durability on ≥ 2 replicas) is now enforced by the side that records it.
+**Breaks if:** a deployment wants per-object durability levels. Out of scope.
+
+## No retry and no re-placement within an upload; orphaned bytes are left for stages 7 and 8 (stage 4)
+**Chose:** a replica that fails isn't retried, and its chunk isn't moved to the fourth node.
+- If 0 or 1 replicas fail, the upload continues.
+- If 2 or 3 fail, the client gives up on the upload straight away: no further chunks, no `CompleteUpload`. The object stays PENDING and the key keeps its previous version.
+
+Bytes that never reach metadata stay on the nodes:
+- **Chunks of abandoned uploads.** They belong to PENDING objects, and `chunk_placements` says which nodes hold them. Stage 8 GC removes them.
+- **A replica that finished after the client gave up on it, or whose node was down at commit.** The file is valid, but there's no replica row for it: an under-count that invariant 3 allows. Stage 7 re-replicates the chunk, and stage 8 must treat "file present, no replica row" as an orphan.
+
+**Over:** retrying the same replica (how many times, how far apart?); re-placing onto the fourth node (it changes placement in the middle of an upload, which "All chunks allocated up front" from stage 2 rules out).
+**Because:** stage 6's liveness-aware placement makes most of this unnecessary, and stage 7 repairs what's left.
+**Breaks if:** short failures are common enough that whole uploads failing hurts more than retry logic would cost.
+
+## Per-replica write deadline; a failed node is skipped for the rest of that upload (stage 4)
+**Chose:** each replica write has a deadline covering connect, frames, trailer and ack: `OSCTL_CHUNK_WRITE_TIMEOUT`, default 10 s. A chunk waits for all three replicas or their deadlines. A node that fails or misses the deadline isn't tried again for the rest of that upload: later chunks count it as failed from the start. This state belongs to one upload in one client process; it isn't cluster liveness. A stopped container refuses the connection in milliseconds. A paused one accepts the TCP connection (the kernel's listen backlog still answers) and then never replies, so only the deadline catches it.
+**Over:**
+- **Cancelling the third replica as soon as two acknowledge.** Healthy but slightly slower nodes would routinely lose their replica, so "all 4 up gives 3 replicas" would fail.
+- **A short grace period after the second ack.** That still costs the grace period on every chunk.
+- **Waiting out the full deadline on every chunk.** A hung node would cost about 250 s for a 100 MiB upload.
+
+**Because:** a hung node costs one deadline per upload. Measured with `docker compose pause node3`: a 10 MiB put took 12.2 s, which is the 10 s client deadline plus the coordinator's 2 s `StatChunks` deadline. `TestFailedNodeSkippedForRestOfUpload` checks that 5 chunks cost about one deadline.
+**Breaks if:** a node recovers mid-upload. It won't be used again until the next upload, so that upload's later chunks get 2 replicas, not 3. Stage 7 restores them.
+
+## Coordinator node calls: one deadline per CompleteUpload, outside the transaction, through cached channels (stage 4)
+**Chose:** `NodeClient` sends one `StatChunks` call per node, all in parallel on virtual threads. They share one deadline: `COORDINATOR_NODE_RPC_TIMEOUT`, default 2 s. A node that fails, misses the deadline, or answers as another node is treated as no answer. Channels are plain grpc-java `ManagedChannel`s cached by `internal_addr`. They're only connections, rebuilt as needed, so invariant 7 holds.
+**Over:** Spring gRPC's named client channels, which are configured statically, while node addresses come from Postgres.
+**Because:** commit latency is bounded by one deadline, and no database row lock is held while waiting on the network.
+**Breaks if:** many objects commit at once against a hung node. Each commit spends a deadline on it until stage 6 stops placing chunks there.
+
+## Node responses must identify the responding node (stage 4)
+**Chose:** a general rule: **any node response the coordinator records facts from carries the responding node's ID, and the coordinator rejects a response whose ID doesn't match the node it meant to call.** It logs an error and treats the response as no answer. `StatChunksResponse.node_id = 2` follows this rule now; stage 7's copy responses will too. CLAUDE.md invariant 3 now ends: "Facts about a node are recorded only from a response that identifies as that node." This is tested by `responseFromTheWrongNodeRecordsNothingForIt`, a fake node answering under another node's ID, and by mutation M10 ("accept a response from the wrong node").
+**Over:** trusting that an address reaches the node it's registered for.
+**Because:** addresses go stale. Stage 4 verification showed that stopping three nodes and starting them again can swap their container IPs; node2 and node3 traded .4 and .6. Here each node listens on a different port, so a stale address fails to connect. With the same port on every node, which is common, a stale address would reach a working node, and its chunks would be recorded as the wrong node's replicas: metadata overstating (invariant 3).
+**Breaks if:** a node is misconfigured with another node's `NODE_ID`. That isn't detected, because there's no authentication.
+
+## Coordinator DNS cache of about 1 s, plus channel reset and one retry on UNAVAILABLE (stage 4)
+**Chose:**
+- The coordinator sets the JVM's DNS cache times (`networkaddress.cache.ttl` and `networkaddress.cache.negative.ttl`, and the system property grpc-java's resolver reads) from `COORDINATOR_DNS_CACHE_TTL_SECONDS`, default 1. The defaults are 30 s for successful lookups and 10 s for failed ones.
+- On `UNAVAILABLE` from `StatChunks`, the cached channel is shut down and replaced, so the address is looked up again, and the call is retried **once** within the same deadline. `StatChunks` only reads, so retrying is safe.
+
+This is tested by `unavailableOnceIsRetriedAndTheReplicaCounts` (a fake node fails once, then answers, and the replica counts) and by mutation M11 ("no retry on UNAVAILABLE"). The smoke test is step 6 of `stage4-replication-check.sh`. Before the fix, two puts right after a three-node restart were refused ("node2: no answer; node3: no answer"). After it, in 6 stop/start rounds, 4 changed IPs, all 6 puts succeeded, and 8 resets and retries were logged.
+**Over:**
+- **B: fixed IPs for the nodes in Compose.** It removes the trigger here but leaves the coordinator just as fragile to address changes in any other deployment, and hard-coded addresses are extra configuration to keep in step.
+- **C: a new channel for every commit.** Not enough on its own: the JVM's DNS cache would still hand the new channel the old address for up to 30 s. It would also pay a connection setup per node on every commit.
+- **D: doing nothing.** Commits are refused for up to about 30 s after nodes restart with new IPs: safe, but spurious failures.
+
+**Because:** this fixes the cause (stale resolution) where it lives, costs one quick retry only when something has failed, and never stretches past the commit's deadline.
+**Breaks if:** DNS itself is slow or down. A 1 s cache means a lookup about every second for each node in use.
+
+## Placement: rotation of 3 of the 4 nodes from a random start per object; stopped nodes are still placed until stage 6 (stage 4)
+**Amends:** "Placement recorded at initiate in chunk_placements" (stage 2). There are now three rows per chunk.
+**Chose:** nodes are sorted by `node_id`, and each object gets a random start `s`. Chunk `i` goes to nodes `s+i`, `s+i+1` and `s+i+2` (mod n). Each chunk leaves out one node, and consecutive chunks leave out consecutive nodes, so each node holds about ¾ of an object's chunks (`placementRotatesThreeOfFourNodes`). There's no liveness until stage 6, so a stopped node is placed like any other. With one node down, about ¾ of chunks include it and get 2 replicas. With two down, any 3 consecutive chunks include one that's placed on both, so an object of 3 or more chunks always fails.
+**Over:** a random 3 of 4 per chunk (balanced only on average); rendezvous hashing on `chunk_id` (stable when nodes join or leave, but rebalancing is out of scope, and harder to reason about in acceptance checks).
+**Because:** it's even, simple to explain, and its outcome with dead nodes can be predicted from `chunk_placements`, which the acceptance script does.
+**Breaks if:** nodes are added or removed. Placement shifts for new objects, existing ones aren't moved, and that's out of scope.
+
+## Stage 4 acceptance criteria corrected (stage 4)
+**Chose:** CLAUDE.md's stage 4 *Accept* block is replaced:
+- all 4 up gives 3 replicas, equal to placement, each verified on its own volume;
+- with one stopped, replicas are placed minus stopped;
+- with one paused, the upload finishes within deadline plus normal time;
+- with three stopped, there's a clean failure;
+- with two stopped, the per-chunk rule applies.
+
+The original "with two stopped, uploads fail cleanly" was written for three nodes. With four nodes and two stopped, a chunk placed on both live nodes and one dead one still gets 2 acks and succeeds. `stage4-replication-check.sh` checks each criterion and works out the expected two-stopped outcome from `chunk_placements`.
+**Over:** keeping the original wording, which isn't true for 4 nodes and isn't deterministic.
+**Because:** acceptance criteria must be true and deterministic.
+**Breaks if:** placement changes from rotation, because then "a 3-chunk object must fail with 2 stopped" no longer follows. The script's per-chunk prediction stays valid.
+
+## Node readiness through a `health` subcommand and the gRPC health service (stage 4)
+**Amends:** "Coordinator readiness: in-container /dev/tcp healthcheck; `up --wait` is the only wait" (stage 2). Nodes now have healthchecks too.
+**Chose:** the node serves `grpc.health.v1`, set to `SERVING` only after temp cleanup has run and the listener is open. `/node health` calls `Health/Check` on its own `NODE_LISTEN_ADDR` with a 1 s deadline and exits 0 or 1. Compose runs it: `test: ["CMD", "/node", "health"]`, `start_period: 30s`, `start_interval: 1s`. `docker compose up --wait` now waits for all six services. The stage 3 crash check's "probe put" readiness trick is gone.
+**Over:** a TCP-only probe (it would need a TCP-dialing mode in the binary anyway, and gRPC health is the protocol-level answer); a shell in the image (against the minimal-image choice).
+**Because:** the distroless image has no shell, so the binary probes itself, and the health service is part of grpc-go, so there's no new dependency.
+**Breaks if:** the node needs a richer "ready" state than "listening" (for example while loading state at startup). Then it would stay `NOT_SERVING` for longer.
+
+## Mutation scripts extended; the Go script renamed (stage 4)
+**Extends:** "Node mutation script; coordinator script extended with M5" (stage 3).
+**Chose:** `scripts/node-mutation-check.sh` is renamed with `git mv` to `scripts/go-mutation-check.sh`, with patches moved to `scripts/mutations/go/`. It runs `go test ./...`, which covers the node, the client and `internal/`. New mutations:
+
+| Mutation | Must be caught by |
+|---|---|
+| C1 client quorum of 1 | `TestWriteChunkQuorum` (the two-failing cases) |
+| C2 no per-replica write deadline | `TestWriteChunkQuorum` (the hanging cases, failed by the test's own timer) |
+| C3 a failed node isn't skipped | `TestFailedNodeSkippedForRestOfUpload` |
+| N9 `StatChunks` skips the chunk-ID check | `TestStatChunks` |
+| M6 coordinator quorum of 1 | `commitRefusedWhenAnyChunkHasFewerThanTwoVerifiedReplicas` |
+| M7 record unverified replicas (every placed node) | `onlyVerifiedReplicasCount` "one missing" |
+| M8 no node RPC deadline | `hungNodeCostsOneDeadlineWhateverTheObjectSize` (`@Timeout`) |
+| M9 skip the hash comparison | `onlyVerifiedReplicasCount` "one with another hash" |
+| M10 accept a response from the wrong node | `responseFromTheWrongNodeRecordsNothingForIt` |
+| M11 no retry on UNAVAILABLE | `unavailableOnceIsRetriedAndTheReplicaCounts` |
+
+M2 (no transaction) is regenerated: the commit phase now runs through a `TransactionTemplate`, and the mutation calls it directly. M5 is regenerated against the restructured service.
+**Because:** every new guarantee is shown to be load-bearing.
+**Breaks if:** code edits stop patches from applying. The scripts then fail at `git apply --check`, never silently.
+
+## Stage 3 acceptance scripts adapted to replication; scripts never hide osctl errors (stage 4)
+**Amends:** "Stage 3 acceptance scripts reach the distroless node's volume through side containers" (stage 3).
+**Chose:**
+- **corrupt-check:** flips the byte on the replica `get` reads first, the lowest `node_id`, since there's no failover until stage 5.
+- **crash-check:** killing node1 mid-upload no longer fails the upload. It now must commit, with node1 recorded for no chunk from the interrupted one onwards, every chunk on ≥ 2 replicas, and `get` identical. The kill-too-late guard is the temp file in step c: an upload that finished before the kill leaves none. Readiness comes from node1's healthcheck.
+- **fsync-trace:** expects as many links on node1 as `chunk_placements` lists for it.
+- **Every script:** osctl calls go through `scripts/lib/osctl.sh`'s `osctl_run`, which prints the command and osctl's error and warning lines on failure. No script sends osctl's errors to `/dev/null` any more.
+- **overwrite-check:** reports disk usage on all four node volumes.
+
+**Because:** an adapted corruption check died silently. Its first put had been refused because of the stale-DNS problem above, and the error went to `/dev/null`.
+**Breaks if:** new scripts call osctl directly.

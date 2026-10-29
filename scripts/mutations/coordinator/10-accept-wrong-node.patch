@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
+@@ -77,7 +77,7 @@
+                 Node node = call.getKey();
+                 try {
+                     StatChunksResponse resp = call.getValue().get();
+-                    if (!node.nodeId().equals(resp.getNodeId())) {
++                    if (false && !node.nodeId().equals(resp.getNodeId())) {
+                         log.atError()
+                                 .addKeyValue("object_id", objectId)
+                                 .addKeyValue("node_id", node.nodeId())

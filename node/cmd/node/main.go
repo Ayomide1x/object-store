@@ -1,5 +1,9 @@
 // Command node runs a storage node: it stores chunk files on local disk and
 // serves StorageNodeService over gRPC.
+//
+//	node          run the node
+//	node health   exit 0 if the node on NODE_LISTEN_ADDR reports SERVING, else 1
+//	              (the image is distroless, so this is the Compose healthcheck)
 package main
 
 import (
@@ -10,9 +14,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 	"github.com/Ayomide1x/object-store/node/internal/chunkstore"
@@ -28,6 +37,14 @@ type config struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "health" {
+		if err := checkHealth(); err != nil {
+			fmt.Fprintln(os.Stderr, "unhealthy:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -68,6 +85,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	srv := grpc.NewServer()
 	objectstorev1.RegisterStorageNodeServiceServer(srv, server.New(cfg.nodeID, store, log, cfg.maxReads))
+	// SERVING only now: temp cleanup is done and the listener is open.
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(srv, healthSrv)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -83,6 +104,34 @@ func run(ctx context.Context, log *slog.Logger) error {
 		srv.GracefulStop()
 		return nil
 	}
+}
+
+// checkHealth asks the local node's gRPC health service for its status.
+func checkHealth() error {
+	addr := os.Getenv("NODE_LISTEN_ADDR")
+	if addr == "" {
+		return fmt.Errorf("NODE_LISTEN_ADDR is required")
+	}
+	// ":9101" listens on all interfaces; probe it on loopback.
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		return fmt.Errorf("health check %s: %w", addr, err)
+	}
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		return fmt.Errorf("status %s", resp.GetStatus())
+	}
+	return nil
 }
 
 func loadConfig() (config, error) {

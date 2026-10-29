@@ -412,3 +412,62 @@ func flip(t *testing.T, path string, offset int64) {
 		t.Fatal(err)
 	}
 }
+
+// TestStatChunks covers each entry state in one batch, including a misplaced
+// file: an intact chunk under another chunk's name must not count as a copy.
+func TestStatChunks(t *testing.T) {
+	const (
+		missingID   = "11111111-2222-4333-8444-555555555555"
+		corruptID   = "22222222-3333-4444-8555-666666666666"
+		misplacedID = "33333333-4444-4555-8666-777777777777"
+	)
+	n := startServer(t, 4)
+	good := []byte("stat me")
+	writeValid(t, n, testChunkID, good)
+	writeValid(t, n, corruptID, []byte("about to lose my magic"))
+	flip(t, n.finalPath(corruptID), 0)
+	writeValid(t, n, otherChunkID, []byte("I belong to otherChunkID"))
+	b, err := os.ReadFile(n.finalPath(otherChunkID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(n.finalPath(misplacedID), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := []string{testChunkID, missingID, corruptID, misplacedID}
+	resp, err := n.client.StatChunks(t.Context(), &objectstorev1.StatChunksRequest{ChunkIds: ids})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetNodeId() != "test-node" {
+		t.Errorf("response node_id = %q, want the node's own ID %q", resp.GetNodeId(), "test-node")
+	}
+	want := []struct {
+		id    string
+		state objectstorev1.ChunkStat_State
+	}{
+		{testChunkID, objectstorev1.ChunkStat_STATE_FOUND},
+		{missingID, objectstorev1.ChunkStat_STATE_MISSING},
+		{corruptID, objectstorev1.ChunkStat_STATE_BAD_HEADER},
+		{misplacedID, objectstorev1.ChunkStat_STATE_BAD_HEADER},
+	}
+	if len(resp.GetStats()) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(resp.GetStats()), len(want))
+	}
+	for i, w := range want {
+		got := resp.GetStats()[i]
+		if got.GetChunkId() != w.id || got.GetState() != w.state {
+			t.Errorf("entry %d = %s %s, want %s %s", i, got.GetChunkId(), got.GetState(), w.id, w.state)
+		}
+	}
+	found := resp.GetStats()[0]
+	if found.GetSizeBytes() != int64(len(good)) || !bytes.Equal(found.GetSha256(), sha(good)) {
+		t.Errorf("found entry = %d bytes %x, want %d bytes %x", found.GetSizeBytes(), found.GetSha256(), len(good), sha(good))
+	}
+
+	_, err = n.client.StatChunks(t.Context(), &objectstorev1.StatChunksRequest{ChunkIds: []string{"../etc/passwd"}})
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("invalid chunk id: code = %v, want InvalidArgument", got)
+	}
+}
