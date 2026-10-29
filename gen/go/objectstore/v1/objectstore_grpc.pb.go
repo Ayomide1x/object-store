@@ -321,6 +321,7 @@ const (
 	StorageNodeService_ReadChunk_FullMethodName   = "/objectstore.v1.StorageNodeService/ReadChunk"
 	StorageNodeService_StatChunks_FullMethodName  = "/objectstore.v1.StorageNodeService/StatChunks"
 	StorageNodeService_VerifyChunk_FullMethodName = "/objectstore.v1.StorageNodeService/VerifyChunk"
+	StorageNodeService_PushChunk_FullMethodName   = "/objectstore.v1.StorageNodeService/PushChunk"
 )
 
 // StorageNodeServiceClient is the client API for StorageNodeService service.
@@ -345,6 +346,15 @@ type StorageNodeServiceClient interface {
 	// the stored SHA-256, and the stored SHA-256 against expected_sha256 (the
 	// coordinator's record). It counts against the node's concurrent read limit.
 	VerifyChunk(ctx context.Context, in *VerifyChunkRequest, opts ...grpc.CallOption) (*VerifyChunkResponse, error)
+	// PushChunk copies a chunk this node holds to another node, for
+	// re-replication ordered by the coordinator (which never carries the
+	// bytes). The node first verifies its own copy, header, chunk ID and data
+	// hash, and checks the hash equals expected_sha256, the coordinator's record;
+	// then it writes to the target through the target's ordinary WriteChunk.
+	// Problems with this node's copy are status errors (DATA_LOSS, NOT_FOUND,
+	// RESOURCE_EXHAUSTED); what happened at the target is the outcome. The
+	// coordinator records nothing from this response: it asks the target.
+	PushChunk(ctx context.Context, in *PushChunkRequest, opts ...grpc.CallOption) (*PushChunkResponse, error)
 }
 
 type storageNodeServiceClient struct {
@@ -407,6 +417,16 @@ func (c *storageNodeServiceClient) VerifyChunk(ctx context.Context, in *VerifyCh
 	return out, nil
 }
 
+func (c *storageNodeServiceClient) PushChunk(ctx context.Context, in *PushChunkRequest, opts ...grpc.CallOption) (*PushChunkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PushChunkResponse)
+	err := c.cc.Invoke(ctx, StorageNodeService_PushChunk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StorageNodeServiceServer is the server API for StorageNodeService service.
 // All implementations must embed UnimplementedStorageNodeServiceServer
 // for forward compatibility.
@@ -429,6 +449,15 @@ type StorageNodeServiceServer interface {
 	// the stored SHA-256, and the stored SHA-256 against expected_sha256 (the
 	// coordinator's record). It counts against the node's concurrent read limit.
 	VerifyChunk(context.Context, *VerifyChunkRequest) (*VerifyChunkResponse, error)
+	// PushChunk copies a chunk this node holds to another node, for
+	// re-replication ordered by the coordinator (which never carries the
+	// bytes). The node first verifies its own copy, header, chunk ID and data
+	// hash, and checks the hash equals expected_sha256, the coordinator's record;
+	// then it writes to the target through the target's ordinary WriteChunk.
+	// Problems with this node's copy are status errors (DATA_LOSS, NOT_FOUND,
+	// RESOURCE_EXHAUSTED); what happened at the target is the outcome. The
+	// coordinator records nothing from this response: it asks the target.
+	PushChunk(context.Context, *PushChunkRequest) (*PushChunkResponse, error)
 	mustEmbedUnimplementedStorageNodeServiceServer()
 }
 
@@ -450,6 +479,9 @@ func (UnimplementedStorageNodeServiceServer) StatChunks(context.Context, *StatCh
 }
 func (UnimplementedStorageNodeServiceServer) VerifyChunk(context.Context, *VerifyChunkRequest) (*VerifyChunkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyChunk not implemented")
+}
+func (UnimplementedStorageNodeServiceServer) PushChunk(context.Context, *PushChunkRequest) (*PushChunkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PushChunk not implemented")
 }
 func (UnimplementedStorageNodeServiceServer) mustEmbedUnimplementedStorageNodeServiceServer() {}
 func (UnimplementedStorageNodeServiceServer) testEmbeddedByValue()                            {}
@@ -526,6 +558,24 @@ func _StorageNodeService_VerifyChunk_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageNodeService_PushChunk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PushChunkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageNodeServiceServer).PushChunk(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageNodeService_PushChunk_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageNodeServiceServer).PushChunk(ctx, req.(*PushChunkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // StorageNodeService_ServiceDesc is the grpc.ServiceDesc for StorageNodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -540,6 +590,10 @@ var StorageNodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VerifyChunk",
 			Handler:    _StorageNodeService_VerifyChunk_Handler,
+		},
+		{
+			MethodName: "PushChunk",
+			Handler:    _StorageNodeService_PushChunk_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

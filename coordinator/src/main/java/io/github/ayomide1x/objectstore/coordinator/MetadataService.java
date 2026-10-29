@@ -18,6 +18,7 @@ import io.github.ayomide1x.objectstore.v1.ChunkStat;
 import io.grpc.Status;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -40,13 +41,15 @@ public class MetadataService {
     private final NodeClient nodeClient;
     private final TransactionTemplate tx;
     private final LivenessTracker liveness;
+    private final ApplicationEventPublisher events;
 
     public MetadataService(MetadataRepository repository, NodeClient nodeClient, TransactionTemplate tx,
-            LivenessTracker liveness) {
+            LivenessTracker liveness, ApplicationEventPublisher events) {
         this.repository = repository;
         this.nodeClient = nodeClient;
         this.tx = tx;
         this.liveness = liveness;
+        this.events = events;
     }
 
     /** One chunk of an upload plan, with the nodes the client must write it to. */
@@ -155,6 +158,9 @@ public class MetadataService {
         Map<UUID, List<String>> verified = verifyReplicas(objectId, plan, chunks);
 
         tx.executeWithoutResult(status -> commitVerified(objectId, chunks, verified));
+        if (verified.values().stream().anyMatch(v -> v.size() < REPLICATION)) {
+            events.publishEvent(new RepairHint("object " + objectId + " committed with fewer than 3 replicas"));
+        }
     }
 
     /** Phase 3. Runs inside a transaction. */

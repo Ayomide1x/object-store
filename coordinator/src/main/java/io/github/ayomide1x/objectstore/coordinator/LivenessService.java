@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 /**
@@ -32,13 +33,15 @@ public class LivenessService implements InitializingBean, DisposableBean {
     private final Ticker ticker;
     private final Duration sweepEvery;
     private final Map<String, Long> lastPersistedBeat = new ConcurrentHashMap<>();
+    private final ApplicationEventPublisher events;
     private ScheduledExecutorService sweeper;
 
     public LivenessService(LivenessTracker tracker, MetadataRepository repository, Ticker ticker,
-            CoordinatorProperties properties, NodeRegistry registry) {
+            CoordinatorProperties properties, NodeRegistry registry, ApplicationEventPublisher events) {
         this.tracker = tracker;
         this.repository = repository;
         this.ticker = ticker;
+        this.events = events;
         this.sweepEvery = properties.livenessSweep();
         // registry is a dependency only so the nodes table is seeded first.
     }
@@ -90,6 +93,9 @@ public class LivenessService implements InitializingBean, DisposableBean {
         log.atInfo().addKeyValue("node_id", t.nodeId()).addKeyValue("from", t.from()).addKeyValue("to", t.to())
                 .addKeyValue("since_last_beat", silence).log("node liveness changed");
         repository.updateNodeState(t.nodeId(), t.to().name());
+        if (t.to() == State.ALIVE) {
+            events.publishEvent(new RepairHint(t.nodeId() + " became ALIVE"));
+        }
     }
 
     private void sweepSafely() {

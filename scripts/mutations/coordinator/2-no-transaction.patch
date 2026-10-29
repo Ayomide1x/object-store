@@ -1,11 +1,11 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
-@@ -145,7 +145,7 @@
+@@ -157,7 +157,7 @@
  
          Map<UUID, List<String>> verified = verifyReplicas(objectId, plan, chunks);
  
 -        tx.executeWithoutResult(status -> commitVerified(objectId, chunks, verified));
 +        commitVerified(objectId, chunks, verified);
-     }
- 
-     /** Phase 3. Runs inside a transaction. */
+         if (verified.values().stream().anyMatch(v -> v.size() < REPLICATION)) {
+             events.publishEvent(new RepairHint("object " + objectId + " committed with fewer than 3 replicas"));
+         }

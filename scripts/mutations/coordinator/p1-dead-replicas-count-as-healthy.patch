@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -141,7 +141,7 @@
+                 State s = states.getOrDefault(r.nodeId(), State.UNKNOWN);
+                 boolean counts = switch (s) {
+                     case ALIVE, SUSPECT -> true;
+-                    case DEAD -> liveness.deadForNanos(r.nodeId()) < graceNanos;
++                    case DEAD -> true;
+                     case UNKNOWN -> true; // unreachable: the pass is skipped while any node is UNKNOWN
+                 };
+                 if (counts) {

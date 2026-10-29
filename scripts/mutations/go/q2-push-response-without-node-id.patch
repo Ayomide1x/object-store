@@ -1,0 +1,11 @@
+--- a/node/internal/server/server.go
++++ b/node/internal/server/server.go
+@@ -281,7 +281,7 @@
+ 			req.GetChunkId(), sum, req.GetExpectedSha256())
+ 	}
+ 
+-	resp := &objectstorev1.PushChunkResponse{NodeId: s.nodeID, ChunkId: req.GetChunkId()}
++	resp := &objectstorev1.PushChunkResponse{ChunkId: req.GetChunkId()}
+ 	_, err = chunkwrite.Write(ctx, req.GetTargetAddress(),
+ 		chunkwrite.Header{ChunkID: req.GetChunkId(), Size: int64(len(data))}, bytes.NewReader(data))
+ 	switch {

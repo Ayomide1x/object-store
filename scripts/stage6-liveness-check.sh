@@ -55,7 +55,7 @@ wait_alive 4
 mkfile_mib x 20
 osctl_run put "$work/x" "liveness/x-$run"
 objx="$(latest_object "liveness/x-$run")"
-cx="$(sql "SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r USING (chunk_id) WHERE c.object_id = '$objx'
+cx="$(sql "SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.origin = 'upload' WHERE c.object_id = '$objx'
            GROUP BY c.chunk_id HAVING min(r.node_id) = 'node2' LIMIT 1")"
 [[ -n "$cx" ]] && echo "   chunk $cx has node2 as its first listed replica" || fail "no chunk of X lists node2 first"
 t0="$(now)"; osctl_run get "liveness/x-$run" "$work/x.out"; baseline="$(since "$t0")"
@@ -76,7 +76,7 @@ osctl_run put "$work/y" "liveness/y-$run"
 objy="$(latest_object "liveness/y-$run")"
 [[ "$(sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$objy' AND p.node_id = 'node2'")" == 0 ]] \
   && ok "nothing placed on node2" || fail "a chunk was placed on node2"
-bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r USING (chunk_id)
+bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.origin = 'upload'
             WHERE c.object_id = '$objy' GROUP BY c.chunk_id
             HAVING string_agg(r.node_id, ',' ORDER BY r.node_id) <> 'node1,node3,node4') t")"
 [[ "$bad" == 0 ]] && ok "every chunk has 3 replicas: node1, node3, node4" || fail "$bad chunks without exactly node1,node3,node4"
@@ -147,7 +147,7 @@ wait_state node4 DEAD $((dead + interval + margin)) || fail "node4 never DEAD"
 mkfile_mib w 10
 if osctl_run put "$work/w" "liveness/two-alive-$run"; then
   objw="$(latest_object "liveness/two-alive-$run")"
-  bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r USING (chunk_id)
+  bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.origin = 'upload'
               WHERE c.object_id = '$objw' GROUP BY c.chunk_id
               HAVING string_agg(r.node_id, ',' ORDER BY r.node_id) <> 'node1,node2') t")"
   [[ "$bad" == 0 ]] && ok "with 2 ALIVE: every chunk on exactly node1 and node2" || fail "$bad chunks not on exactly node1,node2"

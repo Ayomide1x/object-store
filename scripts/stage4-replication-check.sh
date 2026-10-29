@@ -67,8 +67,10 @@ sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA 
 now() { python3 -c 'import time; print(time.time())'; }
 latest_object() { sql "SELECT object_id FROM objects WHERE key = '$1' ORDER BY created_at DESC LIMIT 1"; }
 
-# check_replicas OBJECT_ID DEAD: each chunk's recorded replicas must equal its
-# placed nodes minus DEAD (a Postgres array literal such as '{node2}').
+# check_replicas OBJECT_ID DEAD: each chunk's replicas recorded at upload must
+# equal its placed nodes minus DEAD (a Postgres array literal such as '{node2}').
+# Since stage 7 the reconciler can add rows in the background (origin 'repair');
+# they are additions, never removals, so only origin = 'upload' rows are compared.
 check_replicas() {
   local rows bad=0
   rows="$(sql "
@@ -76,7 +78,7 @@ check_replicas() {
            coalesce((SELECT string_agg(node_id, ',' ORDER BY node_id) FROM chunk_placements p
                      WHERE p.chunk_id = c.chunk_id AND p.node_id <> ALL('$2'::text[])), '-'),
            coalesce((SELECT string_agg(node_id, ',' ORDER BY node_id) FROM chunk_replicas r
-                     WHERE r.chunk_id = c.chunk_id), '-')
+                     WHERE r.chunk_id = c.chunk_id AND r.origin = 'upload'), '-')
     FROM chunks c WHERE c.object_id = '$1' ORDER BY 1")"
   printf '     %-6s %-20s %s\n' chunk expected recorded
   while IFS='|' read -r idx want got; do
@@ -125,7 +127,7 @@ baseline="$(python3 -c "print(round($(now) - $t0, 2))")"
 obj1="$(latest_object "replication/all-up-$run")"
 echo "   put took ${baseline}s"
 check_replicas "$obj1" '{}' && ok "every chunk has 3 replicas, equal to its placement" || fail "replicas differ from placement"
-[[ "$(sql "SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = '$obj1'")" == 9 ]] \
+[[ "$(sql "SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = '$obj1' AND r.origin = 'upload'")" == 9 ]] \
   && ok "9 replica rows for 3 chunks" || fail "expected 9 replica rows"
 verify_files "$obj1" && ok "every replica file verifies on its own node's volume" || fail "a replica file did not verify"
 osctl_run get "replication/all-up-$run" "$work/v1.out" && cmp -s "$work/v1" "$work/v1.out" \
@@ -146,7 +148,7 @@ if "$osctl" put "$work/v2" "replication/one-stopped-$run" 2>"$work/put2.err"; th
   obj2="$(latest_object "replication/one-stopped-$run")"
   [[ "$(placed_on "$obj2" node2)" == 0 ]] && ok "nothing placed on the DEAD node" || fail "a chunk was placed on node2"
   check_replicas "$obj2" '{node2}' && ok "each chunk records its placed nodes minus node2" || fail "replicas wrong"
-  [[ "$(sql "SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = '$obj2'")" == 9 ]] \
+  [[ "$(sql "SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id) WHERE c.object_id = '$obj2' AND r.origin = 'upload'")" == 9 ]] \
     && ok "3 replicas per chunk from the 3 live nodes" || fail "expected 9 replica rows"
   osctl_run get "replication/one-stopped-$run" "$work/v2.out" && cmp -s "$work/v2" "$work/v2.out" \
     && ok "get IDENTICAL with node2 down" || fail "get failed with node2 down"
@@ -268,7 +270,9 @@ for cycle in 1 2 3; do
   fi
   while [[ "$width" == 3 ]] && ! [[ "$seen_success" == yes && "$seen_failure" == yes ]] && ((attempt < 12)); do
     attempt=$((attempt + 1))
-    two_stopped_put "one-chunk-$attempt" 1
+    # The cycle is part of the name: each attempt needs its own key, or a failed
+    # attempt's key would still resolve to an earlier cycle's success.
+    two_stopped_put "one-chunk-c$cycle-$attempt" 1
     if [[ "$matched" == yes ]]; then
       [[ "$expected" == success ]] && seen_success=yes
       [[ "$expected" == failure ]] && seen_failure=yes

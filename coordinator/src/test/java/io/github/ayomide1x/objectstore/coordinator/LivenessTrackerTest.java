@@ -39,7 +39,8 @@ class LivenessTrackerTest {
         clock = new FakeTicker();
         tracker = new LivenessTracker(clock, new CoordinatorProperties(
                 "node1|n1:1|n1:1,node2|n2:2|n2:2", Duration.ofSeconds(2), Duration.ofSeconds(6),
-                Duration.ofSeconds(15), 2, Duration.ZERO));
+                Duration.ofSeconds(15), 2, Duration.ZERO, Duration.ofSeconds(30), Duration.ZERO, 8, 2,
+                Duration.ofSeconds(30), Duration.ofHours(24)));
     }
 
     private void after(double seconds) {

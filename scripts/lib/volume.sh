@@ -24,3 +24,24 @@ flip_byte() {
 delete_chunk_file() {
   docker run --rm --volumes-from "$(node_container "$1")" alpine:3 rm "/data/chunks/$2"
 }
+
+# check_chunk_files NODE CHUNK_ID...: for each chunk, prints "OK id" if NODE's
+# file passes the header (magic), chunk-ID and SHA-256 checks, else "BAD id" or
+# "MISSING id". Works while the node is stopped.
+check_chunk_files() {
+  local node="$1"; shift
+  docker run --rm --volumes-from "$(node_container "$node")" alpine:3 sh -c '
+    for id in "$@"; do
+      f=/data/chunks/$id
+      if [ ! -f "$f" ]; then echo "MISSING $id"; continue; fi
+      magic=$(head -c 8 "$f")
+      hid=$(dd if="$f" bs=1 skip=8 count=16 2>/dev/null | od -An -tx1 -v | tr -d " \n")
+      hsum=$(dd if="$f" bs=1 skip=24 count=32 2>/dev/null | od -An -tx1 -v | tr -d " \n")
+      dsum=$(tail -c +57 "$f" | sha256sum | cut -d" " -f1)
+      if [ "$magic" = OSCHUNK1 ] && [ "$hid" = "$(echo "$id" | tr -d -)" ] && [ "$hsum" = "$dsum" ]; then
+        echo "OK $id"
+      else
+        echo "BAD $id"
+      fi
+    done' sh "$@"
+}

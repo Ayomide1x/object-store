@@ -7,6 +7,7 @@ import io.github.ayomide1x.objectstore.v1.ReportBadReplicaResponse.Verdict;
 import io.github.ayomide1x.objectstore.v1.VerifyChunkResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 /**
@@ -22,10 +23,12 @@ public class ReplicaHealthService {
 
     private final MetadataRepository repository;
     private final NodeClient nodeClient;
+    private final ApplicationEventPublisher events;
 
-    public ReplicaHealthService(MetadataRepository repository, NodeClient nodeClient) {
+    public ReplicaHealthService(MetadataRepository repository, NodeClient nodeClient, ApplicationEventPublisher events) {
         this.repository = repository;
         this.nodeClient = nodeClient;
+        this.events = events;
     }
 
     /**
@@ -73,6 +76,7 @@ public class ReplicaHealthService {
         log.atWarn().addKeyValue("chunk_id", chunkId).addKeyValue("node_id", nodeId)
                 .addKeyValue("reported_reason", reason)
                 .log("replica marked BAD, confirmed by its node: {}", markReason);
+        events.publishEvent(new RepairHint("replica of " + chunkId + " on " + nodeId + " marked BAD"));
         return Verdict.VERDICT_MARKED_BAD;
     }
 }

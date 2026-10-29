@@ -534,3 +534,126 @@ func TestVerifyChunkCountsAgainstReadLimit(t *testing.T) {
 		t.Fatalf("code with the only slot taken = %v, want ResourceExhausted", got)
 	}
 }
+
+// startTCPNode runs a real node server on a TCP port, for PushChunk targets:
+// the push dials the target by address.
+func startTCPNode(t *testing.T, nodeID string) (testNode, string) {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := chunkstore.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(nodeID, store, slog.New(slog.NewTextHandler(io.Discard, nil)), 4)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer()
+	objectstorev1.RegisterStorageNodeServiceServer(gs, srv)
+	go gs.Serve(lis)
+	t.Cleanup(gs.Stop)
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	return testNode{client: objectstorev1.NewStorageNodeServiceClient(conn), srv: srv, dir: dir}, lis.Addr().String()
+}
+
+func TestPushChunk(t *testing.T) {
+	payload := bytes.Repeat([]byte("push me "), 400_000) // 3.2 MB: several frames
+	tests := []struct {
+		name        string
+		setup       func(t *testing.T, source, target testNode) // after source holds payload
+		expected    []byte
+		wantCode    codes.Code
+		wantOutcome objectstorev1.PushChunkResponse_Outcome
+	}{
+		{"copies a verified chunk", func(*testing.T, testNode, testNode) {}, sha(payload),
+			codes.OK, objectstorev1.PushChunkResponse_OUTCOME_COPIED},
+		{"source corrupt", func(t *testing.T, s, _ testNode) { flip(t, s.finalPath(testChunkID), chunkstore.HeaderSize+10) },
+			sha(payload), codes.DataLoss, 0},
+		{"source is not the recorded chunk", func(*testing.T, testNode, testNode) {}, sha([]byte("other")),
+			codes.DataLoss, 0},
+		{"source missing", func(t *testing.T, s, _ testNode) {
+			if err := os.Remove(s.finalPath(testChunkID)); err != nil {
+				t.Fatal(err)
+			}
+		}, sha(payload), codes.NotFound, 0},
+		{"target already has a file", func(t *testing.T, _, tg testNode) { writeValid(t, tg, testChunkID, []byte("old")) },
+			sha(payload), codes.OK, objectstorev1.PushChunkResponse_OUTCOME_TARGET_HAS_CHUNK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := startServer(t, 4)
+			writeValid(t, source, testChunkID, payload)
+			target, targetAddr := startTCPNode(t, "target-node")
+			tt.setup(t, source, target)
+			before, _ := os.ReadFile(target.finalPath(testChunkID))
+
+			resp, err := source.client.PushChunk(t.Context(), &objectstorev1.PushChunkRequest{
+				ChunkId: testChunkID, ExpectedSha256: tt.expected, TargetNodeId: "target-node", TargetAddress: targetAddr,
+			})
+			if got := status.Code(err); got != tt.wantCode {
+				t.Fatalf("code = %v, want %v (err: %v)", got, tt.wantCode, err)
+			}
+			after, _ := os.ReadFile(target.finalPath(testChunkID))
+			if tt.wantCode != codes.OK {
+				if !bytes.Equal(before, after) {
+					t.Error("the target's file changed although the source refused to copy")
+				}
+				return
+			}
+			if resp.GetNodeId() != "test-node" || resp.GetChunkId() != testChunkID {
+				t.Errorf("response identifies %s/%s, want the source test-node/%s", resp.GetNodeId(), resp.GetChunkId(), testChunkID)
+			}
+			if resp.GetOutcome() != tt.wantOutcome {
+				t.Fatalf("outcome = %s (%s), want %s", resp.GetOutcome(), resp.GetDetail(), tt.wantOutcome)
+			}
+			if tt.wantOutcome == objectstorev1.PushChunkResponse_OUTCOME_TARGET_HAS_CHUNK {
+				if !bytes.Equal(before, after) {
+					t.Error("the target's existing file was replaced")
+				}
+				return
+			}
+			// The copy is verified on the target: its own read checks header, ID and hash.
+			frames, err := read(t.Context(), target.client, testChunkID)
+			if err != nil || !bytes.Equal(bytes.Join(frames, nil), payload) {
+				t.Fatalf("target read = %d bytes, %v; want the verified payload", len(bytes.Join(frames, nil)), err)
+			}
+		})
+	}
+}
+
+func TestPushChunkTargetUnreachable(t *testing.T) {
+	source := startServer(t, 4)
+	writeValid(t, source, testChunkID, []byte("going nowhere"))
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+	lis.Close()
+	resp, err := source.client.PushChunk(t.Context(), &objectstorev1.PushChunkRequest{
+		ChunkId: testChunkID, ExpectedSha256: sha([]byte("going nowhere")), TargetNodeId: "gone", TargetAddress: addr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetOutcome() != objectstorev1.PushChunkResponse_OUTCOME_TARGET_FAILED {
+		t.Errorf("outcome = %s, want TARGET_FAILED", resp.GetOutcome())
+	}
+}
+
+func TestPushChunkHoldsAReadSlot(t *testing.T) {
+	source := startServer(t, 1)
+	writeValid(t, source, testChunkID, []byte("x"))
+	source.srv.readSlots <- struct{}{}
+	_, err := source.client.PushChunk(t.Context(), &objectstorev1.PushChunkRequest{
+		ChunkId: testChunkID, ExpectedSha256: sha([]byte("x")), TargetNodeId: "t", TargetAddress: "127.0.0.1:1",
+	})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code with the only slot taken = %v, want ResourceExhausted", got)
+	}
+}

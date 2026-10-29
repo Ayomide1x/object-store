@@ -1,0 +1,14 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -134,10 +134,10 @@
+             List<String> sources = new ArrayList<>();
+             Set<String> withRow = new HashSet<>();
+             for (ReplicaRow r : c.replicas()) {
+-                withRow.add(r.nodeId());
+                 if (!r.state().equals("HEALTHY")) {
+                     continue;
+                 }
++                withRow.add(r.nodeId());
+                 State s = states.getOrDefault(r.nodeId(), State.UNKNOWN);
+                 boolean counts = switch (s) {
+                     case ALIVE, SUSPECT -> true;

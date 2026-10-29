@@ -185,6 +185,15 @@ service StorageNodeService {
   // the stored SHA-256, and the stored SHA-256 against expected_sha256 (the
   // coordinator's record). It counts against the node's concurrent read limit.
   rpc VerifyChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
+  // PushChunk copies a chunk this node holds to another node, for
+  // re-replication ordered by the coordinator (which never carries the
+  // bytes). The node first verifies its own copy, header, chunk ID and data
+  // hash, and checks the hash equals expected_sha256, the coordinator's record;
+  // then it writes to the target through the target's ordinary WriteChunk.
+  // Problems with this node's copy are status errors (DATA_LOSS, NOT_FOUND,
+  // RESOURCE_EXHAUSTED); what happened at the target is the outcome. The
+  // coordinator records nothing from this response: it asks the target.
+  rpc PushChunk(PushChunkRequest) returns (PushChunkResponse);
 }
 
 message WriteChunkRequest {
@@ -273,5 +282,30 @@ message VerifyChunkResponse {
   string node_id = 1;
   string chunk_id = 2;
   State state = 3;
+  string detail = 4;
+}
+
+message PushChunkRequest {
+  string chunk_id = 1;
+  bytes expected_sha256 = 2;
+  string target_node_id = 3;
+  // The target's address as nodes reach it (its internal address).
+  string target_address = 4;
+}
+
+message PushChunkResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // The target acknowledged a verified, durable write.
+    OUTCOME_COPIED = 1;
+    // The target answered ALREADY_EXISTS: it holds some file under that name.
+    OUTCOME_TARGET_HAS_CHUNK = 2;
+    // The target was unreachable, timed out, or rejected the write.
+    OUTCOME_TARGET_FAILED = 3;
+  }
+  // The pushing (source) node's ID.
+  string node_id = 1;
+  string chunk_id = 2;
+  Outcome outcome = 3;
   string detail = 4;
 }

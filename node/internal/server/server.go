@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
+	"github.com/Ayomide1x/object-store/internal/chunkwrite"
 	"github.com/Ayomide1x/object-store/node/internal/chunkstore"
 )
 
@@ -241,6 +242,59 @@ func (s *Server) VerifyChunk(ctx context.Context, req *objectstorev1.VerifyChunk
 		}
 	}
 	log.Info("chunk verified on request", "state", resp.GetState().String(), "detail", resp.GetDetail())
+	return resp, nil
+}
+
+// PushChunk copies a chunk this node holds to another node, for repair. It
+// verifies its own copy first (header, chunk ID, data hash) and that the hash
+// is the coordinator's record, holding a read slot like ReadChunk, then
+// streams it to the target's ordinary WriteChunk, which verifies again and
+// writes durably without replacing anything. Problems with this node's copy
+// are status errors; what happened at the target is the outcome.
+func (s *Server) PushChunk(ctx context.Context, req *objectstorev1.PushChunkRequest) (*objectstorev1.PushChunkResponse, error) {
+	log := s.log.With("node_id", s.nodeID, "chunk_id", req.GetChunkId(), "target_node_id", req.GetTargetNodeId())
+	if req.GetTargetAddress() == "" {
+		return nil, status.Error(codes.InvalidArgument, "target_address is required")
+	}
+	select {
+	case s.readSlots <- struct{}{}:
+		defer func() { <-s.readSlots }()
+	default:
+		return nil, status.Errorf(codes.ResourceExhausted, "node %s is serving %d reads; retry later", s.nodeID, cap(s.readSlots))
+	}
+
+	data, err := s.store.Read(ctx, req.GetChunkId())
+	switch {
+	case errors.Is(err, chunkstore.ErrInvalidID):
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, chunkstore.ErrNotFound):
+		return nil, status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, chunkstore.ErrCorrupt):
+		log.Error("push source failed verification; refusing to copy it", "error", err)
+		return nil, status.Error(codes.DataLoss, err.Error())
+	case err != nil:
+		return nil, status.Errorf(codes.Internal, "read chunk %s: %v", req.GetChunkId(), err)
+	}
+	if sum := sha256.Sum256(data); !bytes.Equal(sum[:], req.GetExpectedSha256()) {
+		log.Error("push source is not the recorded chunk; refusing to copy it")
+		return nil, status.Errorf(codes.DataLoss, "chunk %s: stored sha256 %x differs from the coordinator's record %x",
+			req.GetChunkId(), sum, req.GetExpectedSha256())
+	}
+
+	resp := &objectstorev1.PushChunkResponse{NodeId: s.nodeID, ChunkId: req.GetChunkId()}
+	_, err = chunkwrite.Write(ctx, req.GetTargetAddress(),
+		chunkwrite.Header{ChunkID: req.GetChunkId(), Size: int64(len(data))}, bytes.NewReader(data))
+	switch {
+	case err == nil:
+		resp.Outcome = objectstorev1.PushChunkResponse_OUTCOME_COPIED
+	case status.Code(err) == codes.AlreadyExists:
+		resp.Outcome = objectstorev1.PushChunkResponse_OUTCOME_TARGET_HAS_CHUNK
+		resp.Detail = err.Error()
+	default:
+		resp.Outcome = objectstorev1.PushChunkResponse_OUTCOME_TARGET_FAILED
+		resp.Detail = err.Error()
+	}
+	log.Info("chunk pushed", "outcome", resp.GetOutcome().String(), "bytes", len(data), "detail", resp.GetDetail())
 	return resp, nil
 }
 

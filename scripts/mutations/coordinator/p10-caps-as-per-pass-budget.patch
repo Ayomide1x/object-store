@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -218,7 +218,7 @@
+                         started++;
+                     }
+                 }
+-                if (inFlight == 0) {
++                if (inFlight == 0 || started > 0) {
+                     break; // nothing running, and nothing more fits: done
+                 }
+                 try {

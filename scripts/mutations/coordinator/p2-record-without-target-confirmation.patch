@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -259,7 +259,8 @@
+                 PushChunkResponse resp = nodeClient.pushChunk(nodes.get(sourceId), chunk.chunkId(), chunk.sha256(), target);
+                 switch (resp.getOutcome()) {
+                     case OUTCOME_COPIED -> {
+-                        confirm(chunk, target, "repair", n);
++                        repository.insertRepairedReplica(chunk.chunkId(), target.nodeId(), "repair");
++                        n.recorded.incrementAndGet();
+                         return;
+                     }
+                     case OUTCOME_TARGET_HAS_CHUNK -> {

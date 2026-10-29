@@ -41,6 +41,8 @@ expected_test() {
     h3-ignores-cancellation) echo "TestStopsPromptlyOnCancellation" ;;
     h4-default-reconnect-backoff) echo "TestSurvivesTheCoordinatorBeingDown" ;;
     r1-read-order-ignores-liveness) echo "TestDeadReplicasAreReadLast" ;;
+    q1-push-ignores-expected-hash) echo "TestPushChunk/source_is_not_the_recorded_chunk" ;;
+    q2-push-response-without-node-id) echo "TestPushChunk/copies_a_verified_chunk" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

@@ -18,6 +18,8 @@ import java.util.function.Function;
 import com.google.protobuf.ByteString;
 
 import io.github.ayomide1x.objectstore.v1.ChunkStat;
+import io.github.ayomide1x.objectstore.v1.PushChunkRequest;
+import io.github.ayomide1x.objectstore.v1.PushChunkResponse;
 import io.github.ayomide1x.objectstore.v1.StatChunksRequest;
 import io.github.ayomide1x.objectstore.v1.StatChunksResponse;
 import io.github.ayomide1x.objectstore.v1.StorageNodeServiceGrpc;
@@ -55,10 +57,29 @@ public class NodeClient implements DisposableBean {
     private static final Logger log = LoggerFactory.getLogger(NodeClient.class);
 
     private final Duration timeout;
+    private final Duration copyTimeout;
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
 
     public NodeClient(CoordinatorProperties properties) {
         this.timeout = properties.nodeRpcTimeout();
+        this.copyTimeout = properties.copyTimeout();
+    }
+
+    /**
+     * Orders source to copy a chunk to target (PushChunk), within the copy
+     * deadline. Throws the source's status on a problem with its own copy.
+     * Nothing about the target may be recorded from this answer: callers
+     * confirm with the target's own StatChunks.
+     */
+    public PushChunkResponse pushChunk(Node source, UUID chunkId, byte[] expectedSha256, Node target) {
+        Deadline deadline = Deadline.after(copyTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        PushChunkRequest req = PushChunkRequest.newBuilder()
+                .setChunkId(chunkId.toString())
+                .setExpectedSha256(ByteString.copyFrom(expectedSha256))
+                .setTargetNodeId(target.nodeId())
+                .setTargetAddress(target.internalAddr())
+                .build();
+        return StorageNodeServiceGrpc.newBlockingStub(channel(source)).withDeadline(deadline).pushChunk(req);
     }
 
     /**

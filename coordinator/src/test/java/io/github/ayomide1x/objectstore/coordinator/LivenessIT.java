@@ -51,6 +51,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         "spring.grpc.server.port=0",
         "coordinator.node-rpc-timeout=" + LivenessIT.NODE_TIMEOUT_MS + "ms",
         "coordinator.liveness-sweep=0",
+        "coordinator.repair-interval=0",
 })
 class LivenessIT {
 

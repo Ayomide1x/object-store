@@ -1,0 +1,25 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -338,11 +338,11 @@
+         }
+ 
+         synchronized boolean full() {
+-            return total >= maxTotal;
++            return false;
+         }
+ 
+         synchronized boolean has(String node) {
+-            return perNode.getOrDefault(node, 0) < maxPerNode;
++            return true;
+         }
+ 
+         synchronized int of(String node) {
+@@ -350,7 +350,7 @@
+         }
+ 
+         synchronized boolean reserve(String source, String target) {
+-            if (total >= maxTotal || !has(source) || !has(target)) {
++            if (false) {
+                 return false;
+             }
+             total++;

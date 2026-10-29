@@ -44,6 +44,95 @@ public class MetadataRepository {
                 .update();
     }
 
+    /** A replica row as the reconciler sees it. */
+    public record ReplicaRow(String nodeId, String state) {
+    }
+
+    /** A chunk of a current COMMITTED object, with every replica row of any state. */
+    public record RepairChunk(UUID chunkId, UUID objectId, int index, long sizeBytes, byte[] sha256,
+            java.time.OffsetDateTime objectCreated, List<ReplicaRow> replicas) {
+    }
+
+    /**
+     * Every chunk of every COMMITTED object a key currently points to, with all
+     * its replica rows. Superseded versions and PENDING objects are left out:
+     * they are not repaired.
+     */
+    public List<RepairChunk> repairCandidates() {
+        record Row(UUID chunkId, UUID objectId, int index, long size, byte[] sha, java.time.OffsetDateTime created,
+                String nodeId, String state) {
+        }
+        List<Row> rows = jdbc.sql("""
+                SELECT c.chunk_id, c.object_id, c.chunk_index, c.size_bytes, c.sha256, o.created_at,
+                       r.node_id, r.state
+                FROM keys k
+                JOIN objects o ON o.object_id = k.object_id AND o.status = 'COMMITTED'
+                JOIN chunks c ON c.object_id = o.object_id
+                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
+                ORDER BY c.chunk_id, r.node_id
+                """)
+                .query((rs, i) -> new Row(rs.getObject("chunk_id", UUID.class), rs.getObject("object_id", UUID.class),
+                        rs.getInt("chunk_index"), rs.getLong("size_bytes"), rs.getBytes("sha256"),
+                        rs.getObject("created_at", java.time.OffsetDateTime.class),
+                        rs.getString("node_id"), rs.getString("state")))
+                .list();
+        Map<UUID, RepairChunk> out = new LinkedHashMap<>();
+        for (Row r : rows) {
+            RepairChunk c = out.computeIfAbsent(r.chunkId(), id -> new RepairChunk(id, r.objectId(), r.index(),
+                    r.size(), r.sha(), r.created(), new ArrayList<>()));
+            if (r.nodeId() != null) {
+                c.replicas().add(new ReplicaRow(r.nodeId(), r.state()));
+            }
+        }
+        return List.copyOf(out.values());
+    }
+
+    /** Records a replica repair confirmed on the target. Returns rows inserted (0 if one already existed). */
+    public int insertRepairedReplica(UUID chunkId, String nodeId, String origin) {
+        return jdbc.sql("""
+                INSERT INTO chunk_replicas (chunk_id, node_id, origin) VALUES (:chunkId, :nodeId, :origin)
+                ON CONFLICT (chunk_id, node_id) DO NOTHING
+                """)
+                .param("chunkId", chunkId).param("nodeId", nodeId).param("origin", origin).update();
+    }
+
+    /**
+     * Records that a target's own StatChunks reported an invalid file under the
+     * chunk's name: a BAD row, so no pass targets that node for the chunk, and
+     * stage 8 can find the file.
+     */
+    public int insertBadReplicaFound(UUID chunkId, String nodeId, String reason) {
+        return jdbc.sql("""
+                INSERT INTO chunk_replicas (chunk_id, node_id, state, bad_reason, marked_bad_at, origin)
+                VALUES (:chunkId, :nodeId, 'BAD', :reason, clock_timestamp(), 'repair')
+                ON CONFLICT (chunk_id, node_id) DO NOTHING
+                """)
+                .param("chunkId", chunkId).param("nodeId", nodeId).param("reason", reason).update();
+    }
+
+    public long startRepairPass() {
+        return jdbc.sql("INSERT INTO repair_passes DEFAULT VALUES RETURNING pass_id").query(Long.class).single();
+    }
+
+    public void finishRepairPass(long passId, String skippedReason, int underReplicated, int copiesStarted,
+            int recorded, int foundRecorded, int badFound, int failures) {
+        jdbc.sql("""
+                UPDATE repair_passes SET finished_at = clock_timestamp(), skipped_reason = :skipped,
+                  under_replicated = :under, copies_started = :copies, replicas_recorded = :recorded,
+                  found_recorded = :found, bad_found = :bad, failures = :failures
+                WHERE pass_id = :id
+                """)
+                .param("skipped", skippedReason).param("under", underReplicated).param("copies", copiesStarted)
+                .param("recorded", recorded).param("found", foundRecorded).param("bad", badFound)
+                .param("failures", failures).param("id", passId).update();
+    }
+
+    /** Deletes repair_passes rows started more than retention ago. Returns rows deleted. */
+    public int pruneRepairPasses(java.time.Duration retention) {
+        return jdbc.sql("DELETE FROM repair_passes WHERE started_at < clock_timestamp() - make_interval(secs => :secs)")
+                .param("secs", (double) retention.toMillis() / 1000).update();
+    }
+
     /** Persisted liveness, for observability: written as UNKNOWN at coordinator startup. */
     public void markAllNodesUnknown() {
         jdbc.sql("UPDATE nodes SET state = 'UNKNOWN', state_changed_at = clock_timestamp()").update();

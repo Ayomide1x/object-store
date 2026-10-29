@@ -141,8 +141,9 @@ echo "     objects.status = ${state:-<no row>}"
 inflight="$(sed -n 's/^chunk-\([0-9a-f-]\{36\}\)-.*/\1/p' <<<"$temps" | head -1)"
 if [[ -n "$inflight" ]]; then
   idx="$(sql "SELECT chunk_index FROM chunks WHERE chunk_id = '$inflight'")"
+  # origin = 'upload': a later repair may legitimately copy onto node1 (stage 7).
   late="$(sql "SELECT count(*) FROM chunk_replicas r JOIN chunks c USING (chunk_id)
-               WHERE c.object_id = '$obj' AND r.node_id = 'node1' AND c.chunk_index >= $idx")"
+               WHERE c.object_id = '$obj' AND r.node_id = 'node1' AND c.chunk_index >= $idx AND r.origin = 'upload'")"
   echo "     node1 was writing chunk $idx; node1 replicas recorded from chunk $idx on: $late"
   [[ "$late" == 0 ]] || fail "node1 is recorded for a chunk it never finished"
 fi

@@ -22,6 +22,17 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                       within suspectAfter of the last, that bring a DEAD node back
  * @param livenessSweep  {@code COORDINATOR_LIVENESS_SWEEP}: how often timeouts are
  *                       applied; 0 disables the sweeper (tests sweep by hand)
+ * @param repairGrace    {@code COORDINATOR_REPAIR_GRACE}: how long a node must be DEAD
+ *                       before its replicas stop counting and are repaired
+ * @param repairInterval {@code COORDINATOR_REPAIR_INTERVAL}: time between reconciler
+ *                       passes; 0 disables the scheduler (tests run passes by hand)
+ * @param repairMaxInflight {@code COORDINATOR_REPAIR_MAX_INFLIGHT}: copies at once,
+ *                       cluster-wide
+ * @param repairMaxPerNode  {@code COORDINATOR_REPAIR_MAX_PER_NODE}: copies at once per
+ *                       node, as source or target
+ * @param copyTimeout    {@code COORDINATOR_COPY_TIMEOUT}: deadline for one copy
+ * @param repairPassRetention {@code COORDINATOR_REPAIR_PASS_RETENTION}: how long
+ *                       repair_passes rows are kept
  */
 @ConfigurationProperties("coordinator")
 public record CoordinatorProperties(
@@ -30,12 +41,21 @@ public record CoordinatorProperties(
         @DefaultValue("6s") Duration suspectAfter,
         @DefaultValue("15s") Duration deadAfter,
         @DefaultValue("2") int recoveryBeats,
-        @DefaultValue("1s") Duration livenessSweep) {
+        @DefaultValue("1s") Duration livenessSweep,
+        @DefaultValue("30s") Duration repairGrace,
+        @DefaultValue("10s") Duration repairInterval,
+        @DefaultValue("8") int repairMaxInflight,
+        @DefaultValue("2") int repairMaxPerNode,
+        @DefaultValue("30s") Duration copyTimeout,
+        @DefaultValue("24h") Duration repairPassRetention) {
 
     public CoordinatorProperties {
         if (suspectAfter.isNegative() || suspectAfter.isZero() || deadAfter.compareTo(suspectAfter) <= 0) {
             throw new IllegalStateException(
                     "need 0 < COORDINATOR_SUSPECT_AFTER (%s) < COORDINATOR_DEAD_AFTER (%s)".formatted(suspectAfter, deadAfter));
+        }
+        if (repairMaxInflight < 1 || repairMaxPerNode < 1) {
+            throw new IllegalStateException("COORDINATOR_REPAIR_MAX_INFLIGHT and _MAX_PER_NODE must be >= 1");
         }
         if (recoveryBeats < 1) {
             throw new IllegalStateException("COORDINATOR_RECOVERY_BEATS must be >= 1, got " + recoveryBeats);

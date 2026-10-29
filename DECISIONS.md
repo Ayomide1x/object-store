@@ -747,3 +747,132 @@ Every script that starts services, a node or the coordinator and then puts calls
 The heartbeat test's cleanup waits for `Run` with a bound, so H3 fails the test instead of hanging the run.
 **Because:** each liveness rule is shown to be load-bearing.
 **Breaks if:** code edits stop patches from applying. The scripts fail at `git apply --check`.
+
+## What counts as under-replicated; UNKNOWN pauses repair (stage 7)
+**Chose:** a chunk's counted replicas are its HEALTHY rows on nodes that are ALIVE, SUSPECT, or DEAD for less than the repair grace period. BAD rows never count. A chunk with fewer than 3 is under-replicated. A chunk born with 2 replicas (while only 2 nodes were ALIVE) counts 2 and is topped up once a third ALIVE node without a row exists. **While any node is UNKNOWN, a pass does nothing**: the state hasn't been rebuilt after a restart (stage 6: never act on UNKNOWN), and the pass is recorded with `skipped_reason`. A chunk with no HEALTHY replica on an ALIVE node can't be repaired; it's logged at error every pass. Mutations P1 (DEAD counts as healthy) and P4 (act on UNKNOWN).
+**Over:** counting SUSPECT replicas as missing (a blip would start copies).
+**Because:** repair should respond to real loss, not to noise or to state that isn't known yet.
+**Breaks if:** a node is SUSPECT for a long time (flapping without going DEAD). Its replicas keep counting.
+
+## Repair waits a grace period after DEAD (stage 7)
+**Amends:** "Liveness lives in memory and is persisted for observability and stage 7; what stage 7 can rely on" (stage 6). Repair uses the tracker's monotonic "DEAD since" (`deadForNanos`).
+**Chose:** `COORDINATOR_REPAIR_GRACE`, default 30 s beyond DEAD, so 45 s of silence in total. After a coordinator restart "DEAD since" restarts from zero, which delays repair, never hastens it. Measured: with node2 stopped, A and B were back to 3 HEALTHY replicas 46 s after node2 went DEAD. Mutation P7 (no grace).
+**Over:** repairing as soon as a node is DEAD (a `docker compose restart` would copy everything the node held).
+**Because:** short outages shouldn't cause copy storms.
+**Breaks if:** outages are long and frequent. Repair then always waits out the grace, with data at reduced redundancy meanwhile.
+
+## Only current COMMITTED objects are repaired (stage 7)
+**Chose:** the reconciler covers chunks of COMMITTED objects that a key currently points to. Superseded versions and PENDING objects are never repaired. Test: `supersededAndPendingObjectsAreNotRepaired`.
+**Over:** repairing every COMMITTED object (copies spent on data that stage 8 deletes).
+**Because:** in-flight reads of a superseded version finish within minutes, and a failed one can retry and get the current version.
+**Breaks if:** readers hold superseded chunk lists for a long time while nodes fail.
+
+## A periodic reconciler, with event hints and priority (stage 7)
+**Chose:** a pass every `COORDINATOR_REPAIR_INTERVAL` (10 s) is the source of truth. Hints start a pass early, debounced to at most one extra pass a second: a replica marked BAD, a commit that recorded fewer than 3 replicas, a node becoming ALIVE. They're Spring events, which also avoids a dependency cycle with `ReplicaHealthService`. Work is ordered by counted replicas, fewest first, then object age, then `chunk_id`. Correctness never depends on a hint arriving. Measured: a BAD replica was repaired 1 s after being marked; a born-with-2 object 2 s after its nodes returned.
+**Over:** events only (a missed event becomes a permanent gap); a scan only (repair waits up to a full interval).
+**Because:** the scan guarantees repair happens; hints make it prompt.
+**Breaks if:** the scan gets expensive. Each pass reads every current chunk and its rows, which is fine at this scale.
+
+## Copies are pushed source to target through WriteChunk; the PushChunk RPC (stage 7)
+**Amends:** "Client fan-out writes; per-replica writer in a shared package" (stage 4). The reuse that entry planned for stage 7 is realized here.
+**Chose:** the coordinator calls `PushChunk(chunk_id, expected_sha256, target_node_id, target_address)` on a source.
+1. The source reads its copy through `store.Read`, holding a read slot (so `NODE_MAX_CONCURRENT_READS` bounds it). That checks the magic, the chunk ID and the data hash.
+2. It checks the hash equals the coordinator's record; otherwise `DATA_LOSS` (invariant 5).
+3. It streams to the target's `internal_addr` with `internal/chunkwrite`, into the target's **unchanged `WriteChunk`**: frame rules, trailer hash, temp → fsync → link (no-replace) → dir fsync.
+
+Problems with the source's own copy are status errors (`DATA_LOSS`, `NOT_FOUND`, `RESOURCE_EXHAUSTED`). What happened at the target is the outcome: `COPIED`, `TARGET_HAS_CHUNK` or `TARGET_FAILED`. Deadline: `COORDINATOR_COPY_TIMEOUT` (30 s). If the coordinator's connection drops, gRPC cancels the source's handler and the target aborts its temp file. Tests: `TestPushChunk` (verified copy, corrupt or mismatched or missing source, target already has the chunk, identity), the unreachable-target and read-slot tests. Mutations Q1 (ignore the expected hash) and Q2 (no `node_id`).
+**Over:** the target pulling from the source (a second write path on the node).
+**Because:** the copy goes through the most-tested write code there is, and the coordinator never carries bytes (invariant 6).
+**Breaks if:** bandwidth between nodes needs throttling. There's none; only the concurrency caps bound it.
+
+## A repaired replica is recorded only after the target's own StatChunks (stage 7)
+**Extends:** "Node responses must identify the responding node" (stage 4).
+**Chose:** after `COPIED` or `TARGET_HAS_CHUNK`, the coordinator asks the **target** for the chunk with `StatChunks`, applying the identity rule.
+- FOUND with the planned size and the recorded SHA-256 → insert a HEALTHY row (`origin = 'repair'`, or `'repair-found'` after `TARGET_HAS_CHUNK`).
+- BAD_HEADER, or FOUND with another size or hash → insert a BAD row.
+- MISSING or no answer → record nothing.
+
+The push's answer comes from the source, so it's never enough by itself. Mutation P2 (record on `COPIED`), caught by a source that says `COPIED` while the target holds nothing.
+**Over:** recording on the push outcome.
+**Because:** invariant 3: facts about the target come only from the target.
+**Breaks if:** never in correctness terms. It costs one extra RPC per copy.
+
+## Target selection; resolving ALREADY_EXISTS; recording what repair finds (stage 7)
+**Amends:** "No retry and no re-placement within an upload; orphaned bytes are left for stages 7 and 8" (stage 4), "Bad files stay on disk until stages 7 and 8; no quarantine" (stage 5), and "Replica state on chunk_replicas; BAD is terminal" (stage 5).
+**Chose:** a target is an ALIVE node with **no row of any state** for the chunk; a BAD row's file still blocks the no-replace link until stage 8. Among those, the least busy in this pass, then by `node_id`. **`TARGET_HAS_CHUNK` is never retried as a copy.** The target's own `StatChunks` decides:
+- a valid file becomes a `repair-found` HEALTHY row (for example a copy that finished as the coordinator restarted, or an upload's orphaned replica);
+- an invalid file becomes a **BAD row inserted directly**, with no HEALTHY history (reason "invalid file found during repair", `origin = 'repair'`). Later passes then skip that node for the chunk, and stage 8 can find the file.
+
+Mutations P3 (target a BAD-row node) and P8 (push again on `TARGET_HAS_CHUNK`). The P3 and P5 tests use layouts where `node_id` tie-breaking alone can't hide the mutation.
+**Over:** retrying `ALREADY_EXISTS` (it never succeeds while the file is there); ignoring found files (valid copies wasted, invalid ones targeted forever).
+**Because:** every outcome ends in a recorded fact, so the next pass doesn't repeat it.
+**Breaks if:** a node holds a valid file whose chunk ID is reused. It can't be: IDs are never reused (invariant 4).
+
+## Source selection; a source's DATA_LOSS goes through the stage 5 confirmation path (stage 7)
+**Chose:** sources are HEALTHY rows on ALIVE nodes, least busy first, at most 3 attempts per copy.
+- **`DATA_LOSS` or `NOT_FOUND`** from a source → `ReplicaHealthService.reportBadReplica`: `VerifyChunk` on that source, marked BAD only if it confirms. Then the next source.
+- **`RESOURCE_EXHAUSTED`, `UNAVAILABLE` or a deadline** → the next source, no report.
+
+Never a BAD replica, never a non-ALIVE node. Test: `aSourceWithDataLossIsConfirmedAndMarkedAndTheNextSourceIsUsed`. Mutation P5 (copy from a BAD replica).
+**Over:** marking a source BAD on its own error (the rule is the same as for clients: the node must confirm).
+**Because:** a source that fails might simply be busy; one that's corrupt must be confirmed before it's marked.
+**Breaks if:** every source is busy for a whole pass. The chunk then waits for the next one.
+
+## Over-replication is left in place; no audit on return (stage 7)
+**Chose:** when a DEAD node returns, its old HEALTHY rows count again. Chunks repaired meanwhile then have 4 HEALTHY replicas, and they're left that way: nothing is deleted or marked. Measured: every chunk node2 held had 4 HEALTHY replicas after it returned, and none were BAD. A returning node's rows aren't checked either: that would be a block report, which CLAUDE.md puts out of scope (silent disk loss is detected only at read time). A lost replica is found by a read's `NOT_FOUND`, confirmed through stage 5, then repaired.
+**Over:** deleting the surplus now (destructive, on the data just repaired; stage 8 owns deletion); marking it for stage 8 (close to rebalancing, which is out of scope).
+**Because:** an extra copy costs disk, not correctness.
+**Breaks if:** a node returns with a wiped disk. Its rows overstate until reads find out, and that's the documented limit.
+
+## Concurrency caps; passes don't overlap; work is recomputed each pass (stage 7)
+**Chose:** at most `COORDINATOR_REPAIR_MAX_INFLIGHT` (8) copies cluster-wide and `COORDINATOR_REPAIR_MAX_PER_NODE` (2) per node, counting a node as source or target. **The caps bound copies in flight, not copies per pass:** a pass refills freed slots as copies finish, in priority order, and ends when nothing is in flight and nothing more fits. Passes never overlap: one scheduler thread, `runPass` is synchronized, and a pass waits for its copies, so each pass sees every earlier outcome. A pass right after a complete one starts no copies. There's no task table: each pass recomputes from Postgres and liveness (invariant 7). After a coordinator restart, in-flight copies are cancelled (the target aborts its temp), or have already linked a file without a row, which the next pass records as `repair-found` or works around.
+
+The first build applied the caps as a **per-pass budget**: with 3 live nodes and 2 slots each, only 3 copies fit per pass, so 24 chunks took about 80 s across eight passes. The stage 7 script exposed it. `copiesAreBoundedInFlightAndOnePassRepairsEverything` now requires one pass to repair every chunk within the caps. Mutations P6 (no bound) and P10 (per-pass budget).
+**Over:** a `repair_tasks` table (state to keep consistent, needed only for overlapping passes or multiple coordinators, both out of scope).
+**Because:** bounded and idempotent (invariant 8), with throughput limited only by the caps.
+**Breaks if:** a copy hangs: one stuck copy holds its pass open until the copy timeout. Measured: when node4 was killed mid-copy, the pass took 20.1 s, as 25 of its 29 copies failed with connection errors against the dead or restarting node; the next pass completed the repair in 0.2 s.
+
+## V6: replica origin and repair_passes, pruned by retention (stage 7)
+**Chose:**
+- `chunk_replicas.origin` is `'upload'`, `'repair'` or `'repair-found'`.
+- `repair_passes` holds one row per pass: start and end, skip reason, under-replicated count, copies started, rows recorded, found, BAD found, failures.
+- At the start of each pass, rows older than `COORDINATOR_REPAIR_PASS_RETENTION` (24 h) are deleted. Test: `oldRepairPassRowsArePrunedAndRecentOnesKept`. Mutation P9.
+
+**Over:** relying on logs (scripts would grep logs for pass outcomes).
+**Because:** acceptance checks and people can see exactly what each pass did.
+**Breaks if:** passes run far more often than every 10 s. The table is then bounded only by the retention period.
+
+## Earlier scripts compare upload-origin rows; the stage 7 acceptance script (stage 7)
+**Amends:** "Scripts are deterministic again under liveness" (stage 6).
+**Chose:** background repair only **adds** rows, so earlier exact-replica checks compare `origin = 'upload'` rows:
+- `stage4-replication-check.sh`: `check_replicas`, and the two "9 replica rows" counts;
+- `stage3-crash-check.sh`: the "node1 recorded from the killed chunk on" count;
+- `stage6-liveness-check.sh`: the three replica-set queries.
+
+`stage5-failover-check.sh` needed no change (its checks name specific chunk-and-node states).
+
+Separately, a bug in `stage4-replication-check.sh` step 4 (from stage 6) showed up in the stage 7 verification run: the per-cycle attempt counter restarted each cycle, so cycle 2 reused cycle 1's keys. A genuine failure branch then still resolved to cycle 1's success and went uncounted. Keys now include the cycle (`one-chunk-c<cycle>-<attempt>`); a scratch run forcing every attempt into cycle 2 counted all its failures correctly.
+
+`scripts/stage7-repair-check.sh` covers: a node lost, then repaired and verified on each volume; a repeat pass making no copies; the node returning (4 HEALTHY, none BAD); a BAD replica repaired onto another node; a chunk born with 2 topped up; a target killed mid-copy. For that last one the watcher uses `inotifyd` on node4's `/data/tmp` and SIGKILLs node4's process from a container in the Docker VM's PID namespace: a node-to-node copy of a 4 MiB chunk takes milliseconds, faster than `docker kill`, and the first attempt with the stage 3 `docker kill` watcher missed. The step still requires a temp file at the kill, otherwise it fails as "inconclusive, rerun". `check_chunk_files` lives in `scripts/lib/volume.sh`.
+**Because:** repair now runs in the background, and every check must stay deterministic.
+**Breaks if:** a new script asserts an exact replica set without filtering by origin.
+
+## Mutation scripts extended for stage 7 (stage 7)
+**Extends:** "Mutation scripts extended for stage 6" (stage 6).
+**Chose:**
+- **Coordinator:**
+  - P1 DEAD counts as healthy;
+  - P2 record without the target's confirmation;
+  - P3 target a node with a BAD row;
+  - P4 act on UNKNOWN;
+  - P5 copy from a BAD replica;
+  - P6 no concurrency bound;
+  - P7 no grace;
+  - P8 push again on `TARGET_HAS_CHUNK`;
+  - P9 no pruning;
+  - P10 caps as a per-pass budget.
+- **Go:** Q1 `PushChunk` ignores the expected hash; Q2 `PushChunk` response without `node_id`.
+
+The coordinator script now compiles each mutation first and reports `BUILD FAILED` instead of "detected", as the Go script does. A mutation that doesn't compile would otherwise fail every test and look caught. Patch M2 is regenerated against the changed `completeUpload`.
+**Because:** every repair rule is shown to be load-bearing, and a broken patch can't pass as one.
+**Breaks if:** code edits stop patches from applying. The scripts fail at `git apply --check`.

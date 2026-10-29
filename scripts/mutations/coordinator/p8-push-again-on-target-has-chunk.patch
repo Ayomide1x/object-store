@@ -1,0 +1,13 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -263,9 +263,7 @@
+                         return;
+                     }
+                     case OUTCOME_TARGET_HAS_CHUNK -> {
+-                        // Not retried as a copy: the target's own report decides.
+-                        confirm(chunk, target, "repair-found", n);
+-                        return;
++                        continue;
+                     }
+                     default -> {
+                         n.failures.incrementAndGet();

@@ -46,6 +46,7 @@ public class LivenessTracker {
 
     private static final class Life {
         State state = State.UNKNOWN;
+        long deadSince = -1; // monotonic nanos when the node last became DEAD
         long lastBeat = -1; // monotonic nanos of the last accepted beat; -1 = never
         int recoveryCount;
         String instance;
@@ -153,9 +154,25 @@ public class LivenessTracker {
                 out.add(new Transition(e.getKey(), life.state, next, silence));
                 life.state = next;
                 life.recoveryCount = 0;
+                if (next == State.DEAD) {
+                    life.deadSince = now;
+                }
             }
         }
         return out;
+    }
+
+    /**
+     * How long a node has been DEAD by this coordinator's clock, or -1 if it is
+     * not DEAD. After a coordinator restart this starts again from zero, which
+     * delays repair, never hastens it.
+     */
+    public synchronized long deadForNanos(String nodeId) {
+        Life life = nodes.get(nodeId);
+        if (life == null || life.state != State.DEAD || life.deadSince < 0) {
+            return -1;
+        }
+        return ticker.nanos() - life.deadSince;
     }
 
     public synchronized State stateOf(String nodeId) {

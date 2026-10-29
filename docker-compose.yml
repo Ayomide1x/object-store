@@ -66,6 +66,19 @@ services:
       COORDINATOR_RECOVERY_BEATS: "2"
       # How often timeouts are applied and transitions persisted to the nodes table:
       COORDINATOR_LIVENESS_SWEEP: 1s
+      # Re-replication. A replica stops counting once its node has been DEAD
+      # this long; then the reconciler copies the chunk node to node:
+      COORDINATOR_REPAIR_GRACE: 30s
+      # Time between reconciler passes (sooner on a hint: a replica marked BAD,
+      # a commit with fewer than 3 replicas, a node becoming ALIVE):
+      COORDINATOR_REPAIR_INTERVAL: 10s
+      # Copies at once, cluster-wide and per node (as source or target):
+      COORDINATOR_REPAIR_MAX_INFLIGHT: "8"
+      COORDINATOR_REPAIR_MAX_PER_NODE: "2"
+      # Deadline for one node-to-node copy:
+      COORDINATOR_COPY_TIMEOUT: 30s
+      # How long rows in the repair_passes table are kept:
+      COORDINATOR_REPAIR_PASS_RETENTION: 24h
     ports:
       - "127.0.0.1:9090:9090"
     # Healthy once the gRPC server accepts connections, which happens only after

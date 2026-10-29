@@ -40,6 +40,16 @@ expected_test() {
     l5-unknown-dead-too-early) echo "afterARestartANodeIsNeverDeadBeforeAFullWindow()" ;;
     l6-complete-asks-dead-nodes) echo "completeUploadDoesNotAskADeadNode()" ;;
     l7-conflicting-instance-accepted) echo "twoProcessesClaimingOneNodeAreRejectedUntilOneGoesQuiet()" ;;
+    p1-dead-replicas-count-as-healthy) echo "aDeadNodesReplicaIsCopiedFromAHealthySourceToAFreeNode()" ;;
+    p2-record-without-target-confirmation) echo "aFailedCopyRecordsNothing()" ;;
+    p3-target-node-with-bad-row) echo "aNodeWithABadRowIsNeverATarget()" ;;
+    p4-act-on-unknown) echo "aPassDoesNothingWhileAnyNodeIsUnknown()" ;;
+    p5-copy-from-bad-replica) echo "aBadReplicaIsNeverASource()" ;;
+    p6-no-concurrency-bound) echo "copiesAreBoundedInFlightAndOnePassRepairsEverything()" ;;
+    p7-no-repair-grace) echo "nothingIsCopiedWithinTheGracePeriod()" ;;
+    p8-push-again-on-target-has-chunk) echo "alreadyExistsWithAValidCopyIsRecordedNotRetried()" ;;
+    p9-no-pass-pruning) echo "oldRepairPassRowsArePrunedAndRecentOnesKept()" ;;
+    p10-caps-as-per-pass-budget) echo "copiesAreBoundedInFlightAndOnePassRepairsEverything()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }
@@ -79,6 +89,14 @@ for patch in scripts/mutations/coordinator/*.patch; do
   git apply --check "$patch"
   git apply "$patch"
   applied="$patch"
+  # A mutation that doesn't compile would fail every test and look detected.
+  if ! (cd coordinator && ./gradlew --no-daemon -q compileJava compileTestJava >/dev/null 2>&1); then
+    revert
+    echo "=== mutation $name"
+    echo "    BUILD FAILED: the mutation does not compile, so it proves nothing"
+    status=1
+    continue
+  fi
   run_tests
   revert
 

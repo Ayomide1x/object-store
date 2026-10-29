@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -114,7 +114,7 @@
+         Map<String, State> states = liveness.snapshot();
+         List<String> unknown = states.entrySet().stream().filter(e -> e.getValue() == State.UNKNOWN)
+                 .map(Map.Entry::getKey).toList();
+-        if (!unknown.isEmpty()) {
++        if (false) {
+             String reason = "nodes UNKNOWN: " + unknown;
+             repository.finishRepairPass(passId, reason, 0, 0, 0, 0, 0, 0);
+             log.atInfo().addKeyValue("pass_id", passId).log("repair pass skipped: {}", reason);
