@@ -1,0 +1,11 @@
+--- a/node/internal/server/server.go
++++ b/node/internal/server/server.go
+@@ -319,7 +319,7 @@
+ 	}
+ 	// Checked before anything is touched: a request meant for another node
+ 	// (the caller's address for it is stale) must not delete this node's files.
+-	if req.GetNodeId() != s.nodeID {
++	if false {
+ 		s.log.Error("delete refused: addressed to another node", "node_id", s.nodeID, "addressed_to", req.GetNodeId())
+ 		return nil, status.Errorf(codes.FailedPrecondition, "this is node %q, request is for node %q", s.nodeID, req.GetNodeId())
+ 	}

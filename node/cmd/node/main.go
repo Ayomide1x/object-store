@@ -70,15 +70,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	// Before listening: no write is in flight, so every temp file belongs to a
-	// write that died with a previous process.
-	removed, err := store.CleanTemps(ctx)
-	if err != nil {
+	if err := recoverStore(ctx, store, log); err != nil {
 		return err
-	}
-	for _, name := range removed {
-		log.Warn("removed stray temp file from interrupted write",
-			"chunk_id", chunkstore.ChunkIDFromTempName(name), "file", name)
 	}
 
 	lis, err := net.Listen("tcp", cfg.listenAddr)
@@ -130,6 +123,30 @@ func run(ctx context.Context, log *slog.Logger) error {
 		srv.GracefulStop()
 		return nil
 	}
+}
+
+// recoverStore cleans up after a previous process, before the node listens.
+// No write or delete is in flight then, so every temp file belongs to a write
+// that died, and a final file with a tombstone was left by a process that
+// died between linking it and noticing the tombstone (or between a delete's
+// tombstone and its unlink).
+func recoverStore(ctx context.Context, store *chunkstore.Store, log *slog.Logger) error {
+	removed, err := store.CleanTemps(ctx)
+	if err != nil {
+		return err
+	}
+	for _, name := range removed {
+		log.Warn("removed stray temp file from interrupted write",
+			"chunk_id", chunkstore.ChunkIDFromTempName(name), "file", name)
+	}
+	swept, err := store.SweepTombstoned(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range swept {
+		log.Warn("removed chunk file that has a tombstone (interrupted write or delete)", "chunk_id", id)
+	}
+	return nil
 }
 
 // checkHealth asks the local node's gRPC health service for its status.

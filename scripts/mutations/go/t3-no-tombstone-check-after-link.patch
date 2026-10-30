@@ -1,0 +1,11 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -299,7 +299,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	if deleted {
++	if false && deleted {
+ 		if err := w.store.ops.remove(final); err != nil && !errors.Is(err, os.ErrNotExist) {
+ 			return fmt.Errorf("remove chunk %s written after its deletion: %w", w.chunkID, err)
+ 		}

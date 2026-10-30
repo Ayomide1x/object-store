@@ -10,7 +10,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import com.google.protobuf.ByteString;
+import io.github.ayomide1x.objectstore.v1.ChunkDeletion;
+import io.github.ayomide1x.objectstore.v1.ChunkDeletionResult;
 import io.github.ayomide1x.objectstore.v1.ChunkStat;
+import io.github.ayomide1x.objectstore.v1.DeleteChunksRequest;
+import io.github.ayomide1x.objectstore.v1.DeleteChunksResponse;
 import io.github.ayomide1x.objectstore.v1.PushChunkRequest;
 import io.github.ayomide1x.objectstore.v1.PushChunkResponse;
 import io.github.ayomide1x.objectstore.v1.StatChunksRequest;
@@ -24,8 +28,8 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
 /**
- * Four in-process storage nodes answering StatChunks and VerifyChunk. Each
- * test decides what each node holds and how it behaves.
+ * Four in-process storage nodes answering StatChunks, VerifyChunk, PushChunk
+ * and DeleteChunks. Each test decides what each node holds and how it behaves.
  */
 final class FakeNodes {
 
@@ -43,6 +47,10 @@ final class FakeNodes {
 
     /** One PushChunk call, as observed. */
     record Push(String chunkId, String source, String target) {
+    }
+
+    /** One chunk in one DeleteChunks call, as observed. */
+    record Delete(String node, String chunkId, boolean tombstone) {
     }
 
     /** What a node holds for one chunk. */
@@ -64,6 +72,11 @@ final class FakeNodes {
         final Map<String, VerifyChunkResponse.State> verifyAs = new ConcurrentHashMap<>();
         final AtomicInteger verifyCalls = new AtomicInteger();
         volatile PushMode pushMode = PushMode.COPY;
+        /** Chunk IDs deleted with a tombstone: writes of them are refused, like a real node. */
+        final java.util.Set<String> tombstones = ConcurrentHashMap.newKeySet();
+        /** Chunk IDs DeleteChunks answers OUTCOME_UNSPECIFIED for, keeping the file. */
+        final java.util.Set<String> unclearFor = ConcurrentHashMap.newKeySet();
+        final AtomicInteger deleteCalls = new AtomicInteger();
         FakeNodes owner;
         Server server;
 
@@ -92,8 +105,54 @@ final class FakeNodes {
                 }
                 b.addStats(s);
             }
+            CountDownLatch gate = owner.statGate;
+            if (gate != null) {
+                // The answer is decided; hold it until the test lets it go.
+                owner.statReached.countDown();
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             response.onNext(b.build());
             response.onCompleted();
+        }
+
+        @Override
+        public void deleteChunks(DeleteChunksRequest request, StreamObserver<DeleteChunksResponse> response) {
+            deleteCalls.incrementAndGet();
+            if (failedByMode(response)) {
+                return;
+            }
+            owner.enterDelete(nodeId, request.getChunksCount());
+            try {
+                if (owner.deleteDelayMs > 0) {
+                    Thread.sleep(owner.deleteDelayMs);
+                }
+                DeleteChunksResponse.Builder b = DeleteChunksResponse.newBuilder().setNodeId(answerAs);
+                for (ChunkDeletion d : request.getChunksList()) {
+                    owner.deletes.add(new Delete(nodeId, d.getChunkId(), d.getTombstone()));
+                    if (unclearFor.contains(d.getChunkId())) {
+                        b.addResults(ChunkDeletionResult.newBuilder().setChunkId(d.getChunkId()));
+                        continue;
+                    }
+                    if (d.getTombstone()) {
+                        tombstones.add(d.getChunkId());
+                    }
+                    boolean had = held.remove(d.getChunkId()) != null;
+                    b.addResults(ChunkDeletionResult.newBuilder().setChunkId(d.getChunkId())
+                            .setOutcome(had ? ChunkDeletionResult.Outcome.OUTCOME_DELETED
+                                    : ChunkDeletionResult.Outcome.OUTCOME_ALREADY_ABSENT));
+                }
+                response.onNext(b.build());
+                response.onCompleted();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                response.onError(Status.CANCELLED.asRuntimeException());
+            } finally {
+                owner.leaveDelete(nodeId);
+            }
         }
 
         @Override
@@ -129,8 +188,14 @@ final class FakeNodes {
                     case LIE -> b.setOutcome(PushChunkResponse.Outcome.OUTCOME_COPIED);
                     case COPY -> {
                         Held h = held.get(request.getChunkId());
-                        owner.get(request.getTargetNodeId()).held.put(request.getChunkId(), h);
-                        b.setOutcome(PushChunkResponse.Outcome.OUTCOME_COPIED);
+                        FakeNode target = owner.get(request.getTargetNodeId());
+                        if (target.tombstones.contains(request.getChunkId())) {
+                            b.setOutcome(PushChunkResponse.Outcome.OUTCOME_TARGET_FAILED)
+                                    .setDetail("fake: target refuses a tombstoned chunk");
+                        } else {
+                            target.held.put(request.getChunkId(), h);
+                            b.setOutcome(PushChunkResponse.Outcome.OUTCOME_COPIED);
+                        }
                     }
                 }
                 response.onNext(b.build());
@@ -173,6 +238,41 @@ final class FakeNodes {
     }
 
     private final List<FakeNode> nodes = new ArrayList<>();
+
+    /** Every chunk in every DeleteChunks call that answered, in order of arrival. */
+    final List<Delete> deletes = new java.util.concurrent.CopyOnWriteArrayList<>();
+    volatile long deleteDelayMs;
+    /** When set, every StatChunks answer waits on it, after counting down statReached. */
+    volatile CountDownLatch statGate;
+    volatile CountDownLatch statReached = new CountDownLatch(0);
+    private final Map<String, Integer> deletesInFlight = new java.util.HashMap<>();
+    private int deleteCallsInFlight;
+    private int maxDeleteCallsInFlight;
+    private int maxDeleteCallsOnANode;
+    private int maxDeleteBatch;
+
+    synchronized void enterDelete(String node, int batch) {
+        maxDeleteCallsInFlight = Math.max(maxDeleteCallsInFlight, ++deleteCallsInFlight);
+        maxDeleteCallsOnANode = Math.max(maxDeleteCallsOnANode, deletesInFlight.merge(node, 1, Integer::sum));
+        maxDeleteBatch = Math.max(maxDeleteBatch, batch);
+    }
+
+    synchronized void leaveDelete(String node) {
+        deleteCallsInFlight--;
+        deletesInFlight.merge(node, -1, Integer::sum);
+    }
+
+    synchronized int maxDeleteCallsInFlight() {
+        return maxDeleteCallsInFlight;
+    }
+
+    synchronized int maxDeleteCallsOnANode() {
+        return maxDeleteCallsOnANode;
+    }
+
+    synchronized int maxDeleteBatch() {
+        return maxDeleteBatch;
+    }
 
     /** Every PushChunk call, in order of arrival. */
     final List<Push> pushes = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -233,11 +333,24 @@ final class FakeNodes {
     void reset() {
         pushes.clear();
         pushDelayMs = 0;
+        deletes.clear();
+        deleteDelayMs = 0;
+        CountDownLatch gate = statGate;
+        statGate = null;
+        if (gate != null) {
+            gate.countDown();
+        }
+        statReached = new CountDownLatch(0);
         synchronized (this) {
             inFlight = 0;
             maxInFlight = 0;
             perNode.clear();
             maxPerNode.clear();
+            deletesInFlight.clear();
+            deleteCallsInFlight = 0;
+            maxDeleteCallsInFlight = 0;
+            maxDeleteCallsOnANode = 0;
+            maxDeleteBatch = 0;
         }
         for (FakeNode n : nodes) {
             n.held.clear();
@@ -247,6 +360,9 @@ final class FakeNodes {
             n.verifyAs.clear();
             n.verifyCalls.set(0);
             n.pushMode = PushMode.COPY;
+            n.tombstones.clear();
+            n.unclearFor.clear();
+            n.deleteCalls.set(0);
             n.release.countDown();
             n.release = new CountDownLatch(1);
         }

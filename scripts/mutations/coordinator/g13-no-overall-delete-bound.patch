@@ -1,0 +1,18 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -301,7 +301,6 @@
+                     for (List<DeletionTask> tasks : e.getValue()) {
+                         pool.submit(() -> {
+                             mine.acquireUninterruptibly();
+-                            overall.acquireUninterruptibly();
+                             try {
+                                 deleteOn(node, tasks, d, failed);
+                             } catch (RuntimeException ex) {
+@@ -309,7 +308,6 @@
+                                 d.failures.incrementAndGet();
+                                 log.atError().addKeyValue("node_id", node.nodeId()).log("delete batch failed", ex);
+                             } finally {
+-                                overall.release();
+                                 mine.release();
+                             }
+                         });

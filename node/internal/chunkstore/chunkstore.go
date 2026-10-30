@@ -2,8 +2,10 @@
 //
 // Layout under the data directory (one filesystem, so link() works):
 //
-//	chunks/<chunk_id>   final, immutable chunk files
-//	tmp/                in-progress writes, emptied at startup
+//	chunks/<chunk_id>      final, immutable chunk files
+//	tmp/                   in-progress writes, emptied at startup
+//	tombstones/<chunk_id>  empty files: chunk IDs deleted for good, never
+//	                       written again
 //
 // A chunk file is self-describing: a 56-byte header, then the data.
 //
@@ -14,6 +16,10 @@
 //
 // A file becomes visible under its final name only after its hash matched and
 // it was fsynced, and the final step never replaces an existing chunk.
+//
+// Deleting a chunk removes its final name; it never modifies the file, so a
+// read that already opened it finishes. A deletion with a tombstone also
+// makes the ID unwritable, so a late write can't leave a file nobody tracks.
 package chunkstore
 
 import (
@@ -36,14 +42,15 @@ const (
 	// HeaderSize is the size of the header at the start of every chunk file.
 	HeaderSize = 56
 
-	magic       = "OSCHUNK1"
-	tempPrefix  = "chunk-"
-	idOffset    = 8
-	hashOffset  = 24
-	idLength    = 16
-	hashLength  = sha256.Size
-	chunksDir   = "chunks"
-	tempDirName = "tmp"
+	magic         = "OSCHUNK1"
+	tempPrefix    = "chunk-"
+	idOffset      = 8
+	hashOffset    = 24
+	idLength      = 16
+	hashLength    = sha256.Size
+	chunksDir     = "chunks"
+	tempDirName   = "tmp"
+	tombstonesDir = "tombstones"
 )
 
 var (
@@ -58,6 +65,8 @@ var (
 	ErrChecksumMismatch = errors.New("checksum mismatch")
 	// ErrCorrupt is returned by Read when a stored chunk fails verification.
 	ErrCorrupt = errors.New("chunk failed verification")
+	// ErrDeleted is returned when writing a chunk ID that has a tombstone.
+	ErrDeleted = errors.New("chunk deleted")
 )
 
 // ops are the filesystem calls that make a write durable and visible. They
@@ -80,19 +89,21 @@ func defaultOps() ops {
 
 // Store is a directory of chunk files.
 type Store struct {
-	chunks string
-	tmp    string
-	ops    ops
+	chunks     string
+	tmp        string
+	tombstones string
+	ops        ops
 }
 
 // New creates the chunk and temp directories under dataDir if needed.
 func New(dataDir string) (*Store, error) {
 	s := &Store{
-		chunks: filepath.Join(dataDir, chunksDir),
-		tmp:    filepath.Join(dataDir, tempDirName),
-		ops:    defaultOps(),
+		chunks:     filepath.Join(dataDir, chunksDir),
+		tmp:        filepath.Join(dataDir, tempDirName),
+		tombstones: filepath.Join(dataDir, tombstonesDir),
+		ops:        defaultOps(),
 	}
-	for _, dir := range []string{s.chunks, s.tmp} {
+	for _, dir := range []string{s.chunks, s.tmp, s.tombstones} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create %s: %w", dir, err)
 		}
@@ -166,13 +177,23 @@ type Writer struct {
 	written int64
 }
 
-// NewWriter starts a write of chunkID into a new temp file.
+// NewWriter starts a write of chunkID into a new temp file. A chunk ID with a
+// tombstone is refused with ErrDeleted. That is only a fast path: Commit
+// checks again after the final link, which is what closes the race with a
+// concurrent Delete.
 func (s *Store) NewWriter(ctx context.Context, chunkID string) (*Writer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if _, err := s.path(chunkID); err != nil {
 		return nil, err
+	}
+	deleted, err := s.tombstoned(chunkID)
+	if err != nil {
+		return nil, err
+	}
+	if deleted {
+		return nil, fmt.Errorf("write chunk %s: %w", chunkID, ErrDeleted)
 	}
 	idBytes, err := uuidBytes(chunkID)
 	if err != nil {
@@ -218,10 +239,18 @@ func (w *Writer) TempPath() string { return w.file.Name() }
 //  3. link the temp file to the final name; link fails if the name exists, so
 //     an existing chunk is never replaced (ErrExists)
 //  4. fsync the chunks directory, so the new name survives a crash
-//  5. unlink the temp name
+//  5. if the chunk ID now has a tombstone, a Delete ran concurrently: remove
+//     the new final name, fsync the directory, and fail with ErrDeleted
+//  6. unlink the temp name
 //
 // On any error the temp file is removed and nothing exists under the final
-// name that this call created.
+// name that this call created, except after a failure to fsync the directory
+// in step 4 (the file is then valid and stays).
+//
+// Step 5 is what makes a delete and a write that interleave always end with
+// no file. Delete makes its tombstone durable before it unlinks. So either
+// this check sees the tombstone and removes the file, or the tombstone came
+// after this check, and so after the link, and Delete's unlink removes it.
 func (w *Writer) Commit(ctx context.Context, want []byte) (err error) {
 	defer func() {
 		if err != nil {
@@ -265,6 +294,19 @@ func (w *Writer) Commit(ctx context.Context, want []byte) (err error) {
 	// could race with a reader.
 	if err := w.store.ops.syncDir(w.store.chunks); err != nil {
 		return fmt.Errorf("sync chunks dir after chunk %s: %w", w.chunkID, err)
+	}
+	deleted, err := w.store.tombstoned(w.chunkID)
+	if err != nil {
+		return err
+	}
+	if deleted {
+		if err := w.store.ops.remove(final); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove chunk %s written after its deletion: %w", w.chunkID, err)
+		}
+		if err := w.store.ops.syncDir(w.store.chunks); err != nil {
+			return err
+		}
+		return fmt.Errorf("chunk %s was deleted during the write: %w", w.chunkID, ErrDeleted)
 	}
 	if err := w.store.ops.remove(w.file.Name()); err != nil {
 		return fmt.Errorf("unlink temp of chunk %s: %w", w.chunkID, err)
@@ -333,7 +375,8 @@ func (s *Store) Read(ctx context.Context, chunkID string) ([]byte, error) {
 }
 
 // Stat reports the data size and stored SHA-256 of a chunk, reading only its
-// header. A file exists under a final name only after its hash was verified
+// header. A chunk with a tombstone is ErrNotFound, even in the moment between
+// a racing write's link and its removal. A file exists under a final name only after its hash was verified
 // and it was fsynced (see Commit), so a valid header naming chunkID is proof
 // of a durable, verified write. Data corruption since then is caught by Read.
 // Returns ErrNotFound if there is no file, ErrCorrupt if the header is invalid
@@ -349,6 +392,13 @@ func (s *Store) Stat(ctx context.Context, chunkID string) (size int64, sum []byt
 	idBytes, err := uuidBytes(chunkID)
 	if err != nil {
 		return 0, nil, err
+	}
+	deleted, err := s.tombstoned(chunkID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if deleted {
+		return 0, nil, fmt.Errorf("stat chunk %s: tombstoned: %w", chunkID, ErrNotFound)
 	}
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -376,6 +426,121 @@ func (s *Store) Stat(ctx context.Context, chunkID string) (size int64, sum []byt
 		return 0, nil, fmt.Errorf("chunk %s: header names chunk %x: %w", chunkID, header[idOffset:hashOffset], ErrCorrupt)
 	}
 	return info.Size() - HeaderSize, header[hashOffset:HeaderSize], nil
+}
+
+// Deletion is one chunk to remove.
+type Deletion struct {
+	ChunkID string
+	// Tombstone makes the chunk ID unwritable from now on.
+	Tombstone bool
+}
+
+// Delete removes the final file of each chunk and reports, per chunk, whether
+// a file was there (false means it was already absent, which is not an
+// error). Every ID is validated before anything changes. In order:
+//
+//  1. create the tombstones that were asked for, then fsync the tombstones
+//     directory, so they are durable before any file goes
+//  2. unlink each chunk's final name
+//  3. fsync the chunks directory, so the removals survive a crash
+//
+// A file is never modified, only unlinked: a reader that already opened it
+// keeps reading the same bytes until it closes it.
+func (s *Store) Delete(ctx context.Context, deletions []Deletion) ([]bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, d := range deletions {
+		if _, err := s.path(d.ChunkID); err != nil {
+			return nil, err
+		}
+	}
+
+	tombstoned := false
+	for _, d := range deletions {
+		if !d.Tombstone {
+			continue
+		}
+		f, err := os.OpenFile(filepath.Join(s.tombstones, d.ChunkID), os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("create tombstone for chunk %s: %w", d.ChunkID, err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("close tombstone for chunk %s: %w", d.ChunkID, err)
+		}
+		tombstoned = true
+	}
+	if tombstoned {
+		if err := s.ops.syncDir(s.tombstones); err != nil {
+			return nil, err
+		}
+	}
+
+	removed := make([]bool, len(deletions))
+	for i, d := range deletions {
+		path, _ := s.path(d.ChunkID) // validated above
+		err := s.ops.remove(path)
+		switch {
+		case err == nil:
+			removed[i] = true
+		case errors.Is(err, os.ErrNotExist):
+			// Already gone: deleting is idempotent.
+		default:
+			return nil, fmt.Errorf("remove chunk %s: %w", d.ChunkID, err)
+		}
+	}
+	if err := s.ops.syncDir(s.chunks); err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
+// SweepTombstoned removes every final chunk file that has a tombstone and
+// returns their chunk IDs. It must run before the node accepts writes, like
+// CleanTemps: such a file can exist only if the process died between a racing
+// write's link and its tombstone check (Commit step 5), or between a Delete's
+// tombstone and its unlink.
+func (s *Store) SweepTombstoned(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.tombstones)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", s.tombstones, err)
+	}
+	var removed []string
+	for _, e := range entries {
+		path, err := s.path(e.Name())
+		if err != nil {
+			continue // not a tombstone this store wrote
+		}
+		err = s.ops.remove(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return removed, fmt.Errorf("remove tombstoned chunk %s: %w", e.Name(), err)
+		}
+		removed = append(removed, e.Name())
+	}
+	if len(removed) > 0 {
+		if err := s.ops.syncDir(s.chunks); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
+// tombstoned reports whether chunkID has a tombstone.
+func (s *Store) tombstoned(chunkID string) (bool, error) {
+	_, err := os.Stat(filepath.Join(s.tombstones, chunkID))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check tombstone of chunk %s: %w", chunkID, err)
+	}
+	return true, nil
 }
 
 // path maps a chunk ID to its final file. Rejecting anything but a canonical

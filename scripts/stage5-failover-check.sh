@@ -21,7 +21,8 @@
 #      the two are BAD, the third HEALTHY.
 #   6. Corrupt all 3: get fails loudly naming each replica, no output file; all
 #      three are then BAD, and the next get fails at GetObject with DATA_LOSS.
-# Every flipped byte is flipped back at the end (BAD marks stay: BAD is terminal).
+# Every flipped byte is flipped back at the end (BAD marks stay: BAD is terminal),
+# unless stage 8 GC has deleted that BAD file by then (unflip checks the byte).
 #
 # Usage: scripts/stage5-failover-check.sh
 # Needs the Compose stack up and bin/osctl built (make build).
@@ -41,14 +42,12 @@ deadline=10
 offset=$((56 + 1000000)) # past the 56-byte header, inside chunk data
 export OSCTL_READ_ORDER=listed OSCTL_CHUNK_READ_TIMEOUT="${deadline}s"
 
-flipped="$work/flipped" # "node chunk" per byte currently flipped
+flipped="$work/flipped" # "node chunk offset flipped_value" per flipped byte
 : > "$flipped"
 restore() {
   "${compose[@]}" unpause node1 node2 node3 node4 >/dev/null 2>&1 || true
   "${compose[@]}" up -d --wait >/dev/null 2>&1 || true
-  while read -r node chunk; do
-    [[ -n "$node" ]] && flip_byte "$node" "$chunk" "$offset" >/dev/null
-  done <"$flipped"
+  restore_flipped "$flipped" >/dev/null
   rm -rf "$work"
 }
 trap restore EXIT
@@ -59,12 +58,15 @@ ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -c "$1"; }
 now() { python3 -c 'import time; print(time.time())'; }
 mkfile_mib() { head -c $(($2 << 20)) /dev/urandom > "$work/$1"; }
-corrupt() { flip_byte "$1" "$2" "$offset" | sed 's/^/     /'; echo "$1 $2" >> "$flipped"; }
+corrupt() { corrupt_byte "$1" "$2" "$offset" "$flipped" | sed 's/^/     /'; }
 
 chunk_of() { sql "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = '$1' AND c.chunk_index = $2"; }
 replicas_of() { sql "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$1' ORDER BY node_id"; }
 state_of() { sql "SELECT state || coalesce(' (' || bad_reason || ')', '') FROM chunk_replicas WHERE chunk_id = '$1' AND node_id = '$2'"; }
-bad_count() { sql "SELECT count(*) FROM chunk_replicas WHERE state = 'BAD'"; }
+# bad_count KEY: BAD replicas of KEY's object. Scoped to the step's own object:
+# since stage 8, GC deletes earlier steps' BAD rows after the read grace.
+bad_count() { sql "SELECT count(*) FROM keys k JOIN chunks c USING (object_id) JOIN chunk_replicas r USING (chunk_id)
+                   WHERE k.key = '$1' AND r.state = 'BAD'"; }
 node_state() { sql "SELECT state FROM nodes WHERE node_id = '$1'"; }
 # still_alive NODE: the precondition for steps 3 and 4.
 still_alive() {
@@ -130,14 +132,14 @@ mkfile_mib s3 10
 osctl_run put "$work/s3" "failover/three-$run"
 c0="$(chunk_of "failover/three-$run" 0)"
 first="$(replicas_of "$c0" | head -1)"
-before="$(bad_count)"
+before="$(bad_count "failover/three-$run")"
 echo "   chunk 0 read first from $first; stopping it"
 "${compose[@]}" stop "$first" >/dev/null 2>&1
 still_alive "$first"
 get_identical "failover/three-$run" "$work/s3" "$work/get3.log"
 grep -q "failing over.*node_id=$first\|node_id=$first.*failing over" "$work/get3.log" \
   && ok "the get failed over from the stopped node $first" || fail "no failover from $first in the log"
-[[ "$(bad_count)" == "$before" ]] && ok "nothing marked BAD (a stopped node is not a bad replica)" \
+[[ "$(bad_count "failover/three-$run")" == "$before" ]] && ok "nothing marked BAD (a stopped node is not a bad replica)" \
   || fail "a replica was marked BAD"
 grep -q "bad replica reported" "$work/get3.log" && fail "a report was sent for a stopped node" || ok "no report sent"
 "${compose[@]}" up -d --wait "$first" >/dev/null 2>&1
@@ -150,7 +152,7 @@ osctl_run put "$work/s4" "failover/four-$run"
 c0="$(chunk_of "failover/four-$run" 0)"
 first="$(replicas_of "$c0" | head -1)"
 t0="$(now)"; osctl_run get "failover/four-$run" "$work/out4"; baseline="$(python3 -c "print(round($(now) - $t0, 2))")"
-before="$(bad_count)"
+before="$(bad_count "failover/four-$run")"
 echo "   chunk 0 read first from $first; baseline get ${baseline}s; pausing it"
 "${compose[@]}" pause "$first" >/dev/null
 still_alive "$first"
@@ -161,7 +163,7 @@ limit="$(python3 -c "print(round($deadline + $baseline + 5, 2))")"
 echo "   get took ${elapsed}s (limit ${limit}s = ${deadline}s deadline + ${baseline}s baseline + 5s)"
 python3 -c "import sys; sys.exit(0 if $elapsed < $limit else 1)" && ok "finished within the read deadline" \
   || fail "took longer than the limit"
-[[ "$(bad_count)" == "$before" ]] && ok "nothing marked BAD" || fail "a replica was marked BAD"
+[[ "$(bad_count "failover/four-$run")" == "$before" ]] && ok "nothing marked BAD" || fail "a replica was marked BAD"
 grep -q "failing over.*node_id=$first\|node_id=$first.*failing over" "$work/get4.log" \
   && ok "the get failed over from the paused node $first after its read deadline" \
   || fail "no failover from $first in the log"
@@ -194,7 +196,7 @@ for n in $all; do corrupt "$n" "$c1"; done
 if "$osctl" get "failover/six-$run" "$work/out6" 2>"$work/get6.log"; then
   fail "get succeeded with every replica corrupt"
 else
-  err="$(grep -v ' level=INFO ' "$work/get6.log" | grep 'osctl:' | tail -1)"
+  err="$({ grep -v ' level=INFO ' "$work/get6.log" | grep 'osctl:' || true; } | tail -1)"
   echo "     ${err:0:300}"
   missing=""
   for n in $all; do grep -q "$n: rpc error: code = DataLoss" <<<"$err" || missing="$missing $n"; done
@@ -210,6 +212,11 @@ else
   grep -q "code = DataLoss.*no healthy replicas" "$work/get6b.log" \
     && ok "the next get fails at GetObject: DataLoss, no healthy replicas" || fail "the next get failed differently"
 fi
+
+echo
+echo "restoring the flipped bytes, then checking every touched file:"
+restore_flipped "$flipped"
+check_touched "$flipped" || status=1
 
 echo
 if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi

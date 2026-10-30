@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -225,7 +225,7 @@
+      * the last copies; repair tops the chunk up elsewhere first.
+      */
+     private int scheduleBadReplicas(OffsetDateTime now, Map<String, State> states) {
+-        OffsetDateTime cutoff = now.minus(properties.gcReadGrace());
++        OffsetDateTime cutoff = now.plusSeconds(1);
+         long graceNanos = properties.repairGrace().toNanos();
+         int n = 0;
+         for (BadReplica b : repository.badReplicaCandidates(cutoff, properties.gcBatch())) {

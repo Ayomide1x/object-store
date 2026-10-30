@@ -5,6 +5,15 @@ import java.util.UUID;
 import java.util.function.Supplier;
 
 import io.github.ayomide1x.objectstore.v1.ChunkInfo;
+import io.github.ayomide1x.objectstore.v1.ChunkStatus;
+import io.github.ayomide1x.objectstore.v1.DeleteObjectRequest;
+import io.github.ayomide1x.objectstore.v1.DeleteObjectResponse;
+import io.github.ayomide1x.objectstore.v1.ListObjectsRequest;
+import io.github.ayomide1x.objectstore.v1.ListObjectsResponse;
+import io.github.ayomide1x.objectstore.v1.ObjectSummary;
+import io.github.ayomide1x.objectstore.v1.ReplicaStatus;
+import io.github.ayomide1x.objectstore.v1.StatObjectRequest;
+import io.github.ayomide1x.objectstore.v1.StatObjectResponse;
 import io.github.ayomide1x.objectstore.v1.ChunkPlacement;
 import io.github.ayomide1x.objectstore.v1.CompleteUploadRequest;
 import io.github.ayomide1x.objectstore.v1.CompleteUploadResponse;
@@ -123,6 +132,52 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                     request.getReason().name(), request.getDetail());
             return ReportBadReplicaResponse.newBuilder().setVerdict(verdict).build();
         });
+    }
+
+    @Override
+    public void deleteObject(DeleteObjectRequest request, StreamObserver<DeleteObjectResponse> response) {
+        respond(response, () -> DeleteObjectResponse.newBuilder()
+                .setObjectId(metadata.deleteObject(request.getKey()).toString()).build());
+    }
+
+    @Override
+    public void listObjects(ListObjectsRequest request, StreamObserver<ListObjectsResponse> response) {
+        respond(response, () -> {
+            ListObjectsResponse.Builder b = ListObjectsResponse.newBuilder();
+            for (MetadataRepository.ObjectSummary o : metadata.listObjects(request.getPrefix())) {
+                b.addObjects(ObjectSummary.newBuilder().setKey(o.key()).setObjectId(o.objectId().toString())
+                        .setSizeBytes(o.sizeBytes()).setCommittedAtUnixMillis(millis(o.committedAt())));
+            }
+            return b.build();
+        });
+    }
+
+    @Override
+    public void statObject(StatObjectRequest request, StreamObserver<StatObjectResponse> response) {
+        respond(response, () -> {
+            MetadataRepository.ObjectDetail obj = metadata.statObject(request.getKey())
+                    .orElseThrow(() -> new RequestException(Status.Code.NOT_FOUND,
+                            "key '%s' not found".formatted(request.getKey())));
+            StatObjectResponse.Builder b = StatObjectResponse.newBuilder().setObjectId(obj.objectId().toString())
+                    .setSizeBytes(obj.sizeBytes()).setCommittedAtUnixMillis(millis(obj.committedAt()));
+            for (MetadataRepository.ChunkDetail c : obj.chunks()) {
+                ChunkStatus.Builder cb = ChunkStatus.newBuilder().setChunkId(c.chunkId().toString())
+                        .setIndex(c.index()).setSizeBytes(c.sizeBytes())
+                        .setSha256(c.sha256() == null ? ByteString.EMPTY : ByteString.copyFrom(c.sha256()));
+                for (MetadataRepository.ReplicaDetail r : c.replicas()) {
+                    cb.addReplicas(ReplicaStatus.newBuilder().setNodeId(r.nodeId())
+                            .setState(r.state().equals("BAD") ? ReplicaStatus.State.STATE_BAD : ReplicaStatus.State.STATE_HEALTHY)
+                            .setOrigin(r.origin()).setBadReason(r.badReason() == null ? "" : r.badReason())
+                            .setLiveness(toProto(liveness.stateOf(r.nodeId()))));
+                }
+                b.addChunks(cb);
+            }
+            return b.build();
+        });
+    }
+
+    private static long millis(java.time.OffsetDateTime t) {
+        return t == null ? 0 : t.toInstant().toEpochMilli();
     }
 
     /** Runs a unary handler and translates exceptions into gRPC statuses. */

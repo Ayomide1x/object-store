@@ -1,0 +1,11 @@
+--- a/node/internal/server/server.go
++++ b/node/internal/server/server.go
+@@ -336,7 +336,7 @@
+ 		return nil, status.Errorf(codes.Internal, "delete chunks: %v", err)
+ 	}
+ 
+-	resp := &objectstorev1.DeleteChunksResponse{NodeId: s.nodeID}
++	resp := &objectstorev1.DeleteChunksResponse{}
+ 	for i, d := range deletions {
+ 		outcome := objectstorev1.ChunkDeletionResult_OUTCOME_ALREADY_ABSENT
+ 		if removed[i] {

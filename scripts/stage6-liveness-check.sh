@@ -74,7 +74,7 @@ echo "3. a new upload with node2 DEAD"
 mkfile_mib y 10
 osctl_run put "$work/y" "liveness/y-$run"
 objy="$(latest_object "liveness/y-$run")"
-[[ "$(sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$objy' AND p.node_id = 'node2'")" == 0 ]] \
+[[ "$(sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$objy' AND p.node_id = 'node2' AND p.origin = 'initiate'")" == 0 ]] \
   && ok "nothing placed on node2" || fail "a chunk was placed on node2"
 bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_replicas r ON r.chunk_id = c.chunk_id AND r.origin = 'upload'
             WHERE c.object_id = '$objy' GROUP BY c.chunk_id

@@ -1,5 +1,8 @@
 package io.github.ayomide1x.objectstore.coordinator;
 
+import java.time.Clock;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -42,14 +45,16 @@ public class MetadataService {
     private final TransactionTemplate tx;
     private final LivenessTracker liveness;
     private final ApplicationEventPublisher events;
+    private final Clock clock;
 
     public MetadataService(MetadataRepository repository, NodeClient nodeClient, TransactionTemplate tx,
-            LivenessTracker liveness, ApplicationEventPublisher events) {
+            LivenessTracker liveness, ApplicationEventPublisher events, Clock clock) {
         this.repository = repository;
         this.nodeClient = nodeClient;
         this.tx = tx;
         this.liveness = liveness;
         this.events = events;
+        this.clock = clock;
     }
 
     /** One chunk of an upload plan, with the nodes the client must write it to. */
@@ -98,7 +103,7 @@ public class MetadataService {
         int start = nodes.isEmpty() ? 0 : ThreadLocalRandom.current().nextInt(nodes.size());
 
         UUID objectId = UUID.randomUUID();
-        repository.insertPendingObject(objectId, key, sizeBytes);
+        repository.insertPendingObject(objectId, key, sizeBytes, now());
 
         List<ChunkPlacement> chunks = new ArrayList<>();
         for (int index = 0; index < count; index++) {
@@ -133,15 +138,16 @@ public class MetadataService {
      *
      * The client's own claims about which nodes acknowledged are not used:
      * metadata records only what nodes report (invariant 3). Completing an
-     * already COMMITTED object is a successful no-op, so a client may retry
-     * after a lost response.
+     * object that did commit (COMMITTED, or since SUPERSEDED or DELETED) is a
+     * successful no-op, so a client may retry after a lost response. An
+     * ABANDONED upload fails with FAILED_PRECONDITION: garbage collection
+     * retired it under the same row lock phase 3 takes, so it can never commit.
      */
     public void completeUpload(UUID objectId, String key, long sizeBytes, List<CompletedChunk> chunks) {
         ObjectRow object = repository.findObject(objectId)
                 .orElseThrow(() -> new RequestException(Status.Code.NOT_FOUND,
                         "object %s not found".formatted(objectId)));
-        if (object.status() == MetadataRepository.Status.COMMITTED) {
-            log.atInfo().addKeyValue("object_id", objectId).log("complete of committed object is a no-op");
+        if (alreadyDecided(object)) {
             return;
         }
         // proto3 cannot tell an absent int64 from 0, so both must always match.
@@ -163,12 +169,37 @@ public class MetadataService {
         }
     }
 
+    /**
+     * True if the upload's outcome is already decided and the complete is a
+     * no-op: it committed (and may since have been superseded or deleted).
+     * Throws FAILED_PRECONDITION if it was abandoned. False while PENDING.
+     */
+    private static boolean alreadyDecided(ObjectRow object) {
+        switch (object.status()) {
+            case PENDING -> {
+                return false;
+            }
+            case COMMITTED, SUPERSEDED, DELETED -> {
+                log.atInfo().addKeyValue("object_id", object.objectId()).addKeyValue("status", object.status())
+                        .log("complete of an object that committed is a no-op");
+                return true;
+            }
+            case ABANDONED -> throw new RequestException(Status.Code.FAILED_PRECONDITION,
+                    "upload %s was abandoned: PENDING longer than the pending timeout; its chunks are being deleted"
+                            .formatted(object.objectId()));
+        }
+        throw new IllegalStateException("unknown status " + object.status());
+    }
+
     /** Phase 3. Runs inside a transaction. */
     private void commitVerified(UUID objectId, List<CompletedChunk> chunks, Map<UUID, List<String>> verified) {
-        ObjectRow object = repository.lockObject(objectId).orElseThrow();
-        if (object.status() == MetadataRepository.Status.COMMITTED) {
-            // A concurrent complete of the same upload committed first.
-            log.atInfo().addKeyValue("object_id", objectId).log("complete of committed object is a no-op");
+        // The row was there at phase 1, as PENDING. Only GC removes object rows,
+        // and only retired ones: gone now means abandoned and already collected.
+        ObjectRow object = repository.lockObject(objectId).orElseThrow(() -> new RequestException(
+                Status.Code.FAILED_PRECONDITION, "upload %s was abandoned and its chunks deleted".formatted(objectId)));
+        // A concurrent complete of the same upload may have committed first,
+        // or garbage collection abandoned it while phase 2 ran.
+        if (alreadyDecided(object)) {
             return;
         }
         for (CompletedChunk chunk : chunks) {
@@ -306,6 +337,43 @@ public class MetadataService {
             }
         }
         return obj;
+    }
+
+    /**
+     * Removes a key: in one transaction the keys row is deleted and the object
+     * it pointed to becomes DELETED. The files stay until garbage collection,
+     * after the read grace. Deleting the keys row first is the only order the
+     * composite foreign key allows. It takes the keys row lock, so rm and a
+     * concurrent overwrite of the same key serialize, and the last to commit
+     * wins. A key that doesn't resolve: NOT_FOUND.
+     */
+    @Transactional
+    public UUID deleteObject(String key) {
+        requireKey(key);
+        UUID objectId = repository.deleteKey(key)
+                .orElseThrow(() -> new RequestException(Status.Code.NOT_FOUND, "key '%s' not found".formatted(key)));
+        if (repository.retire(objectId, MetadataRepository.Status.COMMITTED, MetadataRepository.Status.DELETED,
+                now()) != 1) {
+            throw new IllegalStateException("key '%s' pointed to object %s, which is not COMMITTED".formatted(key, objectId));
+        }
+        log.atInfo().addKeyValue("object_id", objectId).addKeyValue("key", key)
+                .log("key removed; object DELETED, files kept until garbage collection");
+        return objectId;
+    }
+
+    @Transactional(readOnly = true)
+    public List<MetadataRepository.ObjectSummary> listObjects(String prefix) {
+        return repository.listKeys(prefix == null ? "" : prefix);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<MetadataRepository.ObjectDetail> statObject(String key) {
+        requireKey(key);
+        return repository.objectDetailByKey(key);
+    }
+
+    private OffsetDateTime now() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
     }
 
     static int chunkCount(long sizeBytes) {

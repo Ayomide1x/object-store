@@ -81,6 +81,10 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 	}
 
 	w, err := s.store.NewWriter(ctx, header.GetChunkId())
+	if errors.Is(err, chunkstore.ErrDeleted) {
+		log.Warn("write rejected: chunk deleted")
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
 	if err != nil {
 		log.Error("start chunk write", "error", err)
 		return status.Error(codes.Internal, err.Error())
@@ -103,6 +107,9 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 	case errors.Is(err, chunkstore.ErrExists):
 		log.Warn("write rejected: chunk exists at link")
 		return status.Error(codes.AlreadyExists, err.Error())
+	case errors.Is(err, chunkstore.ErrDeleted):
+		log.Warn("write undone: chunk deleted during the write", "error", err)
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case err != nil:
 		log.Error("commit chunk", "error", err)
 		return status.Error(codes.Internal, err.Error())
@@ -295,6 +302,50 @@ func (s *Server) PushChunk(ctx context.Context, req *objectstorev1.PushChunkRequ
 		resp.Detail = err.Error()
 	}
 	log.Info("chunk pushed", "outcome", resp.GetOutcome().String(), "bytes", len(data), "detail", resp.GetDetail())
+	return resp, nil
+}
+
+// maxDeleteBatch caps one DeleteChunks request, like maxStatBatch.
+const maxDeleteBatch = 4096
+
+// DeleteChunks removes chunk files for the coordinator's garbage collection.
+// A chunk with no file counts as removed (ALREADY_ABSENT), so a retry after a
+// lost response is harmless. Tombstones are made durable before any file is
+// unlinked. The response carries this node's ID: the coordinator removes its
+// records of this node's copies only on this node's own word.
+func (s *Server) DeleteChunks(ctx context.Context, req *objectstorev1.DeleteChunksRequest) (*objectstorev1.DeleteChunksResponse, error) {
+	if len(req.GetChunks()) > maxDeleteBatch {
+		return nil, status.Errorf(codes.InvalidArgument, "%d chunks exceeds the batch limit of %d", len(req.GetChunks()), maxDeleteBatch)
+	}
+	// Checked before anything is touched: a request meant for another node
+	// (the caller's address for it is stale) must not delete this node's files.
+	if req.GetNodeId() != s.nodeID {
+		s.log.Error("delete refused: addressed to another node", "node_id", s.nodeID, "addressed_to", req.GetNodeId())
+		return nil, status.Errorf(codes.FailedPrecondition, "this is node %q, request is for node %q", s.nodeID, req.GetNodeId())
+	}
+	deletions := make([]chunkstore.Deletion, 0, len(req.GetChunks()))
+	for _, c := range req.GetChunks() {
+		deletions = append(deletions, chunkstore.Deletion{ChunkID: c.GetChunkId(), Tombstone: c.GetTombstone()})
+	}
+	removed, err := s.store.Delete(ctx, deletions)
+	switch {
+	case errors.Is(err, chunkstore.ErrInvalidID):
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	case err != nil:
+		s.log.Error("delete chunks", "node_id", s.nodeID, "error", err)
+		return nil, status.Errorf(codes.Internal, "delete chunks: %v", err)
+	}
+
+	resp := &objectstorev1.DeleteChunksResponse{NodeId: s.nodeID}
+	for i, d := range deletions {
+		outcome := objectstorev1.ChunkDeletionResult_OUTCOME_ALREADY_ABSENT
+		if removed[i] {
+			outcome = objectstorev1.ChunkDeletionResult_OUTCOME_DELETED
+		}
+		s.log.Info("chunk deleted", "node_id", s.nodeID, "chunk_id", d.ChunkID,
+			"tombstone", d.Tombstone, "outcome", outcome.String())
+		resp.Results = append(resp.Results, &objectstorev1.ChunkDeletionResult{ChunkId: d.ChunkID, Outcome: outcome})
+	}
 	return resp, nil
 }
 

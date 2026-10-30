@@ -1,6 +1,8 @@
 package io.github.ayomide1x.objectstore.coordinator;
 
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -14,8 +16,18 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class MetadataRepository {
 
-    /** Object lifecycle states, matching the CHECK constraint on objects.status. */
-    public enum Status { PENDING, COMMITTED }
+    /**
+     * Object lifecycle states, matching the CHECK constraint on objects.status.
+     * SUPERSEDED, DELETED and ABANDONED are retired: no key points to them, ever
+     * again, and garbage collection deletes their files.
+     */
+    public enum Status {
+        PENDING, COMMITTED, SUPERSEDED, DELETED, ABANDONED;
+
+        boolean retired() {
+            return this == SUPERSEDED || this == DELETED || this == ABANDONED;
+        }
+    }
 
     /** An objects row, without its chunks. */
     public record ObjectRow(UUID objectId, String key, long sizeBytes, Status status) {
@@ -85,6 +97,33 @@ public class MetadataRepository {
             }
         }
         return List.copyOf(out.values());
+    }
+
+    /**
+     * Locks an object row in share mode for the rest of the transaction and
+     * reports whether it is current: COMMITTED and pointed to by a key. Repair
+     * calls this before recording a placement or a replica. Retiring an object
+     * (rm, or GC finding it superseded) updates the row, so it waits for this
+     * lock, and a lock taken after it sees the new status. A placement or row
+     * recorded under the lock is therefore always visible to GC's task creation.
+     */
+    public boolean lockIfCurrent(UUID objectId) {
+        return jdbc.sql("""
+                SELECT 1 FROM objects o
+                WHERE o.object_id = :id AND o.status = 'COMMITTED'
+                  AND EXISTS (SELECT 1 FROM keys k WHERE k.object_id = o.object_id)
+                FOR SHARE OF o
+                """)
+                .param("id", objectId).query(Integer.class).optional().isPresent();
+    }
+
+    /** Records that repair is about to copy a chunk to nodeId. Returns rows inserted. */
+    public int insertRepairPlacement(UUID chunkId, String nodeId) {
+        return jdbc.sql("""
+                INSERT INTO chunk_placements (chunk_id, node_id, origin) VALUES (:chunkId, :nodeId, 'repair')
+                ON CONFLICT (chunk_id, node_id) DO NOTHING
+                """)
+                .param("chunkId", chunkId).param("nodeId", nodeId).update();
     }
 
     /** Records a replica repair confirmed on the target. Returns rows inserted (0 if one already existed). */
@@ -160,14 +199,16 @@ public class MetadataRepository {
                 .list();
     }
 
-    public void insertPendingObject(UUID objectId, String key, long sizeBytes) {
+    /** createdAt comes from the coordinator's clock: the pending timeout is measured on it. */
+    public void insertPendingObject(UUID objectId, String key, long sizeBytes, OffsetDateTime createdAt) {
         jdbc.sql("""
-                INSERT INTO objects (object_id, key, size_bytes, status)
-                VALUES (:objectId, :key, :sizeBytes, 'PENDING')
+                INSERT INTO objects (object_id, key, size_bytes, status, created_at)
+                VALUES (:objectId, :key, :sizeBytes, 'PENDING', :createdAt)
                 """)
                 .param("objectId", objectId)
                 .param("key", key)
                 .param("sizeBytes", sizeBytes)
+                .param("createdAt", createdAt)
                 .update();
     }
 
@@ -224,7 +265,7 @@ public class MetadataRepository {
         List<Row> rows = jdbc.sql("""
                 SELECT c.chunk_id, c.chunk_index, c.size_bytes, p.node_id
                 FROM chunks c
-                LEFT JOIN chunk_placements p ON p.chunk_id = c.chunk_id
+                LEFT JOIN chunk_placements p ON p.chunk_id = c.chunk_id AND p.origin = 'initiate'
                 WHERE c.object_id = :id
                 ORDER BY c.chunk_index, p.node_id
                 """)
@@ -313,6 +354,305 @@ public class MetadataRepository {
                 .param("chunkId", chunkId)
                 .param("sha256", sha256)
                 .update();
+    }
+
+    /** Removes a key, returning the object it pointed to. Locks the keys row first. */
+    public Optional<UUID> deleteKey(String key) {
+        return jdbc.sql("DELETE FROM keys WHERE key = :key RETURNING object_id")
+                .param("key", key).query(UUID.class).optional();
+    }
+
+    public boolean isPointedTo(UUID objectId) {
+        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM keys WHERE object_id = :id)")
+                .param("id", objectId).query(Boolean.class).single();
+    }
+
+    /** Moves an object from one status to a retired one. Returns rows changed (0 if it wasn't in {@code from}). */
+    public int retire(UUID objectId, Status from, Status to, OffsetDateTime now) {
+        return jdbc.sql("""
+                UPDATE objects SET status = :to, retired_at = :now
+                WHERE object_id = :id AND status = :from
+                """)
+                .param("to", to.name()).param("now", now).param("id", objectId).param("from", from.name())
+                .update();
+    }
+
+    /** One key as listed by ls. */
+    public record ObjectSummary(String key, UUID objectId, long sizeBytes, OffsetDateTime committedAt) {
+    }
+
+    /** Keys that currently resolve, starting with prefix, in key order. */
+    public List<ObjectSummary> listKeys(String prefix) {
+        return jdbc.sql("""
+                SELECT k.key, o.object_id, o.size_bytes, o.committed_at
+                FROM keys k JOIN objects o ON o.object_id = k.object_id
+                WHERE starts_with(k.key, :prefix)
+                ORDER BY k.key
+                """)
+                .param("prefix", prefix)
+                .query((rs, i) -> new ObjectSummary(rs.getString("key"), rs.getObject("object_id", UUID.class),
+                        rs.getLong("size_bytes"), rs.getObject("committed_at", OffsetDateTime.class)))
+                .list();
+    }
+
+    /** A replica row of any state, as stat shows it. */
+    public record ReplicaDetail(String nodeId, String state, String origin, String badReason) {
+    }
+
+    public record ChunkDetail(UUID chunkId, int index, long sizeBytes, byte[] sha256, List<ReplicaDetail> replicas) {
+    }
+
+    public record ObjectDetail(UUID objectId, long sizeBytes, OffsetDateTime committedAt, List<ChunkDetail> chunks) {
+    }
+
+    /** The object a key resolves to, with every replica row of every chunk, in one statement. */
+    public Optional<ObjectDetail> objectDetailByKey(String key) {
+        record Row(UUID objectId, long objectSize, OffsetDateTime committedAt, UUID chunkId, int index, long size,
+                byte[] sha, String nodeId, String state, String origin, String badReason) {
+        }
+        List<Row> rows = jdbc.sql("""
+                SELECT o.object_id, o.size_bytes AS object_size, o.committed_at,
+                       c.chunk_id, c.chunk_index, c.size_bytes AS chunk_size, c.sha256,
+                       r.node_id, r.state, r.origin, r.bad_reason
+                FROM keys k
+                JOIN objects o ON o.object_id = k.object_id
+                LEFT JOIN chunks c ON c.object_id = o.object_id
+                LEFT JOIN chunk_replicas r ON r.chunk_id = c.chunk_id
+                WHERE k.key = :key
+                ORDER BY c.chunk_index, r.node_id
+                """)
+                .param("key", key)
+                .query((rs, i) -> new Row(rs.getObject("object_id", UUID.class), rs.getLong("object_size"),
+                        rs.getObject("committed_at", OffsetDateTime.class), rs.getObject("chunk_id", UUID.class),
+                        rs.getInt("chunk_index"), rs.getLong("chunk_size"), rs.getBytes("sha256"),
+                        rs.getString("node_id"), rs.getString("state"), rs.getString("origin"),
+                        rs.getString("bad_reason")))
+                .list();
+        if (rows.isEmpty()) {
+            return Optional.empty();
+        }
+        Map<UUID, ChunkDetail> chunks = new LinkedHashMap<>();
+        for (Row r : rows) {
+            if (r.chunkId() == null) {
+                continue;
+            }
+            ChunkDetail c = chunks.computeIfAbsent(r.chunkId(),
+                    id -> new ChunkDetail(id, r.index(), r.size(), r.sha(), new ArrayList<>()));
+            if (r.nodeId() != null) {
+                c.replicas().add(new ReplicaDetail(r.nodeId(), r.state(), r.origin(), r.badReason()));
+            }
+        }
+        Row first = rows.getFirst();
+        return Optional.of(new ObjectDetail(first.objectId(), first.objectSize(), first.committedAt(),
+                List.copyOf(chunks.values())));
+    }
+
+    // --- Garbage collection ---
+
+    /** PENDING objects initiated before cutoff, oldest first. Unlocked: callers re-check under the row lock. */
+    public List<UUID> abandonCandidates(OffsetDateTime cutoff, int limit) {
+        return jdbc.sql("""
+                SELECT object_id FROM objects WHERE status = 'PENDING' AND created_at < :cutoff
+                ORDER BY created_at LIMIT :limit
+                """)
+                .param("cutoff", cutoff).param("limit", limit).query(UUID.class).list();
+    }
+
+    /** Whether an object (locked by the caller) was initiated before cutoff. */
+    public boolean createdBefore(UUID objectId, OffsetDateTime cutoff) {
+        return jdbc.sql("SELECT created_at < :cutoff FROM objects WHERE object_id = :id")
+                .param("cutoff", cutoff).param("id", objectId).query(Boolean.class).single();
+    }
+
+    /** COMMITTED objects no key points to: superseded by an overwrite. Unlocked: callers re-check. */
+    public List<UUID> supersedeCandidates(int limit) {
+        return jdbc.sql("""
+                SELECT o.object_id FROM objects o
+                WHERE o.status = 'COMMITTED'
+                  AND NOT EXISTS (SELECT 1 FROM keys k WHERE k.object_id = o.object_id)
+                ORDER BY o.committed_at LIMIT :limit
+                """)
+                .param("limit", limit).query(UUID.class).list();
+    }
+
+    /**
+     * Retired objects whose files may now be deleted (ABANDONED at once, the
+     * others once retired before cutoff), and that still have a placement or
+     * replica row without a tombstone task: never scheduled, or something was
+     * recorded after scheduling. Running it again finds nothing new.
+     */
+    public List<UUID> scheduleCandidates(OffsetDateTime cutoff, int limit) {
+        return jdbc.sql("""
+                SELECT o.object_id FROM objects o
+                WHERE o.status IN ('SUPERSEDED', 'DELETED', 'ABANDONED')
+                  AND (o.status = 'ABANDONED' OR o.retired_at < :cutoff)
+                  AND (o.gc_started_at IS NULL OR EXISTS (
+                        SELECT 1 FROM chunks c
+                        JOIN (SELECT chunk_id, node_id FROM chunk_placements
+                              UNION SELECT chunk_id, node_id FROM chunk_replicas) f ON f.chunk_id = c.chunk_id
+                        WHERE c.object_id = o.object_id
+                          AND NOT EXISTS (SELECT 1 FROM pending_deletions d
+                                          WHERE d.chunk_id = f.chunk_id AND d.node_id = f.node_id AND d.tombstone)))
+                ORDER BY o.retired_at LIMIT :limit
+                """)
+                .param("cutoff", cutoff).param("limit", limit).query(UUID.class).list();
+    }
+
+    /**
+     * Creates a tombstone deletion task for every (chunk, node) where the
+     * object's files may be: every placement (upload plan and repair targets)
+     * and every replica row. A BAD-replica task for the same file is upgraded
+     * to a tombstone. Returns the tasks created or upgraded.
+     */
+    public int insertObjectDeletionTasks(UUID objectId, String reason) {
+        return jdbc.sql("""
+                INSERT INTO pending_deletions (chunk_id, node_id, tombstone, reason)
+                SELECT f.chunk_id, f.node_id, true, :reason
+                FROM chunks c
+                JOIN (SELECT chunk_id, node_id FROM chunk_placements
+                      UNION SELECT chunk_id, node_id FROM chunk_replicas) f ON f.chunk_id = c.chunk_id
+                WHERE c.object_id = :id
+                ON CONFLICT (chunk_id, node_id) DO UPDATE SET tombstone = true, reason = EXCLUDED.reason
+                WHERE NOT pending_deletions.tombstone
+                """)
+                .param("reason", reason).param("id", objectId).update();
+    }
+
+    public void markGcStarted(UUID objectId, OffsetDateTime now) {
+        jdbc.sql("UPDATE objects SET gc_started_at = coalesce(gc_started_at, :now) WHERE object_id = :id")
+                .param("now", now).param("id", objectId).update();
+    }
+
+    /** A BAD replica of a COMMITTED object, with the nodes holding HEALTHY rows of the same chunk. */
+    public record BadReplica(UUID chunkId, String nodeId, UUID objectId, List<String> healthyNodeIds) {
+    }
+
+    /** BAD replicas of COMMITTED objects marked before cutoff that have no deletion task yet. */
+    public List<BadReplica> badReplicaCandidates(OffsetDateTime cutoff, int limit) {
+        return jdbc.sql("""
+                SELECT b.chunk_id, b.node_id, c.object_id,
+                       ARRAY(SELECT h.node_id FROM chunk_replicas h
+                             WHERE h.chunk_id = b.chunk_id AND h.state = 'HEALTHY' ORDER BY h.node_id) AS healthy
+                FROM chunk_replicas b
+                JOIN chunks c ON c.chunk_id = b.chunk_id
+                JOIN objects o ON o.object_id = c.object_id
+                WHERE b.state = 'BAD' AND o.status = 'COMMITTED' AND b.marked_bad_at < :cutoff
+                  AND NOT EXISTS (SELECT 1 FROM pending_deletions d WHERE d.chunk_id = b.chunk_id AND d.node_id = b.node_id)
+                ORDER BY b.marked_bad_at LIMIT :limit
+                """)
+                .param("cutoff", cutoff).param("limit", limit)
+                .query((rs, i) -> new BadReplica(rs.getObject("chunk_id", UUID.class), rs.getString("node_id"),
+                        rs.getObject("object_id", UUID.class),
+                        Arrays.asList((String[]) rs.getArray("healthy").getArray())))
+                .list();
+    }
+
+    /** A deletion task for one BAD file, without a tombstone. Returns rows inserted. */
+    public int insertBadReplicaTask(UUID chunkId, String nodeId) {
+        return jdbc.sql("""
+                INSERT INTO pending_deletions (chunk_id, node_id, tombstone, reason)
+                VALUES (:chunkId, :nodeId, false, 'bad-replica')
+                ON CONFLICT (chunk_id, node_id) DO NOTHING
+                """)
+                .param("chunkId", chunkId).param("nodeId", nodeId).update();
+    }
+
+    /** One file to delete on one node. */
+    public record DeletionTask(UUID chunkId, String nodeId, boolean tombstone) {
+    }
+
+    /** Up to limit of a node's tasks, oldest first. */
+    public List<DeletionTask> deletionTasks(String nodeId, int limit) {
+        return jdbc.sql("""
+                SELECT chunk_id, node_id, tombstone FROM pending_deletions WHERE node_id = :node
+                ORDER BY created_at, chunk_id LIMIT :limit
+                """)
+                .param("node", nodeId).param("limit", limit)
+                .query((rs, i) -> new DeletionTask(rs.getObject("chunk_id", UUID.class), rs.getString("node_id"),
+                        rs.getBoolean("tombstone")))
+                .list();
+    }
+
+    /**
+     * Records that nodeId itself confirmed it no longer holds chunkId: removes
+     * the task, that node's replica row and that node's placement. Returns
+     * whether a task existed.
+     */
+    public boolean confirmDeleted(UUID chunkId, String nodeId) {
+        int tasks = jdbc.sql("DELETE FROM pending_deletions WHERE chunk_id = :c AND node_id = :n")
+                .param("c", chunkId).param("n", nodeId).update();
+        if (tasks == 0) {
+            return false;
+        }
+        jdbc.sql("DELETE FROM chunk_replicas WHERE chunk_id = :c AND node_id = :n")
+                .param("c", chunkId).param("n", nodeId).update();
+        jdbc.sql("DELETE FROM chunk_placements WHERE chunk_id = :c AND node_id = :n")
+                .param("c", chunkId).param("n", nodeId).update();
+        return true;
+    }
+
+    public void recordDeletionFailure(String nodeId, List<UUID> chunkIds, String error) {
+        jdbc.sql("""
+                UPDATE pending_deletions SET attempts = attempts + 1, last_error = :err
+                WHERE node_id = :n AND chunk_id IN (:ids)
+                """)
+                .param("err", error).param("n", nodeId).param("ids", chunkIds).update();
+    }
+
+    /** Retired objects whose files are all confirmed gone: no task, placement or replica row left. */
+    public List<UUID> finalizeCandidates(int limit) {
+        return jdbc.sql("""
+                SELECT o.object_id FROM objects o
+                WHERE o.status IN ('SUPERSEDED', 'DELETED', 'ABANDONED') AND o.gc_started_at IS NOT NULL
+                  AND NOT EXISTS (
+                        SELECT 1 FROM chunks c
+                        WHERE c.object_id = o.object_id
+                          AND (EXISTS (SELECT 1 FROM pending_deletions d WHERE d.chunk_id = c.chunk_id)
+                            OR EXISTS (SELECT 1 FROM chunk_placements p WHERE p.chunk_id = c.chunk_id)
+                            OR EXISTS (SELECT 1 FROM chunk_replicas r WHERE r.chunk_id = c.chunk_id)))
+                ORDER BY o.retired_at LIMIT :limit
+                """)
+                .param("limit", limit).query(UUID.class).list();
+    }
+
+    /** Whether any task, placement or replica row remains for an object's chunks. */
+    public boolean hasFilesLeft(UUID objectId) {
+        return jdbc.sql("""
+                SELECT EXISTS (
+                  SELECT 1 FROM chunks c WHERE c.object_id = :id
+                    AND (EXISTS (SELECT 1 FROM pending_deletions d WHERE d.chunk_id = c.chunk_id)
+                      OR EXISTS (SELECT 1 FROM chunk_placements p WHERE p.chunk_id = c.chunk_id)
+                      OR EXISTS (SELECT 1 FROM chunk_replicas r WHERE r.chunk_id = c.chunk_id)))
+                """)
+                .param("id", objectId).query(Boolean.class).single();
+    }
+
+    /** Deletes an object's chunks rows, then its objects row. */
+    public void removeObjectMetadata(UUID objectId) {
+        jdbc.sql("DELETE FROM chunks WHERE object_id = :id").param("id", objectId).update();
+        jdbc.sql("DELETE FROM objects WHERE object_id = :id").param("id", objectId).update();
+    }
+
+    public long startGcPass() {
+        return jdbc.sql("INSERT INTO gc_passes DEFAULT VALUES RETURNING pass_id").query(Long.class).single();
+    }
+
+    public void finishGcPass(long passId, String skipped, int abandoned, int superseded, int tasks, int deleted,
+            int absent, int failures, int removed) {
+        jdbc.sql("""
+                UPDATE gc_passes SET finished_at = clock_timestamp(), skipped_reason = :skipped,
+                  abandoned = :abandoned, superseded = :superseded, tasks_created = :tasks,
+                  files_deleted = :deleted, already_absent = :absent, failures = :failures, objects_removed = :removed
+                WHERE pass_id = :id
+                """)
+                .param("skipped", skipped).param("abandoned", abandoned).param("superseded", superseded)
+                .param("tasks", tasks).param("deleted", deleted).param("absent", absent).param("failures", failures)
+                .param("removed", removed).param("id", passId).update();
+    }
+
+    public int pruneGcPasses(java.time.Duration retention) {
+        return jdbc.sql("DELETE FROM gc_passes WHERE started_at < clock_timestamp() - make_interval(secs => :secs)")
+                .param("secs", (double) retention.toMillis() / 1000).update();
     }
 
     public void markCommitted(UUID objectId) {

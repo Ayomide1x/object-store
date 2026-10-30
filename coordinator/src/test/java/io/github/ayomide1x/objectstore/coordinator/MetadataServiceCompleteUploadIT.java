@@ -61,6 +61,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         "coordinator.node-rpc-timeout=" + MetadataServiceCompleteUploadIT.NODE_TIMEOUT_MS + "ms",
         "coordinator.liveness-sweep=0",
         "coordinator.repair-interval=0",
+        "coordinator.gc-interval=0",
 })
 class MetadataServiceCompleteUploadIT {
 
@@ -93,7 +94,7 @@ class MetadataServiceCompleteUploadIT {
     @BeforeEach
     void clearObjects() {
         // nodes stays: NodeRegistry seeded it at context startup.
-        jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
+        jdbc.sql("TRUNCATE keys, pending_deletions, chunk_replicas, chunk_placements, chunks, objects").update();
         nodes.reset();
         // Placement uses only ALIVE nodes; the sweeper is off, so they stay ALIVE.
         for (String n : List.of("node1", "node2", "node3", "node4")) {
@@ -173,7 +174,7 @@ class MetadataServiceCompleteUploadIT {
         assertThat(metadata.getObject("doc").orElseThrow().objectId()).isEqualTo(v2.objectId());
         assertThat(resolvedChunkIds("doc")).containsExactlyElementsOf(chunkIds(v2));
 
-        // The superseded object is left intact for stage 8 GC.
+        // The superseded object is left intact until a GC pass (off in this test).
         assertThat(statusOf(v1.objectId())).isEqualTo("COMMITTED");
         assertThat(count("SELECT count(*) FROM chunks WHERE object_id = :id", v1.objectId())).isEqualTo(2);
     }

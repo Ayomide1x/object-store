@@ -45,9 +45,7 @@ flipped="$work/flipped"
 restore() {
   docker rm -f "$watcher" >/dev/null 2>&1 || true
   "${compose[@]}" up -d --wait >/dev/null 2>&1 || true
-  while read -r node chunk; do
-    [[ -n "$node" ]] && flip_byte "$node" "$chunk" "$offset" >/dev/null
-  done <"$flipped"
+  restore_flipped "$flipped" >/dev/null
   rm -rf "$work"
 }
 trap restore EXIT
@@ -173,7 +171,7 @@ osctl_run put "$work/c" "repair/c-$run"
 c1="$(sql "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = 'repair/c-$run' AND c.chunk_index = 1")"
 first="$(sql "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$c1' ORDER BY node_id LIMIT 1")"
 echo "   corrupting chunk 1's replica on $first, then reading it first"
-flip_byte "$first" "$c1" "$offset" | sed 's/^/     /'; echo "$first $c1" >> "$flipped"
+corrupt_byte "$first" "$c1" "$offset" "$flipped" | sed 's/^/     /'
 OSCTL_READ_ORDER=listed osctl_run get "repair/c-$run" "$work/c.out" && cmp -s "$work/c" "$work/c.out" \
   && ok "get IDENTICAL (failed over)" || fail "get failed"
 [[ "$(sql "SELECT state FROM chunk_replicas WHERE chunk_id = '$c1' AND node_id = '$first'")" == BAD ]] \
@@ -248,6 +246,11 @@ fi
 "${compose[@]}" up -d --wait node1 >/dev/null 2>&1
 wait_alive 4 || fail "not all nodes ALIVE at the end"
 get_identical "repair/e-$run" "$work/e"
+
+echo
+echo "restoring the flipped bytes, then checking every touched file:"
+restore_flipped "$flipped"
+check_touched "$flipped" || status=1
 
 echo
 if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi

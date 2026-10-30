@@ -30,12 +30,10 @@ wait_alive 4
 work="$(mktemp -d)"
 offset=$((56 + 1000000)) # past the 56-byte header, inside the data
 
-flipped="$work/flipped" # "node chunk" per byte currently flipped
+flipped="$work/flipped" # "node chunk offset flipped_value" per flipped byte
 : > "$flipped"
 cleanup() {
-  while read -r node chunk; do
-    [[ -n "$node" ]] && flip_byte "$node" "$chunk" "$offset" >/dev/null
-  done <"$flipped"
+  restore_flipped "$flipped" >/dev/null
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -57,8 +55,7 @@ replicas="$(sql "SELECT node_id FROM chunk_replicas WHERE chunk_id = '$chunk' OR
 echo "flipping byte $offset of chunk $chunk (index 1 of $key1) on every replica: $replicas"
 for n in $replicas; do
   printf '  %s: ' "$n"
-  flip_byte "$n" "$chunk" "$offset"
-  echo "$n $chunk" >> "$flipped"
+  corrupt_byte "$n" "$chunk" "$offset" "$flipped"
 done
 
 echo
@@ -66,7 +63,7 @@ echo "get $key1 (every replica of chunk 1 corrupted):"
 if "$osctl" get "$key1" "$work/one.out" 2>"$work/get1.err"; then
   fail "get succeeded with every replica corrupt"
 else
-  err="$(grep -v ' level=INFO ' "$work/get1.err" | grep 'osctl:' | tail -1)"
+  err="$({ grep -v ' level=INFO ' "$work/get1.err" | grep 'osctl:' || true; } | tail -1)"
   echo "  ${err:0:200}..."
   missing=""
   for n in $replicas; do grep -q "$n: rpc error: code = DataLoss" <<<"$err" || missing="$missing $n"; done
@@ -99,11 +96,7 @@ done
 
 echo
 echo "restoring the flipped bytes:"
-while read -r node c; do
-  printf '  %s: ' "$node"
-  flip_byte "$node" "$c" "$offset"
-done <"$flipped"
-: > "$flipped"
+restore_flipped "$flipped"
 if "$osctl" get "$key1" "$work/one.out" 2>"$work/get1b.err"; then
   fail "get succeeded although every replica is marked BAD"
 elif grep -q "code = DataLoss.*no healthy replicas" "$work/get1b.err"; then
@@ -111,6 +104,11 @@ elif grep -q "code = DataLoss.*no healthy replicas" "$work/get1b.err"; then
 else
   fail "get failed differently: $(grep -v ' level=INFO ' "$work/get1b.err" | tail -1)"
 fi
+
+echo
+echo "restoring again (a no-op now), then checking every touched file:"
+restore_flipped "$flipped"
+check_touched "$flipped" || status=1
 
 echo
 if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi

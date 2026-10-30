@@ -1,0 +1,28 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -484,8 +484,8 @@
+     public List<UUID> scheduleCandidates(OffsetDateTime cutoff, int limit) {
+         return jdbc.sql("""
+                 SELECT o.object_id FROM objects o
+-                WHERE o.status IN ('SUPERSEDED', 'DELETED', 'ABANDONED')
+-                  AND (o.status = 'ABANDONED' OR o.retired_at < :cutoff)
++                WHERE NOT EXISTS (SELECT 1 FROM keys k WHERE k.object_id = o.object_id)
++                  AND (o.status = 'ABANDONED' OR coalesce(o.retired_at, o.created_at) < :cutoff)
+                   AND (o.gc_started_at IS NULL OR EXISTS (
+                         SELECT 1 FROM chunks c
+                         JOIN (SELECT chunk_id, node_id FROM chunk_placements
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -200,10 +200,10 @@
+         for (UUID id : repository.scheduleCandidates(cutoff, properties.gcBatch())) {
+             Integer created = tx.execute(status -> {
+                 ObjectRow o = repository.lockObject(id).orElse(null);
+-                if (o == null || !o.status().retired()) {
++                if (o == null) {
+                     return 0;
+                 }
+-                int c = repository.insertObjectDeletionTasks(id, o.status().name().toLowerCase());
++                int c = repository.insertObjectDeletionTasks(id, "superseded");
+                 repository.markGcStarted(id, now);
+                 return c;
+             });

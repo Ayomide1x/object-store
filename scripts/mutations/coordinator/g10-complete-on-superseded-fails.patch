@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -179,7 +179,8 @@
+             case PENDING -> {
+                 return false;
+             }
+-            case COMMITTED, SUPERSEDED, DELETED -> {
++            case SUPERSEDED -> throw new RequestException(Status.Code.FAILED_PRECONDITION, "superseded");
++            case COMMITTED, DELETED -> {
+                 log.atInfo().addKeyValue("object_id", object.objectId()).addKeyValue("status", object.status())
+                         .log("complete of an object that committed is a no-op");
+                 return true;

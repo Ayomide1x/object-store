@@ -1,0 +1,21 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -469,7 +469,6 @@
+         return jdbc.sql("""
+                 SELECT o.object_id FROM objects o
+                 WHERE o.status = 'COMMITTED'
+-                  AND NOT EXISTS (SELECT 1 FROM keys k WHERE k.object_id = o.object_id)
+                 ORDER BY o.committed_at LIMIT :limit
+                 """)
+                 .param("limit", limit).query(UUID.class).list();
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -180,7 +180,7 @@
+         for (UUID id : repository.supersedeCandidates(properties.gcBatch())) {
+             Boolean done = tx.execute(status -> {
+                 ObjectRow o = repository.lockObject(id).orElse(null);
+-                if (o == null || o.status() != Status.COMMITTED || repository.isPointedTo(id)) {
++                if (o == null || o.status() != Status.COMMITTED) {
+                     return false;
+                 }
+                 return repository.retire(id, Status.COMMITTED, Status.SUPERSEDED, now) == 1;

@@ -1,0 +1,10 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -157,7 +157,6 @@
+                 if (o == null || o.status() != Status.PENDING || !repository.createdBefore(id, cutoff)) {
+                     return false; // completed (or gone) since the candidate query
+                 }
+-                repository.retire(id, Status.PENDING, Status.ABANDONED, now);
+                 repository.insertObjectDeletionTasks(id, "abandoned");
+                 repository.markGcStarted(id, now);
+                 return true;

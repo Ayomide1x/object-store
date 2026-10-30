@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -342,8 +342,7 @@
+         boolean valid = s.getState() == ChunkStat.State.STATE_FOUND && s.getSizeBytes() == chunk.sizeBytes()
+                 && Arrays.equals(s.getSha256().toByteArray(), chunk.sha256());
+         if (valid) {
+-            Integer inserted = tx.execute(status -> repository.lockIfCurrent(chunk.objectId())
+-                    ? repository.insertRepairedReplica(chunk.chunkId(), target.nodeId(), origin) : -1);
++            Integer inserted = repository.insertRepairedReplica(chunk.chunkId(), target.nodeId(), origin);
+             if (inserted != null && inserted < 0) {
+                 logCtx.log("object no longer current; copy not recorded (GC deletes it through its placement)");
+             } else if (inserted != null && inserted > 0) {

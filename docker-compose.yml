@@ -79,6 +79,23 @@ services:
       COORDINATOR_COPY_TIMEOUT: 30s
       # How long rows in the repair_passes table are kept:
       COORDINATOR_REPAIR_PASS_RETENTION: 24h
+      # Garbage collection. Time between passes:
+      COORDINATOR_GC_INTERVAL: 10s
+      # DEMO VALUES: the next two are shortened so the acceptance scripts finish
+      # in minutes. Production should use the code defaults, 15m and 24h.
+      # How long a superseded or removed object's files (and a BAD replica's
+      # file) are kept, so a get that already holds the chunk list finishes:
+      COORDINATOR_GC_READ_GRACE: 60s
+      # How long an upload may stay PENDING before it is abandoned and its
+      # chunk files deleted; must exceed the longest legitimate upload:
+      COORDINATOR_GC_PENDING_TIMEOUT: 120s
+      # Objects retired or scheduled per pass step, and chunk IDs per DeleteChunks call:
+      COORDINATOR_GC_BATCH: "256"
+      # DeleteChunks calls at once, cluster-wide and per node:
+      COORDINATOR_GC_MAX_INFLIGHT: "4"
+      COORDINATOR_GC_MAX_PER_NODE: "1"
+      # How long rows in the gc_passes table are kept:
+      COORDINATOR_GC_PASS_RETENTION: 24h
     ports:
       - "127.0.0.1:9090:9090"
     # Healthy once the gRPC server accepts connections, which happens only after

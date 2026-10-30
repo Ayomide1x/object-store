@@ -1,0 +1,10 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -324,6 +324,7 @@
+         NodeClient.DeleteAnswer answer = nodeClient.deleteChunks(node, tasks);
+         List<UUID> ids = tasks.stream().map(DeletionTask::chunkId).toList();
+         if (answer.response() == null) {
++            ids.forEach(id -> repository.confirmDeleted(id, node.nodeId()));
+             failed.add(node.nodeId());
+             d.failures.incrementAndGet();
+             repository.recordDeletionFailure(node.nodeId(), ids, answer.error());

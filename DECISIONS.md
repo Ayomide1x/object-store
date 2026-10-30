@@ -876,3 +876,272 @@ Separately, a bug in `stage4-replication-check.sh` step 4 (from stage 6) showed 
 The coordinator script now compiles each mutation first and reports `BUILD FAILED` instead of "detected", as the Go script does. A mutation that doesn't compile would otherwise fail every test and look caught. Patch M2 is regenerated against the changed `completeUpload`.
 **Because:** every repair rule is shown to be load-bearing, and a broken patch can't pass as one.
 **Breaks if:** code edits stop patches from applying. The scripts fail at `git apply --check`.
+
+## What becomes garbage, and the two grace periods (stage 8)
+**Chose:** four kinds of garbage, each found from Postgres:
+
+| Garbage | Found as | Files deleted after |
+|---|---|---|
+| Object removed by `osctl rm` | `DELETED` (set by `rm` itself) | read grace after `retired_at` |
+| Superseded version | `COMMITTED` with no `keys` row → `SUPERSEDED` | read grace after `retired_at` |
+| Abandoned upload | `PENDING` older than the pending timeout → `ABANDONED` | at once |
+| BAD replica's file | BAD row on a `COMMITTED` object | read grace after `marked_bad_at`, and only with ≥ 2 counted HEALTHY replicas (see the BAD-file entry) |
+
+- **Read grace:** `COORDINATOR_GC_READ_GRACE`, code default 15 min. A reader still reading an old version after the grace gets `NOT_FOUND` from each node, so the get fails loudly. It never returns wrong data.
+- **Pending timeout:** `COORDINATOR_GC_PENDING_TIMEOUT`, code default 24 h. The longest legitimate upload, 5 GiB as 1,280 sequential chunks with 3× fan-out, can take hours on a slow link. A timeout that's too short fails a slow upload cleanly (next entry); it never corrupts anything.
+- **Compose sets demo values,** 60 s and 120 s, with a comment that production should use the code defaults. The acceptance script would otherwise take hours.
+
+**Over:** one value for both; no grace for superseded objects (in-flight readers break); deleting at overwrite or `rm` time.
+**Because:** readers that already hold a chunk list need the old files for a bounded time, and an upload in progress must be told apart from a dead one.
+**Breaks if:** a get runs longer than the read grace (it then fails), or a legitimate upload outlasts the pending timeout (it then fails at complete with `FAILED_PRECONDITION`).
+
+## Superseded objects are detected by GC and stamped then (stage 8)
+**Supersedes:** "Superseded objects are left fully intact until stage 8" (stage 2), the part that deferred deletion and the timestamp.
+**Chose:** each pass finds `COMMITTED` objects that no `keys` row points to. Under the object's row lock it re-checks both conditions, then sets `SUPERSEDED` and `retired_at` = now. The overwrite path doesn't change.
+**Over:** capturing the old object ID inside the key upsert (that needs a retry loop; stage 2's reason still holds).
+**Because:** a key is never re-pointed to an object it left, so "unreferenced and COMMITTED" stays true once it's true. Detection happens at or after the real supersede time, so the grace can only be longer than intended, never shorter. Mutations: G4 (no grace), G15 (supersede ignores keys).
+
+G15 is caught by `theCurrentVersionIsNeverDeleted`. The composite foreign key also refuses to move a still-referenced object out of `COMMITTED`, so the pass fails with an error rather than silently retiring a current object.
+**Breaks if:** a future feature re-points a key to an older object (undelete, versioning). That's out of scope.
+
+## Abandoned uploads: an atomic PENDING → ABANDONED under the row lock; a late complete fails (stage 8)
+**Amends:** "Object lifecycle: plan persisted at initiate, PENDING → COMMITTED" (stage 2) and "CompleteUpload is idempotent for an already COMMITTED object" (stage 2).
+**Chose:**
+- **GC side, in one transaction:** `SELECT … FOR UPDATE` on the object row; re-check that it's still PENDING and older than the timeout; set `ABANDONED` and `retired_at`; create its tombstone deletion tasks.
+- **`CompleteUpload` side:** phase 3 takes the same lock. Whichever commits first wins:
+  - the complete wins: GC then sees COMMITTED and skips it;
+  - GC wins: the complete finds `ABANDONED` and fails with `FAILED_PRECONDITION`. If GC has already removed the row, phase 3 finds none, and that is also `FAILED_PRECONDITION`: only GC deletes object rows, and only retired ones.
+- **A retried complete** of an object that did commit returns OK: `COMMITTED`, or since `SUPERSEDED` or `DELETED`. This is stage 2's retry rule, extended. It never moves a key back.
+- **Late chunk writes** from the still-running client hit the node's tombstone (later entry).
+
+Tests:
+- `aLateCompleteOfAnAbandonedUploadFailsAndNothingCommits`: the complete is held after phase 2, with every node's answer FOUND, while a GC pass runs. Mutation G3: GC deletes without the transition.
+- `aRetriedCompleteSucceedsForSupersededAndDeletedAndFailsForAbandoned`. Mutation G10: SUPERSEDED fails.
+
+**Over:** checking age and deleting without the lock (a late complete could commit an object whose files are gone); waiting for writes to drain (a live client can keep writing for hours).
+**Because:** invariant 2. An object whose chunks GC is deleting can never become COMMITTED.
+**Breaks if:** a client's clock-free retry loop keeps a 24 h+ upload going. It then fails at the end, after doing all the work.
+
+## Metadata first; durable deletion tasks; rows removed only on the node's own confirmation (stage 8)
+**Chose:**
+1. **Metadata first:** the object becomes unreachable (`DELETED`, `SUPERSEDED`, `ABANDONED`) in one transaction.
+2. **Tasks:** after the grace, `pending_deletions (chunk_id, node_id, tombstone, reason, attempts, last_error)` gets one row for every (chunk, node) in the object's placements or replica rows. This happens under the row lock, sets `gc_started_at`, and is idempotent.
+3. **Deletes:** tasks go to ALIVE nodes in `DeleteChunks` calls. For each chunk the node, answering as itself, reports `DELETED` or `ALREADY_ABSENT`; one transaction then removes the task, that node's replica row and that node's placement.
+   - A node that fails, misses the deadline or answers as another node keeps its rows and tasks, with `attempts + 1` and `last_error`.
+   - A node that isn't ALIVE isn't called; its tasks wait and are retried every pass once it's ALIVE.
+4. **Finish:** a retired object with no task, placement or replica left loses its `chunks` and `objects` rows.
+
+A coordinator restart mid-GC loses nothing: states and tasks are rows (invariant 7). Like repair, a pass does nothing while any node is UNKNOWN.
+
+Tests:
+- `rowsAreRemovedOnlyWhenTheNodeItselfConfirms`. Mutation G2: rows removed for a failed or impostor answer.
+- `aDeadNodesDeletionsWaitAndAreRetriedWhenItReturns`. Mutation G7: drop a DEAD node's tasks.
+- `aSecondPassIsANoOp`. Mutation G14: a task kept after confirmation.
+
+**Over:** deleting files synchronously in `rm` (breaks readers, and fails whenever a node is down); removing rows when the delete is sent (an undelivered delete leaves a file no row points to); recomputing work each pass with no task table, as repair does (the file's location must be kept until the node confirms, and after confirmation the placement that recorded it is gone).
+**Because:** invariant 3. "This node no longer holds this chunk" is a fact about the node, so only the node may establish it. A node that returns later is asked again because its rows were never removed.
+**Breaks if:** a node is permanently lost. Its tasks then wait forever, and the object's metadata is never removed (bounded rows, no data risk). Decommissioning a node is out of scope.
+
+## Tombstones on the node; a check after the link; a sweep at startup (stage 8)
+**Amends:** "Node write path: temp → fsync → link (no-replace) → fsync dir → unlink; temps cleaned before listening" (stage 3).
+**Chose:**
+- **The tombstone:** `DeleteChunks` with `tombstone` set creates `/data/tombstones/<chunk_id>` and fsyncs that directory **before** unlinking any chunk file.
+- **Writes:** `NewWriter` refuses a tombstoned ID (`ErrDeleted` → `FAILED_PRECONDITION`). That's only a fast path. `Commit` checks again **after the link and its directory fsync**: if the tombstone now exists, it unlinks the new file, fsyncs, and fails.
+
+  Either interleaving of a write and a delete ends with no file. Either the write's check sees the tombstone and removes the file, or the tombstone came after the check, so after the link, and the delete's unlink removes it.
+- **`StatChunks`** reports a tombstoned chunk `MISSING`.
+- **At startup**, before listening and together with the temp cleanup, the node deletes every final chunk file that has a tombstone, fsyncs, and logs each one. Such a file can be left only by a crash between a racing write's link and its check, or between a delete's tombstone and its unlink.
+- **Tombstones are empty files, kept forever.**
+
+Tests: `TestWriteRacingDelete` runs a whole delete between a write's fast path and its link (mutation T3: no check after the link); `TestDeleteOrder` (T5: unlink before the tombstone is durable); `TestRecoverStore` (T4: no sweep at startup); `TestDelete`.
+**Over:** no tombstones (late uploads and late repair copies leave files that only a listing would find); the node asking the coordinator before each write (puts the coordinator on the write path).
+**Because:** invariant 4, enforceable on the node: a deleted chunk ID can never be written again, so GC never chases a file that reappears.
+**Breaks if:** tombstones must be pruned (one inode per deleted chunk, forever). Pruning would need to know no write of the ID can still arrive. Out of scope.
+
+## The DeleteChunks RPC: batched, idempotent, addressed to one node, answered by it (stage 8)
+**Chose:** `DeleteChunks { node_id, repeated ChunkDeletion { chunk_id, tombstone } }` returns `{ node_id, repeated ChunkDeletionResult { chunk_id, DELETED | ALREADY_ABSENT } }`.
+- **Idempotent:** a missing file counts as removed.
+- **Validation:** every ID is checked before anything changes, and the request is capped at 4096 chunks.
+- **Durability:** one fsync of the tombstones directory and one of the chunks directory per call.
+- **Reads:** deleting unlinks the name and never modifies the file, so a read that already opened it gets every byte (`TestOpenReadSurvivesDelete`).
+- **Addressing:** the request names the node it's meant for, and a node with another ID refuses the whole request (`FAILED_PRECONDITION`) before touching anything. I added this mid-stage. The design only had the response's `node_id`, which stops the coordinator from **recording** a wrong node's answer, but by then that node has already deleted its own files. For a BAD-file delete (no tombstone, live chunk) those could be the only healthy copies on that node.
+
+Tests: `TestDeleteChunks` (mutations T1: a missing file is an error; T2: no `node_id` in the response; T6: the addressed `node_id` is ignored).
+**Over:** one RPC per chunk (1,280 calls for a 5 GiB object); relying only on the response's identity.
+**Because:** invariant 3 in both directions. A stale address can neither delete another node's data nor have its answer credited.
+**Breaks if:** a node's ID is reassigned to a different disk. That's a configuration error the coordinator can't see.
+
+## Which orphans are cleaned: only those reachable from metadata; repair records its target first (stage 8)
+**Amends:** "No retry and no re-placement within an upload; orphaned bytes are left for stages 7 and 8" (stage 4) and "Copies are pushed source to target through WriteChunk; the PushChunk RPC" (stage 7).
+**Chose:** GC deletes from every (chunk, node) in `chunk_placements` or `chunk_replicas` of a retired object. `chunk_placements.origin` is `'initiate'` or `'repair'`, and repair inserts its target as a placement **before** ordering the copy. That makes reachable:
+- writes that reached a node but were never recorded (a slow replica, a node down at commit);
+- losers of concurrent puts (they are superseded objects);
+- the abandoned uploads' files;
+- copies to a target that vanished mid-copy.
+
+`plannedChunks` and every earlier script that compares against "the placed nodes" now read only `origin = 'initiate'`.
+
+**Explicitly not cleaned:**
+- **Files of live objects on a placed node with no row.** At most one per placed node per chunk; repair may adopt one as `repair-found`, and GC deletes it once the object is retired. Stage 4 said stage 8 "must treat 'file present, no replica row' as an orphan". This entry reverses that for live objects: deleting them would race repair's `ALREADY_EXISTS` resolution. The acceptance check counts them through placements.
+- **Files with no metadata at all** (an unknown chunk ID, a wiped database). Only listing every node's files finds those, and that is the block report CLAUDE.md puts out of scope.
+
+**Over:** listing node files (block reports).
+**Because:** every file the system ever wrote on purpose is recorded somewhere before it's written.
+**Breaks if:** some future write path writes a chunk without recording a placement first.
+
+## Repair and GC never cross (stage 8)
+**Amends:** "A repaired replica is recorded only after the target's own StatChunks" (stage 7) and "Only current COMMITTED objects are repaired" (stage 7).
+**Chose:** `lockIfCurrent` takes a `FOR SHARE` lock on the object row and requires `COMMITTED` and a `keys` row pointing to it. Repair calls it:
+- before inserting the target placement (no copy is started for a retired object);
+- before recording the confirmed HEALTHY row, or a BAD row found.
+
+Retiring an object (`rm`, or supersede) updates that row, so it waits for the share lock. A lock taken afterwards sees the new status.
+
+| Race | Closed by |
+|---|---|
+| A pass loaded the chunk, then the key was removed | the placement step finds it not current; no copy |
+| A copy in flight when the key is removed | no row recorded; the placement was committed before GC's task creation could run (that needs the row lock and the grace), so GC deletes the copy; a copy arriving after the delete hits the tombstone |
+| GC deleting what repair is about to make current | retired objects never become current again; on live chunks GC deletes only BAD files, and repair never targets a node with a BAD row until GC removed that row after the node confirmed |
+
+Test: `repairNeverRecordsACopyForARetiredObjectAndGcFindsTheCopy` (a 500 ms push, `rm` mid-copy). Mutations G6 (record without the check) and G9 (copy without the placement).
+**Over:** one thread for both (it removes only some races, not those with clients, and couples their schedules); a global maintenance lock (coarse, and it would stall uploads).
+**Because:** repair must never copy, or record, for an object being deleted, and GC must never delete what repair keeps.
+**Breaks if:** an object could return to current (see the supersede entry).
+
+## BAD files: after the read grace, only with 2 counted HEALTHY replicas, without a tombstone (stage 8)
+**Amends:** "Bad files stay on disk until stages 7 and 8; no quarantine" (stage 5), "Replica state on chunk_replicas; BAD is terminal" (stage 5) and "Target selection; resolving ALREADY_EXISTS; recording what repair finds" (stage 7).
+**Chose:** a BAD replica of a `COMMITTED` object gets a deletion task with `tombstone = false` when both of these hold:
+- **It was marked longer than the read grace ago.** You chose this mid-stage. The approved design had no grace, but a 10 s pass would remove BAD rows before the stage 5 and 7 scripts check them, and it makes the evidence visible.
+- **At least 2 HEALTHY replicas count by repair's rule:** ALIVE, SUSPECT, or DEAD for less than the repair grace. The ≥ 2 condition was also your choice mid-stage, and so was counting with repair's rule: a HEALTHY row on a node DEAD for an hour doesn't count. `RepairService.counts` is shared, so the two can't drift apart. With fewer, the BAD file stays as evidence, and `GetObject`'s `DATA_LOSS` keeps its reasons. Repair tops the chunk up elsewhere first, and then the BAD file can go.
+
+Once the node confirms, the BAD row and that node's placement are removed. The node is then a valid repair target again, and no tombstone stands in the way. This is how stage 5's "stage 8 finds BAD rows, deletes the file, then the row" is done. Within the read grace, a BAD row still blocks the node as a target, as stage 7 said.
+
+Tests:
+- `aBadFileIsDeletedWithoutATombstoneAndTheNodeIsATargetAgain`. Mutations G8 (tombstone) and G12 (no grace).
+- `aBadFileIsKeptUnlessTwoCountedHealthyReplicasRemain`. Mutation G11: count raw HEALTHY rows.
+- `anAllBadChunkKeepsItsFiles`.
+
+The ≥ 2 check runs when the task is created. A HEALTHY replica marked BAD between task creation and the delete isn't re-counted.
+**Over:** immediate deletion (as first designed); a tombstone (the node could never get a good copy back); always deleting (all-BAD chunks would lose their last copies and the recorded reasons).
+**Because:** a BAD file is useless as data but useful as evidence. It is removed only when the chunk no longer depends on it.
+**Breaks if:** `marked_bad_at` (database clock) and the coordinator clock differ by much. The grace is then off by that much (next entry).
+
+## One wall clock for GC's timestamps (stage 8)
+**Chose:** a `java.time.Clock` bean, `Clock.systemUTC()` in production, provides now for GC's cutoffs, `retired_at`, `gc_started_at`, and the `created_at` of new uploads (initiate now passes it explicitly instead of the column default). Tests replace it with a settable clock. Liveness keeps its monotonic `Ticker`, because liveness intervals are never stored. `marked_bad_at` stays on the database clock (stage 5's `clock_timestamp()`).
+**Over:** `clock_timestamp()` everywhere (grace periods couldn't be tested without sleeping); the `Ticker` (monotonic nanos can't be stored or compared across restarts).
+**Because:** a pending timeout and a read grace both compare a stored instant with now, and they must use the same clock to mean anything.
+**Breaks if:** the coordinator's and Postgres's clocks drift apart by a large fraction of the read grace. Only the BAD-file grace mixes the two.
+
+## Over-replication is still left in place (stage 8)
+**Confirms:** "Over-replication is left in place; no audit on return" (stage 7).
+**Chose:** GC never deletes copies of live data. A 4th HEALTHY copy appears only when a node that held the chunk returns after repair, so with 4 nodes it's at most 4 copies per chunk: at most 33 % extra disk.
+**Over:** trimming after confirming 3 other HEALTHY copies with `VerifyChunk` (the riskiest delete in the system, done on live data, for a bounded cost; close to rebalancing).
+**Because:** an extra copy costs disk, not correctness.
+**Breaks if:** nodes come and go often enough that the extra disk matters.
+
+## rm: the key row first, last commit wins; the foreign key unchanged (stage 8)
+**Amends:** "A key can only point to a COMMITTED object, enforced by a composite foreign key" (stage 2).
+**Chose:**
+- **`DeleteObject(key)`, in one transaction:** `DELETE FROM keys … RETURNING object_id` (taking the key row lock), then `COMMITTED → DELETED` with `retired_at`.
+- **A key that doesn't resolve:** `NOT_FOUND`, and `osctl rm` exits 1 with "key not found".
+- **`rm` racing an overwrite of the same key** serializes on the key row; the last to commit wins:
+  - `rm` first: the old version becomes DELETED, then the put points the key at the new one;
+  - put first: `rm` removes the new version, and the old one is later found SUPERSEDED.
+- **Foreign key:** unchanged. Only the `CHECK` on `objects.status` widens, to `SUPERSEDED`, `DELETED` and `ABANDONED`. Stage 2 warned the FK would need changing "if a later stage adds an object status that must stay readable". These three must not stay readable, so it holds. It already forces the order `rm` uses: the key row must go before the object can leave COMMITTED.
+
+Tests: `rmMakesTheKeyNotFoundAtOnceAndItsFilesGoAfterTheGrace` and `rmRacingAnOverwriteEndsInALastCommitWinsState` (10 rounds, either outcome must be consistent). Neither has a dedicated mutation: the FK and the key row lock make the obvious mistakes fail loudly.
+**Over:** idempotent success for a missing key (S3's choice; you chose `NOT_FOUND`); a `DELETING` status that keeps the key (the key would have to stay readable, which is the case stage 2 warned about).
+**Because:** `rm` is the same atomic pointer change as an overwrite, pointing at nothing.
+**Breaks if:** clients need conditional deletes ("delete only if still version X"). That needs compare-and-swap on `keys`.
+
+## osctl ls and stat (stage 8)
+**Chose:**
+- **`ListObjects(prefix)`** returns the keys that currently resolve, in key order, with size, `committed_at` and object ID. `osctl ls [prefix]` prints them as a table.
+- **`StatObject(key)`** returns the object and every replica row of every chunk, in any state, with origin, BAD reason and the node's liveness. `osctl stat <key>` prints it.
+
+Both are read-only, one statement each. A missing key for `stat` is `NOT_FOUND`.
+**Over:** leaving them for later. CLAUDE.md lists them as CLI commands but attaches them to no stage, and stage 9's demo needs "show final replica state".
+**Because:** you approved adding them in this stage.
+**Breaks if:** there are many keys: `ls` isn't paginated.
+
+## GC bounds, gc_passes, and V7 (stage 8)
+**Chose:**
+- **Passes:** one every `COORDINATOR_GC_INTERVAL` (10 s); passes never overlap (`runPass` is synchronized) and run alongside repair.
+- **Per step:** at most `COORDINATOR_GC_BATCH` (256) objects are retired or scheduled.
+- **`DeleteChunks` calls:** at most 256 IDs each, at most `COORDINATOR_GC_MAX_PER_NODE` (1) in flight per node and `COORDINATOR_GC_MAX_INFLIGHT` (4) overall, each within the 2 s node RPC deadline. Rounds repeat within a pass until every ALIVE node's tasks are done; a node that fails is left until the next pass.
+- **Every round makes progress, so a pass ends.** A result that is neither `DELETED` nor `ALREADY_ABSENT` (say, `OUTCOME_UNSPECIFIED`) is a failure for that chunk: `attempts + 1`, `last_error`, and the node is left until the next pass. A node whose batch confirms nothing is also left until the next pass. Found when mutation G14 hung the mutation run: the rounds asked for the same tasks forever. Real code could do the same, because an unclear outcome was skipped without marking anything, and the synchronized `runPass` would then have stopped GC for good.
+- **`gc_passes`:** one row per pass with counts, pruned after `COORDINATOR_GC_PASS_RETENTION` (24 h).
+- **Migration V7:**
+  - widens the status CHECK;
+  - adds `retired_at` and `gc_started_at`, with a CHECK that retired statuses have `retired_at`, and an index on `(status, created_at)`;
+  - adds `chunk_placements.origin`;
+  - creates `pending_deletions` and `gc_passes`.
+
+Tests: `deletesAreBatchedAndBounded` (30 deletes with a batch of 4, 1 per node, 2 overall), mutation G13 no overall bound; `anUnclearOutcomeIsAFailureAndThePassEnds` (the node is asked once, its task stays with attempts 1, the other nodes confirm), mutation G16 restores the old loop.
+**Over:** one call per chunk; unbounded parallelism; a fixed cap on rounds per pass (an arbitrary number that still repeats a call that achieves nothing).
+**Because:** GC must never compete with reads and writes for nodes or the database.
+**Breaks if:** deletions arrive faster than about 256 chunks per node per round. The backlog grows, and it shows in `pending_deletions`.
+
+## Earlier scripts adapted to stage 8 (stage 8)
+**Amends:** "Earlier scripts compare upload-origin rows; the stage 7 acceptance script" (stage 7).
+**Chose:**
+- **Placement queries read `origin = 'initiate'`**, because repair targets are placements now:
+  - `stage4-replication-check.sh`: `check_replicas`, `placement_width`, `placed_on`, the node3 chunk list, `min_live`, and the two-alive check;
+  - `stage6-liveness-check.sh`: "nothing placed on node2";
+  - `stage3-fsync-trace.sh`: the node1 placement count.
+- **`stage5-failover-check.sh`:** `bad_count` takes the step's key. Steps 3 and 4 compared a cluster-wide BAD count before and after, and GC now deletes earlier steps' BAD rows after the read grace.
+- **`flip_byte` refuses a missing file**, because `dd` would create one.
+- **`unflip` flips back only a byte that still holds the flipped value.** GC may delete a BAD replica's file and repair write a good copy under the same name, and flipping that copy would corrupt a replica Postgres records HEALTHY. Every copy of a chunk has the same bytes, and a flip XORs with 255, so a good copy never holds the flipped value. Restoring is therefore idempotent: each script restores explicitly before its verdict, and its EXIT trap restores again for early exits.
+  - *Corrected in place:* this first recorded each flipped file's inode and unflipped only the same inode. An inode number can't identify a file over time: when a file is deleted, the filesystem frees its inode number and may give it to the next file it creates (ext4 commonly does). A stage 8 run showed exactly that. Node1's BAD file was deleted at 00:12:56, repair wrote a good copy at 00:13:06 under the same inode number, and the exit trap flipped a byte in the good copy. The replica was left HEALTHY in Postgres and corrupt on disk.
+- **Every script that flips bytes checks what it touched**, after restoring and before its verdict (`check_touched` in `scripts/lib/volume.sh`). Each touched file must be gone, or, if Postgres has a HEALTHY row for it, pass the header, chunk-ID and SHA-256 checks. Otherwise the script fails, naming the node and chunk. A file whose row is BAD or absent is never served, so it may stay. Its loop feeds `psql` from `/dev/null`: `compose exec` forwards stdin even with `-T`, and on its first run it swallowed the rest of the list, so only the first touched file was checked. Used by `stage3-corrupt-check.sh`, `stage5-failover-check.sh`, `stage7-repair-check.sh` and `stage8-gc-check.sh`.
+- **`wait_alive` no longer exits silently while no node is ALIVE.** Its `grep -o '=ALIVE'` exits 1 on zero matches, and under `set -e` with `pipefail` that ended the calling script with no output. The window is right after `up --wait`, while the coordinator is seconds old and every node is still UNKNOWN. Reproduced 2 times in 3 on a coordinator restart; it caused one silent stage 8 exit 1 after 1.4 s. Also, `liveness_states` now prints a failed query's error and returns no states, so callers keep polling to their timeout instead of the error being discarded.
+- **`scripts/stage8-gc-check.sh`** covers the six acceptance checks. The overwrite step pauses the node a get reads chunk 0 from, so the overwrite commits while that get holds the old chunk list; the step requires this and otherwise fails as inconclusive. Its first run passed but showed the get finishing before the commit, so it didn't prove the overlap.
+  - *Corrected in place:* step 4 first looked for a chunk with no replica on node4 and stopped node4. When every chunk of the 3-chunk object had a replica on node4 (odds (3/4)³ ≈ 42%), the query came back empty and the script died under `set -e` without a verdict. Step 4 now takes chunk 0 and stops the one node without a replica of it. Step 5 assumed node2 held part of its object (it holds none with odds (1/4)³ ≈ 1.6%); it now stops a node that holds chunk 0.
+- **Existing ITs** set `coordinator.gc-interval=0`, and their `TRUNCATE`s include `pending_deletions`.
+
+**Because:** background GC now deletes rows and files, and every check must stay deterministic.
+**Breaks if:** a new script compares cluster-wide BAD counts, or flips bytes without `corrupt_byte`, `restore_flipped` and `check_touched`; or a chunk's copies stop being byte-identical (they can't while chunks are immutable and IDs never reused).
+
+## Mutation scripts extended for stage 8 (stage 8)
+**Extends:** "Mutation scripts extended for stage 7" (stage 7).
+**Chose:**
+- **Coordinator:**
+  - G1 delete before retire;
+  - G2 remove the row before the node confirms;
+  - G3 abandon without the atomic transition;
+  - G4 no grace for superseded objects;
+  - G5 delete chunks of the current version (tasks scoped by key, not object);
+  - G6 repair records a replica for a retired object;
+  - G7 drop a DEAD node's tasks;
+  - G8 BAD deletes tombstone;
+  - G9 repair copies without the placement;
+  - G10 a complete of a SUPERSEDED object fails;
+  - G11 count raw HEALTHY rows;
+  - G12 no grace for BAD files;
+  - G13 no overall delete bound;
+  - G14 a task kept after confirmation;
+  - G15 supersede ignores keys;
+  - G16 no progress check (an unclear outcome is skipped, and a node that confirms nothing is asked again in the same pass).
+- **Go:**
+  - T1 a missing file is an error;
+  - T2 no `node_id` in the response;
+  - T3 no tombstone check after the link;
+  - T4 no tombstone sweep at startup;
+  - T5 unlink before the tombstone is durable;
+  - T6 the addressed node is ignored.
+- **Regenerated against changed code:** N3 (`Commit` gained the tombstone check), and P1, P3 and P7 (the counting rule moved into `RepairService.counts`).
+
+**Because:** every GC rule is shown to be load-bearing.
+**Breaks if:** code edits stop patches from applying. The scripts fail at `git apply --check`.
+
+## Mutation runs: only the target's class per mutation, on the daemon, reverted on any exit (stage 8)
+**Amends:** "Atomicity is proven by a fault-injection trigger test; mutations as patches" (stage 2) and the mutation-script entries of stages 3–7, which ran the whole coordinator suite under every mutation.
+**Chose:**
+- **What "detected" means now:** each coordinator mutation names `Class|test`; the script runs only that class (`--tests`), and the mutation is DETECTED when that test fails in that run. The full unmutated suite still runs once at the end and guards everything else. "Alone" in earlier tables now means alone within the target's class; other classes are not run under the mutation.
+- **The Gradle daemon** instead of `--no-daemon`, and `test --rerun` instead of `--rerun-tasks`, so compilation is incremental and only the test task is forced.
+- **A default JUnit timeout:** 30 s per test, in its own thread (`junit-platform.properties`), so a hang is a named failure rather than a run that never ends. The slowest test takes under a second.
+- **Revert on any exit:** both scripts source `scripts/lib/mutation.sh`, which reverts the applied patch on EXIT, SIGINT and SIGTERM. Test runs go into the background and the script waits for them, so a signal is handled at once: the run's processes are killed and the patch reverted. Before the first patch, each script checks every patch in `scripts/mutations/` (`git apply --check` succeeds, `git apply -R --check` fails) and refuses to start otherwise.
+
+**Over:** the whole suite under every mutation (47 × about 6 min, and one hang stalled it all); a per-mutation wall-clock limit in the script (it would not say which test hung).
+**Because:** a mutation targets one rule, and that rule's test is in one class. Nothing is lost on the unmutated side, since that run still covers every class. The kill-safe revert matters because a run interrupted by a kill would otherwise leave a mutation in the tree. A later commit could then ship it.
+**Breaks if:** a mutation's only detecting test moves to another class without the `Class|test` entry changing (the script then reports NOT DETECTED, loudly); a mutation would also have broken another class's tests and that mattered (it is no longer seen); or a test legitimately needs more than 30 s and gets its own `@Timeout`.

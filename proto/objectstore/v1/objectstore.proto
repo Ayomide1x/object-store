@@ -17,7 +17,10 @@ service CoordinatorService {
   // the client's SHA-256. It then records exactly those replicas, marks the
   // object COMMITTED and points the key at it, in one transaction. Fewer than 2
   // verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
-  // overwritten. Completing an already COMMITTED object succeeds without changes.
+  // overwritten. Completing an object that already committed (COMMITTED, or
+  // since SUPERSEDED or DELETED) succeeds without changes. An upload abandoned
+  // by garbage collection (PENDING past the pending timeout) fails with
+  // FAILED_PRECONDITION and can never commit.
   rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
   // GetObject returns the chunk list and the HEALTHY replica locations for a
   // key. Replicas marked BAD are left out. If any chunk has no healthy replica,
@@ -33,6 +36,81 @@ service CoordinatorService {
   // a node_id that is still beating fails with FAILED_PRECONDITION. Rejected
   // beats do not count as signs of life.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // DeleteObject removes a key. In one transaction the key stops resolving
+  // and the object it pointed to becomes DELETED; its chunk files are deleted
+  // later, by garbage collection, after a read grace period, so a get that
+  // already holds the chunk list finishes. A key that does not resolve:
+  // NOT_FOUND.
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  // ListObjects returns the keys that currently resolve, in key order.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  // StatObject describes the object a key resolves to, with every recorded
+  // replica of every chunk in any state. For inspection: readers use GetObject.
+  rpc StatObject(StatObjectRequest) returns (StatObjectResponse);
+}
+
+message DeleteObjectRequest {
+  string key = 1;
+}
+
+message DeleteObjectResponse {
+  // The object the key pointed to, now DELETED.
+  string object_id = 1;
+}
+
+message ListObjectsRequest {
+  // Only keys starting with this prefix; empty lists every key.
+  string prefix = 1;
+}
+
+message ListObjectsResponse {
+  repeated ObjectSummary objects = 1;
+}
+
+message ObjectSummary {
+  string key = 1;
+  string object_id = 2;
+  int64 size_bytes = 3;
+  // When the object committed, in milliseconds since the Unix epoch.
+  // Informational only: it does not define version order.
+  int64 committed_at_unix_millis = 4;
+}
+
+message StatObjectRequest {
+  string key = 1;
+}
+
+message StatObjectResponse {
+  string object_id = 1;
+  int64 size_bytes = 2;
+  int64 committed_at_unix_millis = 3;
+  // Ordered by index.
+  repeated ChunkStatus chunks = 4;
+}
+
+message ChunkStatus {
+  string chunk_id = 1;
+  int32 index = 2;
+  int64 size_bytes = 3;
+  bytes sha256 = 4;
+  // Every recorded replica, by node ID.
+  repeated ReplicaStatus replicas = 5;
+}
+
+message ReplicaStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_HEALTHY = 1;
+    // Confirmed corrupt or missing by its node; never served to readers.
+    STATE_BAD = 2;
+  }
+  string node_id = 1;
+  State state = 2;
+  // How the row came to exist: "upload", "repair" or "repair-found".
+  string origin = 3;
+  NodeLiveness liveness = 4;
+  // Set when state is STATE_BAD.
+  string bad_reason = 5;
 }
 
 // NodeLiveness is a node's state as the coordinator sees it from heartbeats.
@@ -194,6 +272,15 @@ service StorageNodeService {
   // RESOURCE_EXHAUSTED); what happened at the target is the outcome. The
   // coordinator records nothing from this response: it asks the target.
   rpc PushChunk(PushChunkRequest) returns (PushChunkResponse);
+  // DeleteChunks removes chunk files, for garbage collection ordered by the
+  // coordinator. It is idempotent: a chunk with no file counts as removed
+  // (OUTCOME_ALREADY_ABSENT). With tombstone set, the node first records,
+  // durably, that the chunk ID is deleted, and from then on refuses any write
+  // of it, so a late upload or copy can never bring the file back. Deletion
+  // never modifies a file: it removes the name, so a read that already opened
+  // the file finishes normally. The response names the node, and the
+  // coordinator records a deletion only from the node itself.
+  rpc DeleteChunks(DeleteChunksRequest) returns (DeleteChunksResponse);
 }
 
 message WriteChunkRequest {
@@ -308,4 +395,39 @@ message PushChunkResponse {
   string chunk_id = 2;
   Outcome outcome = 3;
   string detail = 4;
+}
+
+message DeleteChunksRequest {
+  repeated ChunkDeletion chunks = 1;
+  // The node the coordinator means to address. A node with another ID refuses
+  // the whole request (FAILED_PRECONDITION) and deletes nothing, so a stale
+  // address can never delete another node's copies. Required.
+  string node_id = 2;
+}
+
+message ChunkDeletion {
+  string chunk_id = 1;
+  // Refuse every later write of this chunk ID. Set when the chunk's object is
+  // gone; unset when only this node's bad copy is removed, so a good copy can
+  // be written here again.
+  bool tombstone = 2;
+}
+
+message DeleteChunksResponse {
+  // The responding node's ID (see StatChunksResponse.node_id).
+  string node_id = 1;
+  // One entry per requested chunk, in request order.
+  repeated ChunkDeletionResult results = 2;
+}
+
+message ChunkDeletionResult {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // The file existed and is now removed, durably.
+    OUTCOME_DELETED = 1;
+    // There was no file under the chunk's final name.
+    OUTCOME_ALREADY_ABSENT = 2;
+  }
+  string chunk_id = 1;
+  Outcome outcome = 2;
 }

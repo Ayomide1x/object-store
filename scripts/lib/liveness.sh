@@ -16,8 +16,19 @@ liveness_states() {
     echo "liveness.sh: \$compose must be set before calling its helpers" >&2
     exit 2
   fi
-  "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -F= \
-    -c "SELECT node_id, state FROM nodes ORDER BY node_id" 2>/dev/null | tr '\n' ' '
+  # A failed query prints its error and returns no states, so the callers keep
+  # polling until their timeout. (Discarding the error under set -e and
+  # pipefail once ended a script silently.)
+  local out err rc=0
+  err="$(mktemp)"
+  out="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -F= \
+    -c "SELECT node_id, state FROM nodes ORDER BY node_id" 2>"$err")" || rc=$?
+  if ((rc == 0)); then
+    tr '\n' ' ' <<<"$out"
+  else
+    echo "liveness.sh: reading node states failed (exit $rc): $(tr '\n' ' ' <"$err")" >&2
+  fi
+  rm -f "$err"
 }
 
 # wait_alive N [NODE...]: with no names, waits until at least N nodes are
@@ -32,7 +43,9 @@ wait_alive() {
       ready=yes
       for n in "$@"; do [[ " $states" == *" $n=ALIVE "* ]] || ready=no; done
     else
-      alive="$(grep -o '=ALIVE' <<<"$states" | wc -l | tr -d ' ')"
+      # grep exits 1 when no node is ALIVE (as right after the coordinator
+      # starts); under set -e and pipefail that ended the script silently.
+      alive="$({ grep -o '=ALIVE' <<<"$states" || true; } | wc -l | tr -d ' ')"
       if ((alive >= want)); then ready=yes; else ready=no; fi
     fi
     if [[ "$ready" == yes ]]; then

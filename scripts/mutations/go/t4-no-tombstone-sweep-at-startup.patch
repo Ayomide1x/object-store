@@ -1,0 +1,14 @@
+--- a/node/cmd/node/main.go
++++ b/node/cmd/node/main.go
+@@ -139,10 +139,7 @@
+ 		log.Warn("removed stray temp file from interrupted write",
+ 			"chunk_id", chunkstore.ChunkIDFromTempName(name), "file", name)
+ 	}
+-	swept, err := store.SweepTombstoned(ctx)
+-	if err != nil {
+-		return err
+-	}
++	var swept []string
+ 	for _, id := range swept {
+ 		log.Warn("removed chunk file that has a tombstone (interrupted write or delete)", "chunk_id", id)
+ 	}

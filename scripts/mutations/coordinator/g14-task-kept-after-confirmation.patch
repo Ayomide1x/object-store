@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -579,7 +579,7 @@
+      * whether a task existed.
+      */
+     public boolean confirmDeleted(UUID chunkId, String nodeId) {
+-        int tasks = jdbc.sql("DELETE FROM pending_deletions WHERE chunk_id = :c AND node_id = :n")
++        int tasks = jdbc.sql("UPDATE pending_deletions SET attempts = attempts WHERE chunk_id = :c AND node_id = :n")
+                 .param("c", chunkId).param("n", nodeId).update();
+         if (tasks == 0) {
+             return false;

@@ -7,7 +7,8 @@
 # as detected. Finally, run the unmutated tests.
 #
 # Usage: scripts/go-mutation-check.sh
-# The mutation is always reverted, even on Ctrl-C.
+# Refuses to start if any patch in scripts/mutations/ is already applied. The
+# mutation is reverted on exit, Ctrl-C and kill.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,24 +44,25 @@ expected_test() {
     r1-read-order-ignores-liveness) echo "TestDeadReplicasAreReadLast" ;;
     q1-push-ignores-expected-hash) echo "TestPushChunk/source_is_not_the_recorded_chunk" ;;
     q2-push-response-without-node-id) echo "TestPushChunk/copies_a_verified_chunk" ;;
+    t1-delete-fails-on-missing) echo "TestDeleteChunks/repeated_delete" ;;
+    t2-delete-response-without-node-id) echo "TestDeleteChunks/first_delete" ;;
+    t3-no-tombstone-check-after-link) echo "TestWriteRacingDelete" ;;
+    t4-no-tombstone-sweep-at-startup) echo "TestRecoverStore" ;;
+    t5-unlink-before-tombstone-durable) echo "TestDeleteOrder" ;;
+    t6-delete-ignores-addressed-node) echo "TestDeleteChunks/addressed_to_another_node:_nothing_deleted" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }
 
-applied=""
-revert() {
-  if [[ -n "$applied" ]]; then
-    git apply -R "$applied"
-    applied=""
-  fi
-}
-trap revert EXIT
+. scripts/lib/mutation.sh
+out="$(mktemp)"
+trap 'rm -f "$out"; mutation_revert' EXIT
 
-# Runs the Go tests and prints "BUILD FAILED" or the names of failed tests,
-# one per line (subtests as Parent/sub).
-run_tests() {
+# go_tests FILE: runs the Go tests and writes "BUILD FAILED" or the names of
+# failed tests, one per line (subtests as Parent/sub), to FILE.
+go_tests() {
   if ! go vet ./... >/dev/null 2>&1; then
-    echo "BUILD FAILED"
+    echo "BUILD FAILED" >"$1"
     return
   fi
   go test -count=1 -json ./... 2>/dev/null | python3 -I -c '
@@ -72,18 +74,19 @@ for line in sys.stdin:
         continue
     if ev.get("Action") == "fail" and ev.get("Test"):
         print(ev["Test"])
-' || true
+' >"$1" || true
 }
+
+require_unapplied scripts/mutations/*/*.patch
 
 status=0
 for patch in scripts/mutations/go/*.patch; do
   name="$(basename "$patch" .patch)"
   target="$(expected_test "$name")"
-  git apply --check "$patch"
-  git apply "$patch"
-  applied="$patch"
-  failed="$(run_tests)"
-  revert
+  apply_mutation "$patch"
+  run_child go_tests "$out"
+  mutation_revert
+  failed="$(cat "$out")"
 
   echo "=== mutation $name"
   if [[ "$failed" == "BUILD FAILED" ]]; then
@@ -109,7 +112,8 @@ for patch in scripts/mutations/go/*.patch; do
 done
 
 echo "=== unmutated"
-failed="$(run_tests)"
+run_child go_tests "$out"
+failed="$(cat "$out")"
 echo "    failed tests: $(grep -c . <<<"$failed" || true)"
 while IFS= read -r f; do
   if [[ -n "$f" ]]; then echo "    FAILED $f"; status=1; fi

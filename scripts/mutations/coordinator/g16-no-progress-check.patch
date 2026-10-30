@@ -1,0 +1,22 @@
+diff --git a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -344,7 +344,6 @@
+                 boolean gone = r.getOutcome() == ChunkDeletionResult.Outcome.OUTCOME_DELETED
+                         || r.getOutcome() == ChunkDeletionResult.Outcome.OUTCOME_ALREADY_ABSENT;
+                 if (!gone) {
+-                    notGone.add(chunkId);
+                     continue;
+                 }
+                 if (repository.confirmDeleted(chunkId, node.nodeId())) {
+@@ -371,10 +370,6 @@
+             log.atWarn().addKeyValue("node_id", node.nodeId()).addKeyValue("chunks", notGone.size())
+                     .log("deletions not confirmed: outcome neither deleted nor absent; rows kept");
+         }
+-        if (confirmed == null || confirmed == 0) {
+-            // No progress: sending the same tasks again this pass would loop forever.
+-            failed.add(node.nodeId());
+-        }
+     }
+ 
+     /** Removes the metadata of retired objects whose files are all confirmed gone. */

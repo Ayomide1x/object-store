@@ -29,6 +29,7 @@ import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The reconciler: finds chunks of current COMMITTED objects with fewer than 3
@@ -43,6 +44,13 @@ import org.springframework.stereotype.Service;
  * copies), so a pass sees every earlier copy's outcome, and a pass right after
  * a complete one copies nothing. A new replica row is written only after the
  * target itself, answering as itself, reports a verified copy (StatChunks).
+ *
+ * <p>Repair never crosses garbage collection. Before ordering a copy it records
+ * the target as a placement, and both that and the replica row afterwards are
+ * written only under a share lock on the object row that finds the object still
+ * current ({@link MetadataRepository#lockIfCurrent}). So a copy is never
+ * started, or recorded, for an object being deleted, and every copy that was
+ * started is a placement GC will delete from.
  */
 @Service
 public class RepairService implements InitializingBean, DisposableBean {
@@ -62,16 +70,32 @@ public class RepairService implements InitializingBean, DisposableBean {
     private final LivenessTracker liveness;
     private final ReplicaHealthService replicaHealth;
     private final CoordinatorProperties properties;
+    private final TransactionTemplate tx;
     private final LinkedBlockingQueue<RepairHint> hints = new LinkedBlockingQueue<>();
     private Thread scheduler;
 
     public RepairService(MetadataRepository repository, NodeClient nodeClient, LivenessTracker liveness,
-            ReplicaHealthService replicaHealth, CoordinatorProperties properties) {
+            ReplicaHealthService replicaHealth, CoordinatorProperties properties, TransactionTemplate tx) {
         this.repository = repository;
         this.nodeClient = nodeClient;
         this.liveness = liveness;
         this.replicaHealth = replicaHealth;
         this.properties = properties;
+        this.tx = tx;
+    }
+
+    /**
+     * Whether a HEALTHY row on a node in state s counts as a replica: its node
+     * is ALIVE or SUSPECT, or DEAD for less than the repair grace. Repair and
+     * garbage collection share this rule, so GC never treats a long-DEAD copy
+     * as one of the replicas that make deleting a BAD file safe.
+     */
+    static boolean counts(State s, long deadForNanos, long graceNanos) {
+        return switch (s) {
+            case ALIVE, SUSPECT -> true;
+            case DEAD -> deadForNanos < graceNanos;
+            case UNKNOWN -> true; // unreachable: passes are skipped while any node is UNKNOWN
+        };
     }
 
     @Override
@@ -139,12 +163,7 @@ public class RepairService implements InitializingBean, DisposableBean {
                     continue;
                 }
                 State s = states.getOrDefault(r.nodeId(), State.UNKNOWN);
-                boolean counts = switch (s) {
-                    case ALIVE, SUSPECT -> true;
-                    case DEAD -> liveness.deadForNanos(r.nodeId()) < graceNanos;
-                    case UNKNOWN -> true; // unreachable: the pass is skipped while any node is UNKNOWN
-                };
-                if (counts) {
+                if (counts(s, liveness.deadForNanos(r.nodeId()), graceNanos)) {
                     counted++;
                 }
                 if (s == State.ALIVE) {
@@ -189,7 +208,7 @@ public class RepairService implements InitializingBean, DisposableBean {
                     Set<String> excluded = excludedBy.get(id);
                     while (remaining.get(id) > 0 && !load.full()) {
                         // Never a node with any row for the chunk (a BAD row's file
-                        // blocks the no-replace link until stage 8 deletes it).
+                        // blocks the no-replace link until GC deletes it, then the row).
                         String target = aliveNodes.stream().filter(x -> !excluded.contains(x) && load.has(x))
                                 .min(Comparator.comparingInt(load::of).thenComparing(x -> x)).orElse(null);
                         String source = need.sources().stream().filter(load::has)
@@ -249,6 +268,19 @@ public class RepairService implements InitializingBean, DisposableBean {
             Counters n) {
         var logCtx = log.atInfo().addKeyValue("chunk_id", chunk.chunkId()).addKeyValue("object_id", chunk.objectId())
                 .addKeyValue("target_node_id", target.nodeId());
+        // The placement first, so GC finds the target's file whatever happens
+        // next; and only while the object is current.
+        Boolean placed = tx.execute(status -> {
+            if (!repository.lockIfCurrent(chunk.objectId())) {
+                return false;
+            }
+            repository.insertRepairPlacement(chunk.chunkId(), target.nodeId());
+            return true;
+        });
+        if (!Boolean.TRUE.equals(placed)) {
+            logCtx.log("object no longer current (removed or superseded); copy not started");
+            return;
+        }
         for (int i = 0; i < Math.min(MAX_SOURCE_ATTEMPTS, sources.size()); i++) {
             String sourceId = sources.get(i);
             boolean extraSlot = i > 0;
@@ -310,7 +342,11 @@ public class RepairService implements InitializingBean, DisposableBean {
         boolean valid = s.getState() == ChunkStat.State.STATE_FOUND && s.getSizeBytes() == chunk.sizeBytes()
                 && Arrays.equals(s.getSha256().toByteArray(), chunk.sha256());
         if (valid) {
-            if (repository.insertRepairedReplica(chunk.chunkId(), target.nodeId(), origin) > 0) {
+            Integer inserted = tx.execute(status -> repository.lockIfCurrent(chunk.objectId())
+                    ? repository.insertRepairedReplica(chunk.chunkId(), target.nodeId(), origin) : -1);
+            if (inserted != null && inserted < 0) {
+                logCtx.log("object no longer current; copy not recorded (GC deletes it through its placement)");
+            } else if (inserted != null && inserted > 0) {
                 (origin.equals("repair") ? n.recorded : n.found).incrementAndGet();
                 logCtx.addKeyValue("origin", origin).log("replica recorded after the target confirmed it");
             }
@@ -318,7 +354,9 @@ public class RepairService implements InitializingBean, DisposableBean {
         }
         String reason = "invalid file found during repair: " + (s.getState() == ChunkStat.State.STATE_FOUND
                 ? "size or sha256 differs from the record" : "bad header");
-        if (repository.insertBadReplicaFound(chunk.chunkId(), target.nodeId(), reason) > 0) {
+        Integer badInserted = tx.execute(status -> repository.lockIfCurrent(chunk.objectId())
+                ? repository.insertBadReplicaFound(chunk.chunkId(), target.nodeId(), reason) : 0);
+        if (badInserted != null && badInserted > 0) {
             n.bad.incrementAndGet();
             log.atWarn().addKeyValue("chunk_id", chunk.chunkId()).addKeyValue("node_id", target.nodeId())
                     .log("target holds an invalid file under the chunk's name; recorded BAD");

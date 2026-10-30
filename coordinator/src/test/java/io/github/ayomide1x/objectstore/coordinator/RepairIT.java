@@ -29,6 +29,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -44,6 +45,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         "coordinator.copy-timeout=2s",
         "coordinator.liveness-sweep=0",
         "coordinator.repair-interval=0",
+        "coordinator.gc-interval=0",
 })
 class RepairIT {
 
@@ -79,11 +81,13 @@ class RepairIT {
     private final CoordinatorProperties properties;
     private final JdbcClient jdbc;
     private final LivenessTracker tracker;
+    private final TransactionTemplate tx;
 
     @Autowired
     RepairIT(MetadataService metadata, LivenessService liveness, RepairService repair, MetadataRepository repository,
             NodeClient nodeClient, ReplicaHealthService replicaHealth, CoordinatorProperties properties, JdbcClient jdbc,
-            LivenessTracker tracker) {
+            LivenessTracker tracker, TransactionTemplate tx) {
+        this.tx = tx;
         this.metadata = metadata;
         this.liveness = liveness;
         this.repair = repair;
@@ -97,7 +101,7 @@ class RepairIT {
 
     @BeforeEach
     void allAlive() {
-        jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects, repair_passes").update();
+        jdbc.sql("TRUNCATE keys, pending_deletions, chunk_replicas, chunk_placements, chunks, objects, repair_passes, gc_passes").update();
         nodes.reset();
         for (int i = 0; i < 2; i++) {
             ALL.forEach(n -> liveness.heartbeat(n, "test-instance"));
@@ -199,7 +203,7 @@ class RepairIT {
         // A coordinator that has just restarted: node4 has not beaten yet.
         LivenessTracker fresh = new LivenessTracker(clock, properties);
         List.of("node1", "node2", "node3").forEach(n -> fresh.beat(n, "test-instance"));
-        RepairService justRestarted = new RepairService(repository, nodeClient, fresh, replicaHealth, properties);
+        RepairService justRestarted = new RepairService(repository, nodeClient, fresh, replicaHealth, properties, tx);
 
         RepairService.PassResult result = justRestarted.runPass();
 
@@ -295,7 +299,7 @@ class RepairIT {
             badNode = candidate.placed().stream().filter(n -> n.compareTo(candidate.free()) < 0).findFirst().orElse(null);
             c = candidate;
             if (badNode == null) {
-                jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
+                jdbc.sql("TRUNCATE keys, pending_deletions, chunk_replicas, chunk_placements, chunks, objects").update();
             }
         }
         assertThat(badNode).as("a usable layout").isNotNull();
@@ -356,8 +360,10 @@ class RepairIT {
         markBad(newer.chunkId(), newer.placed().get(2)); // counted 1
         CoordinatorProperties oneAtATime = new CoordinatorProperties(properties.nodes(), properties.nodeRpcTimeout(),
                 properties.suspectAfter(), properties.deadAfter(), properties.recoveryBeats(), properties.livenessSweep(),
-                properties.repairGrace(), Duration.ZERO, 1, 1, properties.copyTimeout(), properties.repairPassRetention());
-        RepairService capped = new RepairService(repository, nodeClient, tracker, replicaHealth, oneAtATime);
+                properties.repairGrace(), Duration.ZERO, 1, 1, properties.copyTimeout(), properties.repairPassRetention(),
+                properties.gcInterval(), properties.gcReadGrace(), properties.gcPendingTimeout(), properties.gcBatch(),
+                properties.gcMaxInflight(), properties.gcMaxPerNode(), properties.gcPassRetention());
+        RepairService capped = new RepairService(repository, nodeClient, tracker, replicaHealth, oneAtATime, tx);
 
         capped.runPass();
 

@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -485,7 +485,7 @@
+         return jdbc.sql("""
+                 SELECT o.object_id FROM objects o
+                 WHERE o.status IN ('SUPERSEDED', 'DELETED', 'ABANDONED')
+-                  AND (o.status = 'ABANDONED' OR o.retired_at < :cutoff)
++                  AND (o.status IN ('ABANDONED', 'SUPERSEDED') OR o.retired_at < :cutoff)
+                   AND (o.gc_started_at IS NULL OR EXISTS (
+                         SELECT 1 FROM chunks c
+                         JOIN (SELECT chunk_id, node_id FROM chunk_placements

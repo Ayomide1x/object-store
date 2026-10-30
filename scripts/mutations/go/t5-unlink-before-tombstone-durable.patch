@@ -1,0 +1,27 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -470,12 +470,6 @@
+ 		}
+ 		tombstoned = true
+ 	}
+-	if tombstoned {
+-		if err := s.ops.syncDir(s.tombstones); err != nil {
+-			return nil, err
+-		}
+-	}
+-
+ 	removed := make([]bool, len(deletions))
+ 	for i, d := range deletions {
+ 		path, _ := s.path(d.ChunkID) // validated above
+@@ -489,6 +483,11 @@
+ 			return nil, fmt.Errorf("remove chunk %s: %w", d.ChunkID, err)
+ 		}
+ 	}
++	if tombstoned {
++		if err := s.ops.syncDir(s.tombstones); err != nil {
++			return nil, err
++		}
++	}
+ 	if err := s.ops.syncDir(s.chunks); err != nil {
+ 		return nil, err
+ 	}

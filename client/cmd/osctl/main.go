@@ -2,6 +2,10 @@
 //
 //	osctl put <file> <key>
 //	osctl get <key> <file>
+//	osctl rm <key>       the key stops resolving now; its files are deleted
+//	                     after the coordinator's read grace
+//	osctl ls [prefix]    keys that currently resolve
+//	osctl stat <key>     the object and every recorded replica of each chunk
 //
 // Environment:
 //
@@ -34,7 +38,10 @@ const defaultCoordinator = "127.0.0.1:9090"
 
 const usage = `usage:
   osctl put <file> <key>
-  osctl get <key> <file>`
+  osctl get <key> <file>
+  osctl rm <key>
+  osctl ls [prefix]
+  osctl stat <key>`
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -70,6 +77,25 @@ func run(ctx context.Context, log *slog.Logger, args []string) error {
 			return errors.New(usage)
 		}
 		return get(ctx, log, coordAddr, args[1], args[2])
+	case "rm":
+		if len(args) != 2 {
+			return errors.New(usage)
+		}
+		return rm(ctx, log, coordAddr, args[1])
+	case "ls":
+		if len(args) > 2 {
+			return errors.New(usage)
+		}
+		prefix := ""
+		if len(args) == 2 {
+			prefix = args[1]
+		}
+		return ls(ctx, os.Stdout, coordAddr, prefix)
+	case "stat":
+		if len(args) != 2 {
+			return errors.New(usage)
+		}
+		return stat(ctx, os.Stdout, coordAddr, args[1])
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
 	}

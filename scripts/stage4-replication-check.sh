@@ -76,7 +76,7 @@ check_replicas() {
   rows="$(sql "
     SELECT c.chunk_index,
            coalesce((SELECT string_agg(node_id, ',' ORDER BY node_id) FROM chunk_placements p
-                     WHERE p.chunk_id = c.chunk_id AND p.node_id <> ALL('$2'::text[])), '-'),
+                     WHERE p.chunk_id = c.chunk_id AND p.origin = 'initiate' AND p.node_id <> ALL('$2'::text[])), '-'),
            coalesce((SELECT string_agg(node_id, ',' ORDER BY node_id) FROM chunk_replicas r
                      WHERE r.chunk_id = c.chunk_id AND r.origin = 'upload'), '-')
     FROM chunks c WHERE c.object_id = '$1' ORDER BY 1")"
@@ -135,8 +135,9 @@ osctl_run get "replication/all-up-$run" "$work/v1.out" && cmp -s "$work/v1" "$wo
 
 # placement_width OBJECT_ID: how many nodes chunk 0 was placed on (3 before
 # the coordinator detects stopped nodes, the number of ALIVE nodes after).
-placement_width() { sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$1' AND c.chunk_index = 0"; }
-placed_on() { sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$1' AND p.node_id = '$2'"; }
+# Since stage 8, repair records its copy targets as placements too (origin 'repair').
+placement_width() { sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$1' AND c.chunk_index = 0 AND p.origin = 'initiate'"; }
+placed_on() { sql "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) WHERE c.object_id = '$1' AND p.node_id = '$2' AND p.origin = 'initiate'"; }
 
 echo
 echo "2. node2 stopped and DEAD"
@@ -183,7 +184,7 @@ fi
 "${compose[@]}" unpause node3 >/dev/null
 # After unpause, node3 sees the cancelled streams and removes its temps.
 ids3="$(sql "SELECT p.chunk_id FROM chunk_placements p JOIN chunks c USING (chunk_id)
-             WHERE c.object_id = '$obj3' AND p.node_id = 'node3'" | tr '\n' ' ')"
+             WHERE c.object_id = '$obj3' AND p.node_id = 'node3' AND p.origin = 'initiate'" | tr '\n' ' ')"
 leftover=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   leftover="$(docker run --rm --volumes-from "$("${compose[@]}" ps -q node3)" alpine:3 sh -c '
@@ -221,7 +222,7 @@ two_stopped_put() {
   # Fewest live placed nodes on any chunk of this object.
   min_live="$(sql "SELECT min(n) FROM (SELECT count(*) FILTER (WHERE p.node_id NOT IN ('node3', 'node4')) AS n
                    FROM chunks c JOIN chunk_placements p USING (chunk_id)
-                   WHERE c.object_id = '$obj' GROUP BY c.chunk_id) t")"
+                   WHERE c.object_id = '$obj' AND p.origin = 'initiate' GROUP BY c.chunk_id) t")"
   if ((min_live >= 2)); then expected=success; else expected=failure; fi
   echo "   $name: $chunks chunks, fewest live placed nodes on a chunk = $min_live -> expected $expected, actual $actual"
   if [[ "$actual" != "$expected" ]]; then
@@ -298,7 +299,7 @@ mkfile_mib after-detection 10
 if osctl_run put "$work/after-detection" "replication/two-dead-$run"; then
   obj4="$(latest_object "replication/two-dead-$run")"
   bad="$(sql "SELECT count(*) FROM (SELECT c.chunk_id FROM chunks c JOIN chunk_placements p USING (chunk_id)
-              WHERE c.object_id = '$obj4' GROUP BY c.chunk_id
+              WHERE c.object_id = '$obj4' AND p.origin = 'initiate' GROUP BY c.chunk_id
               HAVING string_agg(p.node_id, ',' ORDER BY p.node_id) <> 'node1,node2') t")"
   [[ "$bad" == 0 ]] && check_replicas "$obj4" '{}' \
     && ok "after detection: succeeded, every chunk on exactly node1 and node2" \

@@ -24,6 +24,9 @@ const (
 	CoordinatorService_GetObject_FullMethodName        = "/objectstore.v1.CoordinatorService/GetObject"
 	CoordinatorService_ReportBadReplica_FullMethodName = "/objectstore.v1.CoordinatorService/ReportBadReplica"
 	CoordinatorService_Heartbeat_FullMethodName        = "/objectstore.v1.CoordinatorService/Heartbeat"
+	CoordinatorService_DeleteObject_FullMethodName     = "/objectstore.v1.CoordinatorService/DeleteObject"
+	CoordinatorService_ListObjects_FullMethodName      = "/objectstore.v1.CoordinatorService/ListObjects"
+	CoordinatorService_StatObject_FullMethodName       = "/objectstore.v1.CoordinatorService/StatObject"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -41,7 +44,10 @@ type CoordinatorServiceClient interface {
 	// the client's SHA-256. It then records exactly those replicas, marks the
 	// object COMMITTED and points the key at it, in one transaction. Fewer than 2
 	// verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
-	// overwritten. Completing an already COMMITTED object succeeds without changes.
+	// overwritten. Completing an object that already committed (COMMITTED, or
+	// since SUPERSEDED or DELETED) succeeds without changes. An upload abandoned
+	// by garbage collection (PENDING past the pending timeout) fails with
+	// FAILED_PRECONDITION and can never commit.
 	CompleteUpload(ctx context.Context, in *CompleteUploadRequest, opts ...grpc.CallOption) (*CompleteUploadResponse, error)
 	// GetObject returns the chunk list and the HEALTHY replica locations for a
 	// key. Replicas marked BAD are left out. If any chunk has no healthy replica,
@@ -57,6 +63,17 @@ type CoordinatorServiceClient interface {
 	// a node_id that is still beating fails with FAILED_PRECONDITION. Rejected
 	// beats do not count as signs of life.
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	// DeleteObject removes a key. In one transaction the key stops resolving
+	// and the object it pointed to becomes DELETED; its chunk files are deleted
+	// later, by garbage collection, after a read grace period, so a get that
+	// already holds the chunk list finishes. A key that does not resolve:
+	// NOT_FOUND.
+	DeleteObject(ctx context.Context, in *DeleteObjectRequest, opts ...grpc.CallOption) (*DeleteObjectResponse, error)
+	// ListObjects returns the keys that currently resolve, in key order.
+	ListObjects(ctx context.Context, in *ListObjectsRequest, opts ...grpc.CallOption) (*ListObjectsResponse, error)
+	// StatObject describes the object a key resolves to, with every recorded
+	// replica of every chunk in any state. For inspection: readers use GetObject.
+	StatObject(ctx context.Context, in *StatObjectRequest, opts ...grpc.CallOption) (*StatObjectResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -117,6 +134,36 @@ func (c *coordinatorServiceClient) Heartbeat(ctx context.Context, in *HeartbeatR
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) DeleteObject(ctx context.Context, in *DeleteObjectRequest, opts ...grpc.CallOption) (*DeleteObjectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteObjectResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_DeleteObject_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coordinatorServiceClient) ListObjects(ctx context.Context, in *ListObjectsRequest, opts ...grpc.CallOption) (*ListObjectsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListObjectsResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_ListObjects_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coordinatorServiceClient) StatObject(ctx context.Context, in *StatObjectRequest, opts ...grpc.CallOption) (*StatObjectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatObjectResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_StatObject_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -132,7 +179,10 @@ type CoordinatorServiceServer interface {
 	// the client's SHA-256. It then records exactly those replicas, marks the
 	// object COMMITTED and points the key at it, in one transaction. Fewer than 2
 	// verified replicas for any chunk: FAILED_PRECONDITION. An existing key is
-	// overwritten. Completing an already COMMITTED object succeeds without changes.
+	// overwritten. Completing an object that already committed (COMMITTED, or
+	// since SUPERSEDED or DELETED) succeeds without changes. An upload abandoned
+	// by garbage collection (PENDING past the pending timeout) fails with
+	// FAILED_PRECONDITION and can never commit.
 	CompleteUpload(context.Context, *CompleteUploadRequest) (*CompleteUploadResponse, error)
 	// GetObject returns the chunk list and the HEALTHY replica locations for a
 	// key. Replicas marked BAD are left out. If any chunk has no healthy replica,
@@ -148,6 +198,17 @@ type CoordinatorServiceServer interface {
 	// a node_id that is still beating fails with FAILED_PRECONDITION. Rejected
 	// beats do not count as signs of life.
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// DeleteObject removes a key. In one transaction the key stops resolving
+	// and the object it pointed to becomes DELETED; its chunk files are deleted
+	// later, by garbage collection, after a read grace period, so a get that
+	// already holds the chunk list finishes. A key that does not resolve:
+	// NOT_FOUND.
+	DeleteObject(context.Context, *DeleteObjectRequest) (*DeleteObjectResponse, error)
+	// ListObjects returns the keys that currently resolve, in key order.
+	ListObjects(context.Context, *ListObjectsRequest) (*ListObjectsResponse, error)
+	// StatObject describes the object a key resolves to, with every recorded
+	// replica of every chunk in any state. For inspection: readers use GetObject.
+	StatObject(context.Context, *StatObjectRequest) (*StatObjectResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -172,6 +233,15 @@ func (UnimplementedCoordinatorServiceServer) ReportBadReplica(context.Context, *
 }
 func (UnimplementedCoordinatorServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) DeleteObject(context.Context, *DeleteObjectRequest) (*DeleteObjectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteObject not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) ListObjects(context.Context, *ListObjectsRequest) (*ListObjectsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListObjects not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) StatObject(context.Context, *StatObjectRequest) (*StatObjectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StatObject not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -284,6 +354,60 @@ func _CoordinatorService_Heartbeat_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_DeleteObject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteObjectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).DeleteObject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_DeleteObject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).DeleteObject(ctx, req.(*DeleteObjectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoordinatorService_ListObjects_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListObjectsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).ListObjects(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_ListObjects_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).ListObjects(ctx, req.(*ListObjectsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoordinatorService_StatObject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StatObjectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).StatObject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_StatObject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).StatObject(ctx, req.(*StatObjectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -311,17 +435,30 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Heartbeat",
 			Handler:    _CoordinatorService_Heartbeat_Handler,
 		},
+		{
+			MethodName: "DeleteObject",
+			Handler:    _CoordinatorService_DeleteObject_Handler,
+		},
+		{
+			MethodName: "ListObjects",
+			Handler:    _CoordinatorService_ListObjects_Handler,
+		},
+		{
+			MethodName: "StatObject",
+			Handler:    _CoordinatorService_StatObject_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "objectstore/v1/objectstore.proto",
 }
 
 const (
-	StorageNodeService_WriteChunk_FullMethodName  = "/objectstore.v1.StorageNodeService/WriteChunk"
-	StorageNodeService_ReadChunk_FullMethodName   = "/objectstore.v1.StorageNodeService/ReadChunk"
-	StorageNodeService_StatChunks_FullMethodName  = "/objectstore.v1.StorageNodeService/StatChunks"
-	StorageNodeService_VerifyChunk_FullMethodName = "/objectstore.v1.StorageNodeService/VerifyChunk"
-	StorageNodeService_PushChunk_FullMethodName   = "/objectstore.v1.StorageNodeService/PushChunk"
+	StorageNodeService_WriteChunk_FullMethodName   = "/objectstore.v1.StorageNodeService/WriteChunk"
+	StorageNodeService_ReadChunk_FullMethodName    = "/objectstore.v1.StorageNodeService/ReadChunk"
+	StorageNodeService_StatChunks_FullMethodName   = "/objectstore.v1.StorageNodeService/StatChunks"
+	StorageNodeService_VerifyChunk_FullMethodName  = "/objectstore.v1.StorageNodeService/VerifyChunk"
+	StorageNodeService_PushChunk_FullMethodName    = "/objectstore.v1.StorageNodeService/PushChunk"
+	StorageNodeService_DeleteChunks_FullMethodName = "/objectstore.v1.StorageNodeService/DeleteChunks"
 )
 
 // StorageNodeServiceClient is the client API for StorageNodeService service.
@@ -355,6 +492,15 @@ type StorageNodeServiceClient interface {
 	// RESOURCE_EXHAUSTED); what happened at the target is the outcome. The
 	// coordinator records nothing from this response: it asks the target.
 	PushChunk(ctx context.Context, in *PushChunkRequest, opts ...grpc.CallOption) (*PushChunkResponse, error)
+	// DeleteChunks removes chunk files, for garbage collection ordered by the
+	// coordinator. It is idempotent: a chunk with no file counts as removed
+	// (OUTCOME_ALREADY_ABSENT). With tombstone set, the node first records,
+	// durably, that the chunk ID is deleted, and from then on refuses any write
+	// of it, so a late upload or copy can never bring the file back. Deletion
+	// never modifies a file: it removes the name, so a read that already opened
+	// the file finishes normally. The response names the node, and the
+	// coordinator records a deletion only from the node itself.
+	DeleteChunks(ctx context.Context, in *DeleteChunksRequest, opts ...grpc.CallOption) (*DeleteChunksResponse, error)
 }
 
 type storageNodeServiceClient struct {
@@ -427,6 +573,16 @@ func (c *storageNodeServiceClient) PushChunk(ctx context.Context, in *PushChunkR
 	return out, nil
 }
 
+func (c *storageNodeServiceClient) DeleteChunks(ctx context.Context, in *DeleteChunksRequest, opts ...grpc.CallOption) (*DeleteChunksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteChunksResponse)
+	err := c.cc.Invoke(ctx, StorageNodeService_DeleteChunks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StorageNodeServiceServer is the server API for StorageNodeService service.
 // All implementations must embed UnimplementedStorageNodeServiceServer
 // for forward compatibility.
@@ -458,6 +614,15 @@ type StorageNodeServiceServer interface {
 	// RESOURCE_EXHAUSTED); what happened at the target is the outcome. The
 	// coordinator records nothing from this response: it asks the target.
 	PushChunk(context.Context, *PushChunkRequest) (*PushChunkResponse, error)
+	// DeleteChunks removes chunk files, for garbage collection ordered by the
+	// coordinator. It is idempotent: a chunk with no file counts as removed
+	// (OUTCOME_ALREADY_ABSENT). With tombstone set, the node first records,
+	// durably, that the chunk ID is deleted, and from then on refuses any write
+	// of it, so a late upload or copy can never bring the file back. Deletion
+	// never modifies a file: it removes the name, so a read that already opened
+	// the file finishes normally. The response names the node, and the
+	// coordinator records a deletion only from the node itself.
+	DeleteChunks(context.Context, *DeleteChunksRequest) (*DeleteChunksResponse, error)
 	mustEmbedUnimplementedStorageNodeServiceServer()
 }
 
@@ -482,6 +647,9 @@ func (UnimplementedStorageNodeServiceServer) VerifyChunk(context.Context, *Verif
 }
 func (UnimplementedStorageNodeServiceServer) PushChunk(context.Context, *PushChunkRequest) (*PushChunkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PushChunk not implemented")
+}
+func (UnimplementedStorageNodeServiceServer) DeleteChunks(context.Context, *DeleteChunksRequest) (*DeleteChunksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteChunks not implemented")
 }
 func (UnimplementedStorageNodeServiceServer) mustEmbedUnimplementedStorageNodeServiceServer() {}
 func (UnimplementedStorageNodeServiceServer) testEmbeddedByValue()                            {}
@@ -576,6 +744,24 @@ func _StorageNodeService_PushChunk_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageNodeService_DeleteChunks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteChunksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageNodeServiceServer).DeleteChunks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageNodeService_DeleteChunks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageNodeServiceServer).DeleteChunks(ctx, req.(*DeleteChunksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // StorageNodeService_ServiceDesc is the grpc.ServiceDesc for StorageNodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -594,6 +780,10 @@ var StorageNodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PushChunk",
 			Handler:    _StorageNodeService_PushChunk_Handler,
+		},
+		{
+			MethodName: "DeleteChunks",
+			Handler:    _StorageNodeService_DeleteChunks_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -230,8 +230,7 @@
+         int n = 0;
+         for (BadReplica b : repository.badReplicaCandidates(cutoff, properties.gcBatch())) {
+             long counted = b.healthyNodeIds().stream()
+-                    .filter(id -> RepairService.counts(states.getOrDefault(id, State.UNKNOWN),
+-                            liveness.deadForNanos(id), graceNanos))
++                    .filter(id -> true)
+                     .count();
+             if (counted < MetadataService.MIN_REPLICAS) {
+                 continue;

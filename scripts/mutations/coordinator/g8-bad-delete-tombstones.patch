@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -551,7 +551,7 @@
+     public int insertBadReplicaTask(UUID chunkId, String nodeId) {
+         return jdbc.sql("""
+                 INSERT INTO pending_deletions (chunk_id, node_id, tombstone, reason)
+-                VALUES (:chunkId, :nodeId, false, 'bad-replica')
++                VALUES (:chunkId, :nodeId, true, 'bad-replica')
+                 ON CONFLICT (chunk_id, node_id) DO NOTHING
+                 """)
+                 .param("chunkId", chunkId).param("nodeId", nodeId).update();

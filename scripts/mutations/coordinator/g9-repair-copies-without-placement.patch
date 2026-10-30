@@ -1,0 +1,10 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -274,7 +274,6 @@
+             if (!repository.lockIfCurrent(chunk.objectId())) {
+                 return false;
+             }
+-            repository.insertRepairPlacement(chunk.chunkId(), target.nodeId());
+             return true;
+         });
+         if (!Boolean.TRUE.equals(placed)) {

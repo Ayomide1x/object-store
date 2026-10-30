@@ -17,7 +17,10 @@ import java.util.function.Function;
 
 import com.google.protobuf.ByteString;
 
+import io.github.ayomide1x.objectstore.v1.ChunkDeletion;
 import io.github.ayomide1x.objectstore.v1.ChunkStat;
+import io.github.ayomide1x.objectstore.v1.DeleteChunksRequest;
+import io.github.ayomide1x.objectstore.v1.DeleteChunksResponse;
 import io.github.ayomide1x.objectstore.v1.PushChunkRequest;
 import io.github.ayomide1x.objectstore.v1.PushChunkResponse;
 import io.github.ayomide1x.objectstore.v1.StatChunksRequest;
@@ -164,6 +167,39 @@ public class NodeClient implements DisposableBean {
             return Optional.empty();
         }
         return Optional.of(answer);
+    }
+
+    /** A node's answer to DeleteChunks: the response, or why there is none to act on. */
+    public record DeleteAnswer(DeleteChunksResponse response, String error) {
+    }
+
+    /**
+     * Asks a node to delete chunk files (DeleteChunks), within one node RPC
+     * deadline. The answer counts only if it identifies as that node; a
+     * failure or an answer from another node comes back as an error, and
+     * nothing may be concluded from it.
+     */
+    public DeleteAnswer deleteChunks(Node node, List<MetadataRepository.DeletionTask> tasks) {
+        Deadline deadline = Deadline.after(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        DeleteChunksRequest.Builder req = DeleteChunksRequest.newBuilder().setNodeId(node.nodeId());
+        for (MetadataRepository.DeletionTask t : tasks) {
+            req.addChunks(ChunkDeletion.newBuilder().setChunkId(t.chunkId().toString()).setTombstone(t.tombstone()));
+        }
+        DeleteChunksResponse answer;
+        try {
+            answer = callWithRetry(node, deadline, "DeleteChunks", stub -> stub.deleteChunks(req.build()));
+        } catch (StatusRuntimeException e) {
+            return new DeleteAnswer(null, "DeleteChunks failed: " + e.getStatus());
+        }
+        if (!node.nodeId().equals(answer.getNodeId())) {
+            log.atError()
+                    .addKeyValue("node_id", node.nodeId())
+                    .addKeyValue("responder_node_id", answer.getNodeId())
+                    .addKeyValue("addr", node.internalAddr())
+                    .log("DeleteChunks answered by the wrong node; treated as no answer");
+            return new DeleteAnswer(null, "answered by node '%s'".formatted(answer.getNodeId()));
+        }
+        return new DeleteAnswer(answer, null);
     }
 
     private <T> T callWithRetry(Node node, Deadline deadline, String rpc,

@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataRepository.java
+@@ -511,7 +511,8 @@
+                 FROM chunks c
+                 JOIN (SELECT chunk_id, node_id FROM chunk_placements
+                       UNION SELECT chunk_id, node_id FROM chunk_replicas) f ON f.chunk_id = c.chunk_id
+-                WHERE c.object_id = :id
++                WHERE c.object_id IN (SELECT object_id FROM objects
++                                      WHERE key = (SELECT key FROM objects WHERE object_id = :id))
+                 ON CONFLICT (chunk_id, node_id) DO UPDATE SET tombstone = true, reason = EXCLUDED.reason
+                 WHERE NOT pending_deletions.tombstone
+                 """)

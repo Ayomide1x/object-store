@@ -46,6 +46,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         "coordinator.node-rpc-timeout=500ms",
         "coordinator.liveness-sweep=0",
         "coordinator.repair-interval=0",
+        "coordinator.gc-interval=0",
 })
 class BadReplicaReportIT {
 
@@ -76,7 +77,7 @@ class BadReplicaReportIT {
 
     @BeforeEach
     void clear() {
-        jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
+        jdbc.sql("TRUNCATE keys, pending_deletions, chunk_replicas, chunk_placements, chunks, objects").update();
         nodes.reset();
         for (String n : List.of("node1", "node2", "node3", "node4")) {
             liveness.heartbeat(n, "test-instance");

@@ -52,6 +52,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         "coordinator.node-rpc-timeout=" + LivenessIT.NODE_TIMEOUT_MS + "ms",
         "coordinator.liveness-sweep=0",
         "coordinator.repair-interval=0",
+        "coordinator.gc-interval=0",
 })
 class LivenessIT {
 
@@ -94,7 +95,7 @@ class LivenessIT {
 
     @BeforeEach
     void allAlive() {
-        jdbc.sql("TRUNCATE keys, chunk_replicas, chunk_placements, chunks, objects").update();
+        jdbc.sql("TRUNCATE keys, pending_deletions, chunk_replicas, chunk_placements, chunks, objects").update();
         nodes.reset();
         // Two beats: enough to bring back a node an earlier test left DEAD.
         for (int i = 0; i < 2; i++) {

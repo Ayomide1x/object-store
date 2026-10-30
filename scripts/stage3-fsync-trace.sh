@@ -50,7 +50,7 @@ osctl_run put "$work/payload" "fsync-trace/$$"
 docker stop "$tracer" >/dev/null # SIGTERM: strace detaches and flushes
 expected="$("${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tAc \
   "SELECT count(*) FROM chunk_placements p JOIN chunks c USING (chunk_id) JOIN objects o USING (object_id)
-   WHERE o.key = 'fsync-trace/$$' AND p.node_id = 'node1'")"
+   WHERE o.key = 'fsync-trace/$$' AND p.node_id = 'node1' AND p.origin = 'initiate'")"
 echo "node1 is placed on $expected chunks of this upload"
 
 python3 -I - "$work/trace" "$expected" <<'EOF'

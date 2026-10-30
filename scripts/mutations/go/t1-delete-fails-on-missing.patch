@@ -1,0 +1,11 @@
+--- a/node/internal/chunkstore/chunkstore.go
++++ b/node/internal/chunkstore/chunkstore.go
+@@ -484,7 +484,7 @@
+ 		case err == nil:
+ 			removed[i] = true
+ 		case errors.Is(err, os.ErrNotExist):
+-			// Already gone: deleting is idempotent.
++			return nil, fmt.Errorf("remove chunk %s: %w", d.ChunkID, ErrNotFound)
+ 		default:
+ 			return nil, fmt.Errorf("remove chunk %s: %w", d.ChunkID, err)
+ 		}

@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/GcService.java
+@@ -279,7 +279,7 @@
+                     continue;
+                 }
+                 if (states.get(nodeId) != State.ALIVE) {
+-                    // Not attempted: its rows stay until it confirms, once ALIVE again.
++                    tasks.forEach(t -> repository.confirmDeleted(t.chunkId(), nodeId));
+                     log.atInfo().addKeyValue("node_id", nodeId).addKeyValue("state", states.get(nodeId))
+                             .log("node not ALIVE; its deletions wait");
+                     failed.add(nodeId);

@@ -657,3 +657,94 @@ func TestPushChunkHoldsAReadSlot(t *testing.T) {
 		t.Fatalf("code with the only slot taken = %v, want ResourceExhausted", got)
 	}
 }
+
+func TestDeleteChunks(t *testing.T) {
+	const (
+		missingID    = "11111111-2222-4333-8444-555555555555"
+		thirdChunkID = "44444444-5555-4666-8777-888888888888"
+	)
+	n := startServer(t, 4)
+	writeValid(t, n, testChunkID, []byte("delete me"))
+	writeValid(t, n, otherChunkID, []byte("bad copy, delete without a tombstone"))
+
+	req := &objectstorev1.DeleteChunksRequest{NodeId: "test-node", Chunks: []*objectstorev1.ChunkDeletion{
+		{ChunkId: testChunkID, Tombstone: true},
+		{ChunkId: missingID, Tombstone: true},
+		{ChunkId: otherChunkID, Tombstone: false},
+	}}
+	tests := []struct {
+		name string
+		want []objectstorev1.ChunkDeletionResult_Outcome
+	}{
+		{"first delete", []objectstorev1.ChunkDeletionResult_Outcome{
+			objectstorev1.ChunkDeletionResult_OUTCOME_DELETED,
+			objectstorev1.ChunkDeletionResult_OUTCOME_ALREADY_ABSENT,
+			objectstorev1.ChunkDeletionResult_OUTCOME_DELETED,
+		}},
+		// A retry after a lost response succeeds, reporting every file absent.
+		{"repeated delete", []objectstorev1.ChunkDeletionResult_Outcome{
+			objectstorev1.ChunkDeletionResult_OUTCOME_ALREADY_ABSENT,
+			objectstorev1.ChunkDeletionResult_OUTCOME_ALREADY_ABSENT,
+			objectstorev1.ChunkDeletionResult_OUTCOME_ALREADY_ABSENT,
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := n.client.DeleteChunks(t.Context(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.GetNodeId() != "test-node" {
+				t.Errorf("response node_id = %q, want the node's own ID %q", resp.GetNodeId(), "test-node")
+			}
+			if len(resp.GetResults()) != len(tt.want) {
+				t.Fatalf("got %d results, want %d", len(resp.GetResults()), len(tt.want))
+			}
+			for i, w := range tt.want {
+				got := resp.GetResults()[i]
+				if got.GetChunkId() != req.GetChunks()[i].GetChunkId() || got.GetOutcome() != w {
+					t.Errorf("result %d = %s %s, want %s %s", i, got.GetChunkId(), got.GetOutcome(),
+						req.GetChunks()[i].GetChunkId(), w)
+				}
+			}
+			for _, id := range []string{testChunkID, otherChunkID} {
+				if _, err := os.Stat(n.finalPath(id)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("chunk %s still on disk: %v", id, err)
+				}
+			}
+		})
+	}
+
+	t.Run("tombstoned chunk is refused, untombstoned one can be rewritten", func(t *testing.T) {
+		b := []byte("try again")
+		frames := []*objectstorev1.WriteChunkRequest{header(int64(len(b))), data(b), trailer(sha(b))}
+		_, err := write(t.Context(), n.client, frames)
+		if got := status.Code(err); got != codes.FailedPrecondition {
+			t.Errorf("write of tombstoned chunk: code = %v, want FailedPrecondition", got)
+		}
+		if _, err := os.Stat(n.finalPath(testChunkID)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("refused write left a file: %v", err)
+		}
+		writeValid(t, n, otherChunkID, []byte("a good copy, written again"))
+	})
+
+	t.Run("addressed to another node: nothing deleted", func(t *testing.T) {
+		writeValid(t, n, thirdChunkID, []byte("not yours to delete"))
+		_, err := n.client.DeleteChunks(t.Context(), &objectstorev1.DeleteChunksRequest{NodeId: "other-node",
+			Chunks: []*objectstorev1.ChunkDeletion{{ChunkId: thirdChunkID}}})
+		if got := status.Code(err); got != codes.FailedPrecondition {
+			t.Errorf("code = %v, want FailedPrecondition", got)
+		}
+		if _, err := os.Stat(n.finalPath(thirdChunkID)); err != nil {
+			t.Errorf("chunk deleted by a request for another node: %v", err)
+		}
+	})
+
+	t.Run("invalid ID", func(t *testing.T) {
+		_, err := n.client.DeleteChunks(t.Context(), &objectstorev1.DeleteChunksRequest{NodeId: "test-node",
+			Chunks: []*objectstorev1.ChunkDeletion{{ChunkId: "../etc/passwd"}}})
+		if got := status.Code(err); got != codes.InvalidArgument {
+			t.Errorf("code = %v, want InvalidArgument", got)
+		}
+	})
+}
