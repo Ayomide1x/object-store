@@ -58,6 +58,8 @@ type chunkJSON struct {
 	SizeBytes int64         `json:"size_bytes"`
 	SHA256    string        `json:"sha256"`
 	Replicas  []replicaJSON `json:"replicas"`
+	// By the reconciler's rule: what counts toward the 3-replica target.
+	CountedReplicas int32 `json:"counted_replicas"`
 }
 
 type statResponse struct {
@@ -73,7 +75,7 @@ func toStatResponse(key string, r *objectstorev1.StatObjectResponse) statRespons
 		CommittedAtUnixMillis: r.GetCommittedAtUnixMillis(), Chunks: []chunkJSON{}}
 	for _, c := range r.GetChunks() {
 		cj := chunkJSON{ChunkID: c.GetChunkId(), Index: c.GetIndex(), SizeBytes: c.GetSizeBytes(),
-			SHA256: hex.EncodeToString(c.GetSha256()), Replicas: []replicaJSON{}}
+			SHA256: hex.EncodeToString(c.GetSha256()), Replicas: []replicaJSON{}, CountedReplicas: c.GetCountedReplicas()}
 		for _, rep := range c.GetReplicas() {
 			cj.Replicas = append(cj.Replicas, replicaJSON{NodeID: rep.GetNodeId(),
 				State: strings.TrimPrefix(rep.GetState().String(), "STATE_"), Origin: rep.GetOrigin(),
@@ -122,14 +124,27 @@ type gcPassJSON struct {
 	ObjectsRemoved       int32  `json:"objects_removed"`
 }
 
+type livenessEventJSON struct {
+	EventID int64  `json:"event_id"`
+	NodeID  string `json:"node_id"`
+	// Empty for the events written when the coordinator started.
+	From         string `json:"from"`
+	To           string `json:"to"`
+	AtUnixMillis int64  `json:"at_unix_millis"`
+}
+
 type clusterResponse struct {
-	Nodes                 []nodeJSON       `json:"nodes"`
-	UnderReplicatedChunks int64            `json:"under_replicated_chunks"`
-	PendingDeletions      int64            `json:"pending_deletions"`
-	LastRepairPass        *repairPassJSON  `json:"last_repair_pass"`
-	LastGcPass            *gcPassJSON      `json:"last_gc_pass"`
-	RecentRepairPasses    []repairPassJSON `json:"recent_repair_passes"`
-	RecentGcPasses        []gcPassJSON     `json:"recent_gc_passes"`
+	Nodes                 []nodeJSON `json:"nodes"`
+	UnderReplicatedChunks int64      `json:"under_replicated_chunks"`
+	PendingDeletions      int64      `json:"pending_deletions"`
+	// When the two counts above were computed (the coordinator caches them briefly).
+	CountsAsOfUnixMillis  int64               `json:"counts_as_of_unix_millis"`
+	LastRepairPass        *repairPassJSON     `json:"last_repair_pass"`
+	LastGcPass            *gcPassJSON         `json:"last_gc_pass"`
+	RecentRepairPasses    []repairPassJSON    `json:"recent_repair_passes"`
+	RecentGcPasses        []gcPassJSON        `json:"recent_gc_passes"`
+	RecentLivenessEvents  []livenessEventJSON `json:"recent_liveness_events"`
+	LivenessEventsDropped int64               `json:"liveness_events_dropped"`
 }
 
 func toRepairPass(p *objectstorev1.RepairPass) repairPassJSON {
@@ -150,7 +165,9 @@ func toGcPass(p *objectstorev1.GcPass) gcPassJSON {
 
 func toClusterResponse(r *objectstorev1.GetClusterStatusResponse) clusterResponse {
 	out := clusterResponse{Nodes: []nodeJSON{}, UnderReplicatedChunks: r.GetUnderReplicatedChunks(),
-		PendingDeletions: r.GetPendingDeletions(), RecentRepairPasses: []repairPassJSON{}, RecentGcPasses: []gcPassJSON{}}
+		PendingDeletions: r.GetPendingDeletions(), CountsAsOfUnixMillis: r.GetUnderReplicatedAsOfUnixMillis(),
+		RecentRepairPasses: []repairPassJSON{}, RecentGcPasses: []gcPassJSON{},
+		RecentLivenessEvents: []livenessEventJSON{}, LivenessEventsDropped: r.GetLivenessEventsDropped()}
 	for _, n := range r.GetNodes() {
 		out.Nodes = append(out.Nodes, nodeJSON{NodeID: n.GetNodeId(), Liveness: liveness(n.GetLiveness()),
 			LivenessSinceUnixMillis: n.GetLivenessSinceUnixMillis(), LastHeartbeatUnixMillis: n.GetLastHeartbeatUnixMillis()})
@@ -168,6 +185,14 @@ func toClusterResponse(r *objectstorev1.GetClusterStatusResponse) clusterRespons
 	}
 	for _, p := range r.GetRecentGcPasses() {
 		out.RecentGcPasses = append(out.RecentGcPasses, toGcPass(p))
+	}
+	for _, e := range r.GetRecentLivenessEvents() {
+		from := ""
+		if e.GetFrom() != objectstorev1.NodeLiveness_NODE_LIVENESS_UNSPECIFIED {
+			from = liveness(e.GetFrom())
+		}
+		out.RecentLivenessEvents = append(out.RecentLivenessEvents, livenessEventJSON{EventID: e.GetEventId(),
+			NodeID: e.GetNodeId(), From: from, To: liveness(e.GetTo()), AtUnixMillis: e.GetAtUnixMillis()})
 	}
 	return out
 }

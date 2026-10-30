@@ -1,0 +1,10 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessService.java
+@@ -99,7 +99,6 @@
+         log.atInfo().addKeyValue("node_id", t.nodeId()).addKeyValue("from", t.from()).addKeyValue("to", t.to())
+                 .addKeyValue("since_last_beat", silence).log("node liveness changed");
+         // First, so a failing nodes update below cannot lose the event.
+-        eventLog.record(t.nodeId(), t.from(), t.to());
+         repository.updateNodeState(t.nodeId(), t.to().name());
+         if (t.to() == State.ALIVE) {
+             events.publishEvent(new RepairHint(t.nodeId() + " became ALIVE"));

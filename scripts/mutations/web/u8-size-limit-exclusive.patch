@@ -1,0 +1,9 @@
+--- a/web/src/keys.ts
++++ b/web/src/keys.ts
+@@ -47,5 +47,5 @@
+ 
+ /** Why a file of size bytes won't be sent, or null. */
+ export function sizeProblem(size: number): string | null {
+-  return size > MAX_OBJECT_SIZE ? "This file is larger than the 5 GiB limit." : null;
++  return size >= MAX_OBJECT_SIZE ? "This file is larger than the 5 GiB limit." : null;
+ }

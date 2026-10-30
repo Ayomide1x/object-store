@@ -1,0 +1,11 @@
+--- a/web/src/grid.ts
++++ b/web/src/grid.ts
+@@ -75,7 +75,7 @@
+     const cells = nodes.map((nodeId): Cell => {
+       const r = byNode.get(nodeId);
+       const nodeLiveness = liveness.get(nodeId) ?? "UNKNOWN";
+-      const state: CellState = r === undefined ? "ABSENT" : r.state;
++      const state: CellState = r === undefined ? "BAD" : r.state;
+       const repairCopy = r !== undefined && r.state === "HEALTHY" && r.origin !== "upload";
+       const badReason = r?.state === "BAD" ? (r.bad_reason ?? "") : "";
+       const words = cellWords({ state, repairCopy, badReason });

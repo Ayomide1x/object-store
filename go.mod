@@ -2,6 +2,9 @@ module github.com/Ayomide1x/object-store
 
 go 1.27.0
 
+// web/ is the browser UI (npm); its node_modules can contain .go files.
+ignore ./web
+
 require (
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12

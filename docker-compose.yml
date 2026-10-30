@@ -151,6 +151,15 @@ services:
       COORDINATOR_GC_MAX_PER_NODE: "1"
       # How long rows in the gc_passes table are kept:
       COORDINATOR_GC_PASS_RETENTION: 24h
+      # GetClusterStatus (the web UI polls it through the gateways) reuses its
+      # under-replicated and pending-deletion counts for this long, so the
+      # scan behind them runs at most once per TTL however many tabs watch;
+      # 0 recomputes on every call:
+      COORDINATOR_STATUS_CACHE_TTL: 1s
+      # How long liveness_events rows (the UI's activity feed) are kept. They
+      # are written off the liveness path: a failed write drops the event,
+      # never delays a transition. Pruned at the start of each repair pass:
+      COORDINATOR_LIVENESS_EVENT_RETENTION: 24h
     mem_limit: 768m
     memswap_limit: 768m
     ports:
@@ -251,11 +260,16 @@ services:
   # a transfer that moves no chunk for this long is cut off (there is no
   # whole-request timeout). GATEWAY_CHUNK_WRITE_TIMEOUT and _READ_TIMEOUT
   # bound each replica write and read, as osctl's do. GOMEMLIMIT: Go's soft
-  # memory limit, under mem_limit above.
+  # memory limit, under mem_limit above. GATEWAY_ALLOWED_HOSTS (required):
+  # the Host header values served, host:port, comma-separated; any other Host
+  # gets 403 (against DNS rebinding: a hostile domain resolving to 127.0.0.1).
+  # It must include the host and port you type in the browser. The
+  # healthcheck sends the first entry as its Host. The web UI is served at /.
   gateway1:
     <<: *gateway
     environment:
       GATEWAY_LISTEN_ADDR: ":9081"
+      GATEWAY_ALLOWED_HOSTS: "127.0.0.1:9081,localhost:9081"
       GATEWAY_COORDINATOR: coordinator:9090
       GATEWAY_COORDINATOR_TIMEOUT: 10s
       GATEWAY_MAX_CONCURRENT_UPLOADS: "8"
@@ -271,6 +285,7 @@ services:
     <<: *gateway
     environment:
       GATEWAY_LISTEN_ADDR: ":9082"
+      GATEWAY_ALLOWED_HOSTS: "127.0.0.1:9082,localhost:9082"
       GATEWAY_COORDINATOR: coordinator:9090
       GATEWAY_COORDINATOR_TIMEOUT: 10s
       GATEWAY_MAX_CONCURRENT_UPLOADS: "8"

@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ClusterStatusService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ClusterStatusService.java
+@@ -82,7 +82,7 @@
+     /** The counts, recomputed if older than the TTL. Synchronized: concurrent callers share one scan. */
+     synchronized Counts counts() {
+         long now = ticker.nanos();
+-        if (cached == null || now - cachedAtNanos >= cacheTtlNanos) {
++        if (cached == null) {
+             cached = new Counts(repair.underReplicatedChunks(), repository.countPendingDeletions(),
+                     System.currentTimeMillis());
+             cachedAtNanos = now;

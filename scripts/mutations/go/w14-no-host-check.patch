@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/security.go
++++ b/gateway/internal/httpapi/security.go
+@@ -46,7 +46,7 @@
+ 		allowed[strings.ToLower(h)] = true
+ 	}
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		if !allowed[strings.ToLower(r.Host)] {
++		if false && !allowed[strings.ToLower(r.Host)] {
+ 			w.Header().Set("Connection", "close")
+ 			writeError(w, http.StatusForbidden, "HOST_NOT_ALLOWED",
+ 				fmt.Sprintf("Host %q is not one this gateway serves (GATEWAY_ALLOWED_HOSTS)", r.Host))

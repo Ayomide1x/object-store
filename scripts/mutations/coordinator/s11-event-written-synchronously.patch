@@ -1,0 +1,13 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessEventLog.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessEventLog.java
+@@ -64,6 +64,10 @@
+     /** Queues one event, stamped now. Never blocks; drops (and counts) the event if the queue is full. */
+     public void record(String nodeId, State from, State to) {
+         Event e = new Event(nodeId, from, to, Instant.now());
++        if (startWriter) {
++            sink.write(List.of(e));
++            return;
++        }
+         outstanding.incrementAndGet();
+         if (!queue.offer(e)) {
+             outstanding.decrementAndGet();

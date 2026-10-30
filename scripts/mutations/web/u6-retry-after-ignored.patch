@@ -1,0 +1,11 @@
+--- a/web/src/uploadMessages.ts
++++ b/web/src/uploadMessages.ts
+@@ -47,7 +47,7 @@
+ }
+ 
+ function describeStatus(o: Extract<UploadOutcome, { kind: "http" }>): Notice {
+-  const wait = o.retryAfterSeconds ?? 0;
++  const wait = 0;
+   const later = (text: string): Notice => ({ tone: "error", text, retry: true, retryAfterSeconds: wait });
+   const final = (text: string): Notice => ({ tone: "error", text, retry: false, retryAfterSeconds: 0 });
+   const retryIn = wait > 0 ? ` Retry in ${wait} s.` : " Try again.";

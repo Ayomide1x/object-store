@@ -20,7 +20,9 @@ import org.springframework.stereotype.Service;
 /**
  * Receives heartbeats, runs the timeout sweeper, and persists every liveness
  * transition to the nodes table (for observability, scripts and stage 7). The
- * tracker in memory stays authoritative.
+ * tracker in memory stays authoritative. Each transition is also queued for
+ * the liveness_events history, after the tracker's lock is released and
+ * without waiting on Postgres ({@link LivenessEventLog}).
  */
 @Service
 public class LivenessService implements InitializingBean, DisposableBean {
@@ -34,14 +36,17 @@ public class LivenessService implements InitializingBean, DisposableBean {
     private final Duration sweepEvery;
     private final Map<String, Long> lastPersistedBeat = new ConcurrentHashMap<>();
     private final ApplicationEventPublisher events;
+    private final LivenessEventLog eventLog;
     private ScheduledExecutorService sweeper;
 
     public LivenessService(LivenessTracker tracker, MetadataRepository repository, Ticker ticker,
-            CoordinatorProperties properties, NodeRegistry registry, ApplicationEventPublisher events) {
+            CoordinatorProperties properties, NodeRegistry registry, ApplicationEventPublisher events,
+            LivenessEventLog eventLog) {
         this.tracker = tracker;
         this.repository = repository;
         this.ticker = ticker;
         this.events = events;
+        this.eventLog = eventLog;
         this.sweepEvery = properties.livenessSweep();
         // registry is a dependency only so the nodes table is seeded first.
     }
@@ -50,6 +55,7 @@ public class LivenessService implements InitializingBean, DisposableBean {
     public void afterPropertiesSet() {
         // After a restart nothing is known: say so, rather than leave stale states.
         repository.markAllNodesUnknown();
+        tracker.snapshot().keySet().forEach(n -> eventLog.record(n, null, State.UNKNOWN));
         if (!sweepEvery.isZero()) {
             sweeper = Executors.newSingleThreadScheduledExecutor(r -> Thread.ofPlatform().daemon().name("liveness-sweep").unstarted(r));
             sweeper.scheduleWithFixedDelay(this::sweepSafely, sweepEvery.toMillis(), sweepEvery.toMillis(),
@@ -92,6 +98,8 @@ public class LivenessService implements InitializingBean, DisposableBean {
         String silence = t.silenceNanos() == Long.MAX_VALUE ? "never" : "%.1fs".formatted(t.silenceNanos() / 1e9);
         log.atInfo().addKeyValue("node_id", t.nodeId()).addKeyValue("from", t.from()).addKeyValue("to", t.to())
                 .addKeyValue("since_last_beat", silence).log("node liveness changed");
+        // First, so a failing nodes update below cannot lose the event.
+        eventLog.record(t.nodeId(), t.from(), t.to());
         repository.updateNodeState(t.nodeId(), t.to().name());
         if (t.to() == State.ALIVE) {
             events.publishEvent(new RepairHint(t.nodeId() + " became ALIVE"));

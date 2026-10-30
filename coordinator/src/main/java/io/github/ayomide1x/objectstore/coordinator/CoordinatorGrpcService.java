@@ -31,6 +31,7 @@ import io.github.ayomide1x.objectstore.v1.ReportBadReplicaResponse;
 import io.github.ayomide1x.objectstore.v1.GcPass;
 import io.github.ayomide1x.objectstore.v1.GetClusterStatusRequest;
 import io.github.ayomide1x.objectstore.v1.GetClusterStatusResponse;
+import io.github.ayomide1x.objectstore.v1.LivenessEvent;
 import io.github.ayomide1x.objectstore.v1.NodeAddressSet;
 import io.github.ayomide1x.objectstore.v1.NodeStatus;
 import io.github.ayomide1x.objectstore.v1.RepairPass;
@@ -54,13 +55,15 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
     private final ReplicaHealthService replicaHealth;
     private final LivenessService liveness;
     private final ClusterStatusService clusterStatus;
+    private final RepairService repair;
 
     public CoordinatorGrpcService(MetadataService metadata, ReplicaHealthService replicaHealth,
-            LivenessService liveness, ClusterStatusService clusterStatus) {
+            LivenessService liveness, ClusterStatusService clusterStatus, RepairService repair) {
         this.metadata = metadata;
         this.replicaHealth = replicaHealth;
         this.liveness = liveness;
         this.clusterStatus = clusterStatus;
+        this.repair = repair;
     }
 
     @Override
@@ -180,6 +183,8 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                             .setOrigin(r.origin()).setBadReason(r.badReason() == null ? "" : r.badReason())
                             .setLiveness(toProto(liveness.stateOf(r.nodeId()))));
                 }
+                cb.setCountedReplicas(repair.countedReplicas(c.replicas().stream()
+                        .map(r -> new MetadataRepository.ReplicaRow(r.nodeId(), r.state())).toList()));
                 b.addChunks(cb);
             }
             return b.build();
@@ -189,10 +194,12 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
     @Override
     public void getClusterStatus(GetClusterStatusRequest request, StreamObserver<GetClusterStatusResponse> response) {
         respond(response, () -> {
-            ClusterStatusService.Status st = clusterStatus.status(request.getRecentPasses());
+            ClusterStatusService.Status st = clusterStatus.status(request.getRecentPasses(), request.getRecentEvents());
             GetClusterStatusResponse.Builder b = GetClusterStatusResponse.newBuilder()
-                    .setUnderReplicatedChunks(st.underReplicatedChunks())
-                    .setPendingDeletions(st.pendingDeletions());
+                    .setUnderReplicatedChunks(st.counts().underReplicatedChunks())
+                    .setPendingDeletions(st.counts().pendingDeletions())
+                    .setUnderReplicatedAsOfUnixMillis(st.counts().asOfUnixMillis())
+                    .setLivenessEventsDropped(st.livenessEventsDropped());
             for (ClusterStatusService.NodeView n : st.nodes()) {
                 b.addNodes(NodeStatus.newBuilder().setNodeId(n.row().nodeId()).setLiveness(toProto(n.liveness()))
                         .setLivenessSinceUnixMillis(millis(n.row().stateChangedAt()))
@@ -202,6 +209,12 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
             st.lastGcPass().forEach(p -> b.setLastGcPass(toProto(p)));
             st.recentRepairPasses().forEach(p -> b.addRecentRepairPasses(toProto(p)));
             st.recentGcPasses().forEach(p -> b.addRecentGcPasses(toProto(p)));
+            for (MetadataRepository.LivenessEventRow e : st.recentLivenessEvents()) {
+                b.addRecentLivenessEvents(LivenessEvent.newBuilder().setEventId(e.eventId()).setNodeId(e.nodeId())
+                        .setFrom(e.from() == null ? NodeLiveness.NODE_LIVENESS_UNSPECIFIED
+                                : toProto(LivenessTracker.State.valueOf(e.from())))
+                        .setTo(toProto(LivenessTracker.State.valueOf(e.to()))).setAtUnixMillis(millis(e.at())));
+            }
             return b.build();
         });
     }

@@ -33,10 +33,16 @@ jobs:
           distribution: temurin
           java-version: "25"
       - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: build
         run: |
           make build
           docker compose build
+          (cd web && npm ci && npx playwright install --with-deps chromium)
       # Only arm64 can prove the images run natively there; on amd64 the
       # check's first half fails by design.
       - name: check-arm64
@@ -51,7 +57,7 @@ jobs:
           status=0
           for s in demo stage2-roundtrip stage2-overwrite-check stage3-corrupt-check stage3-crash-check \
                    stage3-fsync-trace stage4-replication-check stage5-failover-check stage6-liveness-check \
-                   stage7-repair-check stage8-gc-check stage10-gateway-check; do
+                   stage7-repair-check stage8-gc-check stage10-gateway-check stage11-ui-check; do
             if scripts/$s.sh > logs/$s.log 2>&1; then
               echo "$s: PASS"
             else
@@ -65,6 +71,9 @@ jobs:
       - name: coordinator mutation check
         if: always()
         run: scripts/coordinator-mutation-check.sh | tee logs/coordinator-mutation.log
+      - name: web mutation check
+        if: always()
+        run: scripts/web-mutation-check.sh | tee logs/web-mutation.log
       - name: logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -73,3 +82,4 @@ jobs:
           path: |
             logs
             coordinator/build/test-results
+            web/test-results

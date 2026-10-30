@@ -1,0 +1,15 @@
+--- a/web/src/poller.ts
++++ b/web/src/poller.ts
+@@ -46,10 +46,11 @@
+ 
+   async function tick() {
+     timer = null;
+-    if (stopped || inFlight || hidden()) {
++    if (stopped || hidden()) {
+       return;
+     }
+     inFlight = true;
++    schedule(interval);
+     try {
+       const data = await deps.load(abort.signal);
+       if (stopped) {

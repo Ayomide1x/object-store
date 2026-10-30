@@ -1,0 +1,22 @@
+--- a/web/src/components/ObjectDetail.tsx
++++ b/web/src/components/ObjectDetail.tsx
+@@ -24,7 +24,18 @@
+       </p>
+       <div className="detail-actions">
+         {/* A plain link: the browser streams the download to disk. */}
+-        <a className="button" href={objectPath(stat.key)} download data-testid="download">
++        <a
++          className="button"
++          href={objectPath(stat.key)}
++          download
++          data-testid="download"
++          onClick={(e) => {
++            e.preventDefault();
++            void fetch(objectPath(stat.key))
++              .then((r) => r.blob())
++              .then((b) => window.open(URL.createObjectURL(b)));
++          }}
++        >
+           Download
+         </a>
+         <button type="button" className="danger-quiet" onClick={onDelete}>

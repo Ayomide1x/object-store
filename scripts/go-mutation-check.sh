@@ -66,6 +66,12 @@ expected_test() {
     w12-not-found-unmapped) echo "TestErrorMapping" ;;
     w13-busy-response-drains-body) echo "TestRefusedUploadDoesNotWaitForItsBody" ;;
     l1-ls-first-page-only) echo "TestLsFollowsEveryPage" ;;
+    w14-no-host-check) echo "TestHostNotAllowedIsRefused" ;;
+    w15-no-cross-origin-check) echo "TestCrossOriginMutationIsRefused" ;;
+    w16-raw-key-in-disposition) echo "TestContentDispositionEncodesKey" ;;
+    w17-inline-disposition) echo "TestDownloadIsAnAttachment" ;;
+    w18-health-probe-sends-listen-host) echo "TestHealthProbeSendsAnAllowedHost" ;;
+    w19-csp-allows-inline-scripts) echo "TestEveryResponseCarriesTheSecurityHeaders" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

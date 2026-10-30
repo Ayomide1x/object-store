@@ -10,4 +10,9 @@ class LivenessConfig {
     Ticker systemTicker() {
         return System::nanoTime;
     }
+
+    @Bean
+    LivenessEventLog.Sink livenessEventSink(MetadataRepository repository) {
+        return repository::insertLivenessEvents;
+    }
 }

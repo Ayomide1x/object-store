@@ -1,0 +1,11 @@
+--- a/web/src/keys.ts
++++ b/web/src/keys.ts
+@@ -21,7 +21,7 @@
+   if (browserUnreachable(key)) {
+     throw new Error(`the key "${key}" can't be reached from a browser`);
+   }
+-  return encodeURIComponent(key);
++  return encodeURI(key);
+ }
+ 
+ /** The object's URL path: /objects/{key}. */

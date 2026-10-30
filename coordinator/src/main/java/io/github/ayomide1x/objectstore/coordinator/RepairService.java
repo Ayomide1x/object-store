@@ -100,9 +100,22 @@ public class RepairService implements InitializingBean, DisposableBean {
 
     /** The replicas of c that count: HEALTHY rows whose node passes {@link #counts}, given states. */
     private int countedReplicas(RepairChunk c, Map<String, State> states) {
+        return countedReplicas(c.replicas(), states);
+    }
+
+    /**
+     * How many of a chunk's replica rows count toward the target, now, by the
+     * same rule as a pass. For StatObject, so observers see the reconciler's
+     * own count per chunk.
+     */
+    public int countedReplicas(List<ReplicaRow> replicas) {
+        return countedReplicas(replicas, liveness.snapshot());
+    }
+
+    private int countedReplicas(List<ReplicaRow> replicas, Map<String, State> states) {
         long graceNanos = properties.repairGrace().toNanos();
         int counted = 0;
-        for (ReplicaRow r : c.replicas()) {
+        for (ReplicaRow r : replicas) {
             if (r.state().equals("HEALTHY")
                     && counts(states.getOrDefault(r.nodeId(), State.UNKNOWN), liveness.deadForNanos(r.nodeId()), graceNanos)) {
                 counted++;
@@ -159,6 +172,7 @@ public class RepairService implements InitializingBean, DisposableBean {
     /** Runs one reconciler pass. Synchronized: passes never overlap. */
     public synchronized PassResult runPass() {
         repository.pruneRepairPasses(properties.repairPassRetention());
+        repository.pruneLivenessEvents(properties.livenessEventRetention());
         long passId = repository.startRepairPass();
 
         Map<String, State> states = liveness.snapshot();

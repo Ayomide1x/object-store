@@ -107,6 +107,8 @@ code="$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H 'Transfer-Encoding: ch
   --data-binary @"$work/small" "$(key_url "$GATEWAY1" "$(key chunked)")")"
 [[ "$code" == 411 ]] && ok "chunked PUT: 411" || fail "chunked PUT: got $code, want 411"
 # curl always declares a length for a body, so the header-less PUT is sent raw.
+# With the Host a real client sends: since stage 11 the gateway refuses any
+# Host not in GATEWAY_ALLOWED_HOSTS with 403.
 raw_status() {
   python3 -I - "$1" <<'EOF'
 import socket, sys
@@ -115,9 +117,9 @@ s.sendall(sys.argv[1].encode())
 print(s.recv(200).split(b"\r\n")[0].decode())
 EOF
 }
-line="$(raw_status "PUT /objects/stage10%2F$run%2Fno-length HTTP/1.1"$'\r\n'"Host: x"$'\r\n\r\n')"
+line="$(raw_status "PUT /objects/stage10%2F$run%2Fno-length HTTP/1.1"$'\r\n'"Host: 127.0.0.1:9081"$'\r\n\r\n')"
 [[ "$line" == *" 411 "* ]] && ok "PUT without Content-Length: $line" || fail "PUT without Content-Length: got '$line', want 411"
-line="$(raw_status "PUT /objects/stage10%2F$run%2Ftoo-big HTTP/1.1"$'\r\n'"Host: x"$'\r\n'"Content-Length: $(((5 << 30) + 1))"$'\r\n'"Expect: 100-continue"$'\r\n\r\n')"
+line="$(raw_status "PUT /objects/stage10%2F$run%2Ftoo-big HTTP/1.1"$'\r\n'"Host: 127.0.0.1:9081"$'\r\n'"Content-Length: $(((5 << 30) + 1))"$'\r\n'"Expect: 100-continue"$'\r\n\r\n')"
 [[ "$line" == *" 413 "* ]] && ok "PUT of 5 GiB + 1 byte: $line, before any body was sent" || fail "oversized PUT: got '$line', want 413"
 initiated_after="$(sql "SELECT count(*) FROM objects")"
 [[ "$initiated_after" == "$initiated_before" ]] && ok "the coordinator was asked nothing (objects rows: $initiated_after)" \

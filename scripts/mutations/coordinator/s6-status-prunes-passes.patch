@@ -1,14 +1,14 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ClusterStatusService.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ClusterStatusService.java
-@@ -40,8 +40,10 @@
-      * is clamped. One read-only transaction, so the counts are one snapshot of
-      * Postgres (liveness comes from memory, as everywhere).
+@@ -66,8 +66,10 @@
+      * (liveness comes from memory, as everywhere); the counts may be up to the
+      * cache TTL older, and say when they were computed.
       */
 -    @Transactional(readOnly = true)
 +    @Transactional
-     public Status status(int recentPasses) {
+     public Status status(int recentPasses, int recentEvents) {
 +        repository.pruneRepairPasses(java.time.Duration.ofDays(1));
 +        repository.pruneGcPasses(java.time.Duration.ofDays(1));
-         if (recentPasses < 0) {
-             throw RequestException.invalid("recent_passes %d is negative".formatted(recentPasses));
-         }
+         int passes = clamp("recent_passes", recentPasses, DEFAULT_RECENT_PASSES, MAX_RECENT_PASSES);
+         int events = clamp("recent_events", recentEvents, DEFAULT_RECENT_EVENTS, MAX_RECENT_EVENTS);
+         List<NodeView> nodes = repository.listNodeRows().stream()

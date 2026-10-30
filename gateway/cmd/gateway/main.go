@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/Ayomide1x/object-store/gateway/internal/httpapi"
+	"github.com/Ayomide1x/object-store/gateway/internal/webui"
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 )
 
@@ -42,7 +43,7 @@ type config struct {
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "health" {
-		if err := checkHealth(); err != nil {
+		if err := checkHealth(os.Getenv("GATEWAY_LISTEN_ADDR"), os.Getenv("GATEWAY_ALLOWED_HOSTS")); err != nil {
 			fmt.Fprintln(os.Stderr, "unhealthy:", err)
 			os.Exit(1)
 		}
@@ -75,6 +76,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	defer conn.Close()
 
+	if !webui.Built() {
+		log.Warn("web UI not built into this binary: / answers 503 (run make web, then rebuild)")
+	}
 	api := httpapi.New(objectstorev1.NewCoordinatorServiceClient(conn), cfg.api, log)
 	srv := &http.Server{
 		Addr:    cfg.listenAddr,
@@ -93,7 +97,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	go func() {
 		log.Info("gateway listening", "addr", cfg.listenAddr, "coordinator", cfg.coordinatorAddr,
 			"max_concurrent_uploads", cfg.api.MaxUploads, "max_concurrent_downloads", cfg.api.MaxDownloads,
-			"stall_timeout", cfg.api.StallTimeout.String())
+			"stall_timeout", cfg.api.StallTimeout.String(), "allowed_hosts", cfg.api.AllowedHosts)
 		serveErr <- srv.ListenAndServe()
 	}()
 
@@ -114,16 +118,28 @@ func run(ctx context.Context, log *slog.Logger) error {
 // checkHealth asks the local gateway's /healthz. It says only that the
 // process is serving HTTP, not that the coordinator is reachable: a
 // coordinator outage must not get healthy gateways restarted.
-func checkHealth() error {
-	addr := os.Getenv("GATEWAY_LISTEN_ADDR")
-	if addr == "" {
+//
+// It connects to the listen address but sends the first allowed host as
+// Host, so the probe passes the Host check like any browser request; there
+// is no exemption for /healthz.
+func checkHealth(listenAddr, allowedHosts string) error {
+	if listenAddr == "" {
 		return fmt.Errorf("GATEWAY_LISTEN_ADDR is required")
 	}
-	if strings.HasPrefix(addr, ":") {
-		addr = "127.0.0.1" + addr
+	if strings.HasPrefix(listenAddr, ":") {
+		listenAddr = "127.0.0.1" + listenAddr
 	}
+	hosts, err := httpapi.ParseAllowedHosts(allowedHosts)
+	if err != nil {
+		return fmt.Errorf("GATEWAY_ALLOWED_HOSTS: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+listenAddr+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	req.Host = hosts[0]
 	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + addr + "/healthz")
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -146,6 +162,10 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("GATEWAY_COORDINATOR is required")
 	}
 	var err error
+	if cfg.api.AllowedHosts, err = httpapi.ParseAllowedHosts(os.Getenv("GATEWAY_ALLOWED_HOSTS")); err != nil {
+		return config{}, fmt.Errorf("GATEWAY_ALLOWED_HOSTS: %w", err)
+	}
+	cfg.api.UI = webui.Handler()
 	if cfg.api.MaxUploads, err = intEnv("GATEWAY_MAX_CONCURRENT_UPLOADS", 8); err != nil {
 		return config{}, err
 	}

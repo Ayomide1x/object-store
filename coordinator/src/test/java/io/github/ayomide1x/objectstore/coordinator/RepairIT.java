@@ -362,7 +362,8 @@ class RepairIT {
                 properties.suspectAfter(), properties.deadAfter(), properties.recoveryBeats(), properties.livenessSweep(),
                 properties.repairGrace(), Duration.ZERO, 1, 1, properties.copyTimeout(), properties.repairPassRetention(),
                 properties.gcInterval(), properties.gcReadGrace(), properties.gcPendingTimeout(), properties.gcBatch(),
-                properties.gcMaxInflight(), properties.gcMaxPerNode(), properties.gcPassRetention());
+                properties.gcMaxInflight(), properties.gcMaxPerNode(), properties.gcPassRetention(),
+                properties.statusCacheTtl(), properties.livenessEventRetention(), properties.livenessEventWriter());
         RepairService capped = new RepairService(repository, nodeClient, tracker, replicaHealth, oneAtATime, tx);
 
         capped.runPass();

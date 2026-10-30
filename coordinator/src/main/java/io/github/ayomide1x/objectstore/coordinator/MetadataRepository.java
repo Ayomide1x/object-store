@@ -177,6 +177,34 @@ public class MetadataRepository {
         jdbc.sql("UPDATE nodes SET state = 'UNKNOWN', state_changed_at = clock_timestamp()").update();
     }
 
+    /** Inserts liveness events, one row each. Called only by {@link LivenessEventLog}'s writer. */
+    public void insertLivenessEvents(List<LivenessEventLog.Event> events) {
+        for (LivenessEventLog.Event e : events) {
+            jdbc.sql("INSERT INTO liveness_events (node_id, from_state, to_state, at) VALUES (:id, :from, :to, :at)")
+                    .param("id", e.nodeId()).param("from", e.from() == null ? null : e.from().name())
+                    .param("to", e.to().name()).param("at", java.time.OffsetDateTime.ofInstant(e.at(), java.time.ZoneOffset.UTC))
+                    .update();
+        }
+    }
+
+    public int pruneLivenessEvents(java.time.Duration retention) {
+        return jdbc.sql("DELETE FROM liveness_events WHERE at < clock_timestamp() - make_interval(secs => :secs)")
+                .param("secs", (double) retention.toMillis() / 1000).update();
+    }
+
+    /** A liveness_events row. from is null for the events written at coordinator startup. */
+    public record LivenessEventRow(long eventId, String nodeId, String from, String to, OffsetDateTime at) {
+    }
+
+    /** The most recent liveness events, newest first. */
+    public List<LivenessEventRow> recentLivenessEvents(int limit) {
+        return jdbc.sql("SELECT * FROM liveness_events ORDER BY event_id DESC LIMIT :limit")
+                .param("limit", limit)
+                .query((rs, i) -> new LivenessEventRow(rs.getLong("event_id"), rs.getString("node_id"),
+                        rs.getString("from_state"), rs.getString("to_state"), rs.getObject("at", OffsetDateTime.class)))
+                .list();
+    }
+
     public void updateNodeState(String nodeId, String state) {
         jdbc.sql("UPDATE nodes SET state = :state, state_changed_at = clock_timestamp() WHERE node_id = :id")
                 .param("state", state).param("id", nodeId).update();

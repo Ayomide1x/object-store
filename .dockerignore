@@ -3,3 +3,7 @@ bin
 coordinator/build
 coordinator/.gradle
 **/*.test
+web/node_modules
+web/test-results
+web/playwright-report
+gateway/internal/webui/build/dist

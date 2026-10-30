@@ -48,6 +48,13 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                       per node
  * @param gcPassRetention {@code COORDINATOR_GC_PASS_RETENTION}: how long gc_passes rows
  *                       are kept
+ * @param statusCacheTtl {@code COORDINATOR_STATUS_CACHE_TTL}: how long GetClusterStatus
+ *                       reuses its under-replicated and pending-deletion counts; 0 recomputes
+ *                       them on every call
+ * @param livenessEventRetention {@code COORDINATOR_LIVENESS_EVENT_RETENTION}: how long
+ *                       liveness_events rows are kept
+ * @param livenessEventWriter {@code COORDINATOR_LIVENESS_EVENT_WRITER}: whether the thread
+ *                       that writes liveness events runs; false only in tests, which flush by hand
  */
 @ConfigurationProperties("coordinator")
 public record CoordinatorProperties(
@@ -69,7 +76,10 @@ public record CoordinatorProperties(
         @DefaultValue("256") int gcBatch,
         @DefaultValue("4") int gcMaxInflight,
         @DefaultValue("1") int gcMaxPerNode,
-        @DefaultValue("24h") Duration gcPassRetention) {
+        @DefaultValue("24h") Duration gcPassRetention,
+        @DefaultValue("1s") Duration statusCacheTtl,
+        @DefaultValue("24h") Duration livenessEventRetention,
+        @DefaultValue("true") boolean livenessEventWriter) {
 
     public CoordinatorProperties {
         if (suspectAfter.isNegative() || suspectAfter.isZero() || deadAfter.compareTo(suspectAfter) <= 0) {
@@ -84,6 +94,9 @@ public record CoordinatorProperties(
         }
         if (gcBatch < 1 || gcMaxInflight < 1 || gcMaxPerNode < 1) {
             throw new IllegalStateException("COORDINATOR_GC_BATCH, _MAX_INFLIGHT and _MAX_PER_NODE must be >= 1");
+        }
+        if (statusCacheTtl.isNegative()) {
+            throw new IllegalStateException("COORDINATOR_STATUS_CACHE_TTL must be >= 0, got " + statusCacheTtl);
         }
         if (recoveryBeats < 1) {
             throw new IllegalStateException("COORDINATOR_RECOVERY_BEATS must be >= 1, got " + recoveryBeats);

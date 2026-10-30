@@ -1,0 +1,9 @@
+--- a/web/src/components/KeyText.tsx
++++ b/web/src/components/KeyText.tsx
+@@ -1,5 +1,5 @@
+ // A key is text a user typed, possibly hostile. It is only ever rendered as a
+ // React text child, never as markup (lint forbids the alternatives).
+ export function KeyText({ value }: { value: string }) {
+-  return <span className="key">{value}</span>;
++  return <span className="key" dangerouslySetInnerHTML={{ __html: value }} />;
+ }

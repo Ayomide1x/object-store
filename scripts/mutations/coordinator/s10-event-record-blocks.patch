@@ -1,0 +1,16 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessEventLog.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/LivenessEventLog.java
+@@ -65,7 +65,12 @@
+     public void record(String nodeId, State from, State to) {
+         Event e = new Event(nodeId, from, to, Instant.now());
+         outstanding.incrementAndGet();
+-        if (!queue.offer(e)) {
++        try {
++            queue.put(e);
++        } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
++        }
++        if (false) {
+             outstanding.decrementAndGet();
+             long n = dropped.incrementAndGet();
+             log.atWarn().addKeyValue("node_id", nodeId).addKeyValue("from", from).addKeyValue("to", to)

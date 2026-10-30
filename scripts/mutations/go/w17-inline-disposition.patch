@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/security.go
++++ b/gateway/internal/httpapi/security.go
+@@ -101,7 +101,7 @@
+ 			fmt.Fprintf(&exact, "%%%02X", b)
+ 		}
+ 	}
+-	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, fallback.String(), exact.String())
++	return fmt.Sprintf(`inline; filename="%s"; filename*=UTF-8''%s`, fallback.String(), exact.String())
+ }
+ 
+ // isAttrChar reports whether b may appear unencoded in an RFC 5987 value.

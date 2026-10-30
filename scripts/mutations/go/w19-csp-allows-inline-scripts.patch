@@ -1,0 +1,11 @@
+--- a/gateway/internal/webui/webui.go
++++ b/gateway/internal/webui/webui.go
+@@ -18,7 +18,7 @@
+ // csp lets the page load only its own scripts, styles, fonts and images,
+ // talk only to its own origin, and never be framed. No 'unsafe-inline':
+ // even a key rendered as markup by mistake could not run a script.
+-const csp = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; " +
++const csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self'; font-src 'self'; " +
+ 	"connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+ 
+ // Handler serves the embedded build: index.html at / and hashed files under

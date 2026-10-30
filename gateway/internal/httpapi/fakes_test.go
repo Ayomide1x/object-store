@@ -309,6 +309,7 @@ func (c *fakeCoordinator) StatObject(_ context.Context, req *objectstorev1.StatO
 			cs.Replicas = append(cs.Replicas, &objectstorev1.ReplicaStatus{NodeId: n.id, State: objectstorev1.ReplicaStatus_STATE_HEALTHY,
 				Origin: "upload", Liveness: objectstorev1.NodeLiveness_NODE_LIVENESS_ALIVE})
 		}
+		cs.CountedReplicas = int32(len(cs.Replicas))
 		resp.Chunks = append(resp.Chunks, cs)
 	}
 	return resp, nil
@@ -319,7 +320,12 @@ func (c *fakeCoordinator) GetClusterStatus(context.Context, *objectstorev1.GetCl
 		return nil, err
 	}
 	resp := &objectstorev1.GetClusterStatusResponse{UnderReplicatedChunks: 2, PendingDeletions: 5,
-		LastRepairPass: &objectstorev1.RepairPass{PassId: 9, CopiesStarted: 1}}
+		LastRepairPass: &objectstorev1.RepairPass{PassId: 9, CopiesStarted: 1}, UnderReplicatedAsOfUnixMillis: 1234,
+		LivenessEventsDropped: 3, RecentLivenessEvents: []*objectstorev1.LivenessEvent{
+			{EventId: 2, NodeId: "node2", From: objectstorev1.NodeLiveness_NODE_LIVENESS_ALIVE,
+				To: objectstorev1.NodeLiveness_NODE_LIVENESS_SUSPECT, AtUnixMillis: 99},
+			{EventId: 1, NodeId: "node2", To: objectstorev1.NodeLiveness_NODE_LIVENESS_UNKNOWN, AtUnixMillis: 98},
+		}}
 	for _, n := range c.nodes {
 		resp.Nodes = append(resp.Nodes, &objectstorev1.NodeStatus{NodeId: n.id, Liveness: objectstorev1.NodeLiveness_NODE_LIVENESS_ALIVE})
 	}
@@ -363,7 +369,7 @@ func listen(t *testing.T) net.Listener {
 
 func newCluster(t *testing.T, o options) *cluster {
 	t.Helper()
-	if o.cfg == (Config{}) {
+	if o.cfg.MaxUploads == 0 {
 		o.cfg = defaultConfig()
 	}
 	if o.chunkSize == 0 {
@@ -395,8 +401,13 @@ func newCluster(t *testing.T, o options) *cluster {
 	}
 	t.Cleanup(func() { conn.Close() })
 	log := slog.New(slog.NewTextHandler(testLogOut, nil))
+	c.srv = httptest.NewUnstartedServer(nil)
+	if o.cfg.AllowedHosts == nil {
+		// The test server's address, as http.Client sends it, and "x", the
+		// Host of the hand-written requests.
+		o.cfg.AllowedHosts = []string{c.srv.Listener.Addr().String(), "x"}
+	}
 	h := New(objectstorev1.NewCoordinatorServiceClient(conn), o.cfg, log).Handler()
-	c.srv = httptest.NewUnstartedServer(h)
 	c.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { c.handled <- struct{}{} }()
 		h.ServeHTTP(w, r)

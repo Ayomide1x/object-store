@@ -1,7 +1,8 @@
 # On every push and pull request: the fast checks. Go formatting, vet and
 # tests; the protobuf lint and wire-compatibility check (invariant 9); the
 # coordinator's tests against a real Postgres (Testcontainers uses the
-# runner's Docker). The slow checks run weekly, in acceptance.yml.
+# runner's Docker); the web UI's lint, typecheck, unit tests and build. The
+# slow checks run weekly, in acceptance.yml.
 name: ci
 
 on:
@@ -60,3 +61,27 @@ jobs:
         with:
           name: coordinator-test-reports
           path: coordinator/build/reports/tests/test
+
+  # The web UI. Go doesn't need it built (the embed directory always holds a
+  # README), so this job stands alone.
+  web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: lint
+        run: npm run lint
+      - name: typecheck
+        run: npm run typecheck
+      - name: unit tests
+        run: npm test
+      - name: build
+        run: npx vite build

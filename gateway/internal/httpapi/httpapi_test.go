@@ -227,6 +227,11 @@ func TestKeyEncoding(t *testing.T) {
 			if resp.StatusCode != http.StatusOK || st.Key != key {
 				t.Fatalf("stat: %s, key %q", resp.Status, st.Key)
 			}
+			for _, ch := range st.Chunks {
+				if ch.CountedReplicas != 3 {
+					t.Fatalf("stat: chunk %d counted_replicas %d, want 3", ch.Index, ch.CountedReplicas)
+				}
+			}
 		})
 	}
 
@@ -652,6 +657,11 @@ func TestClusterJSON(t *testing.T) {
 	}
 	if len(cl.Nodes) != 3 || cl.Nodes[0].Liveness != "ALIVE" || cl.UnderReplicatedChunks != 2 ||
 		cl.PendingDeletions != 5 || cl.LastRepairPass == nil || cl.LastRepairPass.CopiesStarted != 1 || cl.LastGcPass != nil {
+		t.Fatalf("cluster %+v", cl)
+	}
+	if cl.CountsAsOfUnixMillis != 1234 || cl.LivenessEventsDropped != 3 || len(cl.RecentLivenessEvents) != 2 ||
+		cl.RecentLivenessEvents[0] != (livenessEventJSON{EventID: 2, NodeID: "node2", From: "ALIVE", To: "SUSPECT", AtUnixMillis: 99}) ||
+		cl.RecentLivenessEvents[1].From != "" || cl.RecentLivenessEvents[1].To != "UNKNOWN" {
 		t.Fatalf("cluster %+v", cl)
 	}
 }

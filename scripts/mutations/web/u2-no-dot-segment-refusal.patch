@@ -1,0 +1,11 @@
+--- a/web/src/keys.ts
++++ b/web/src/keys.ts
+@@ -10,7 +10,7 @@
+  * addressed from a browser at all; osctl and curl can.
+  */
+ export function browserUnreachable(key: string): boolean {
+-  return key === "." || key === "..";
++  return key === "\u0000";
+ }
+ 
+ /** One path segment for key. Throws for a key a browser can't address. */

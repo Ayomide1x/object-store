@@ -36,6 +36,8 @@ import io.github.ayomide1x.objectstore.v1.NodeAddressSet;
 import io.github.ayomide1x.objectstore.v1.NodeLiveness;
 import io.github.ayomide1x.objectstore.v1.NodeLocation;
 import io.github.ayomide1x.objectstore.v1.NodeStatus;
+import io.github.ayomide1x.objectstore.v1.StatObjectRequest;
+import io.github.ayomide1x.objectstore.v1.StatObjectResponse;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
@@ -56,9 +58,12 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
  * The RPCs and fields stage 10 added for the gateway: ListObjects pagination,
- * the node address set, and GetClusterStatus. Calls go through the gRPC
- * adapter itself (in process), so request defaults are exercised as a caller
- * sends them. Schedulers and the liveness sweeper are off.
+ * the node address set, and GetClusterStatus; and stage 11's additions for the
+ * web UI: counted replicas per chunk, liveness events, and the status cache.
+ * Calls go through the gRPC adapter itself (in process), so request defaults
+ * are exercised as a caller sends them. Schedulers, the liveness sweeper and
+ * the event writer are off (events are flushed by hand), and the status cache
+ * is off except where a test builds its own.
  */
 @Testcontainers
 @SpringBootTest(properties = {
@@ -68,6 +73,8 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         "coordinator.liveness-sweep=0",
         "coordinator.repair-interval=0",
         "coordinator.gc-interval=0",
+        "coordinator.status-cache-ttl=0",
+        "coordinator.liveness-event-writer=false",
 })
 class GatewayRpcIT {
 
@@ -106,16 +113,23 @@ class GatewayRpcIT {
     private final RepairService repair;
     private final CoordinatorProperties properties;
     private final JdbcClient jdbc;
+    private final LivenessEventLog eventLog;
+    private final MetadataRepository repository;
+    private final LivenessTracker tracker;
 
     @Autowired
     GatewayRpcIT(CoordinatorGrpcService grpc, MetadataService metadata, LivenessService liveness, RepairService repair,
-            CoordinatorProperties properties, JdbcClient jdbc) {
+            CoordinatorProperties properties, JdbcClient jdbc, LivenessEventLog eventLog, MetadataRepository repository,
+            LivenessTracker tracker) {
         this.grpc = grpc;
         this.metadata = metadata;
         this.liveness = liveness;
         this.repair = repair;
         this.properties = properties;
         this.jdbc = jdbc;
+        this.eventLog = eventLog;
+        this.repository = repository;
+        this.tracker = tracker;
     }
 
     @BeforeEach
@@ -124,6 +138,8 @@ class GatewayRpcIT {
         nodes.reset();
         beatAllBut(null);
         beatAllBut(null);
+        eventLog.flush();
+        jdbc.sql("TRUNCATE liveness_events").update();
     }
 
     private void beatAllBut(String skipped) {
@@ -437,7 +453,7 @@ class GatewayRpcIT {
 
     private Map<String, Long> rowCounts() {
         List<String> tables = List.of("nodes", "objects", "keys", "chunks", "chunk_placements", "chunk_replicas",
-                "pending_deletions", "repair_passes", "gc_passes");
+                "pending_deletions", "repair_passes", "gc_passes", "liveness_events");
         return tables.stream().collect(Collectors.toMap(t -> t,
                 t -> jdbc.sql("SELECT count(*) FROM " + t).query(Long.class).single()));
     }
@@ -455,6 +471,7 @@ class GatewayRpcIT {
         jdbc.sql("INSERT INTO repair_passes (started_at, finished_at) VALUES (now() - interval '400 days', now() - interval '400 days')").update();
         jdbc.sql("INSERT INTO gc_passes (started_at, finished_at) VALUES (now() - interval '400 days', now() - interval '400 days')").update();
         dead("node3", properties.repairGrace().plusSeconds(1)); // something to repair, if anything acted
+        eventLog.flush();
         Map<String, Long> before = rowCounts();
         String nodesBefore = nodesSnapshot();
 
@@ -465,5 +482,119 @@ class GatewayRpcIT {
         assertThat(rowCounts()).isEqualTo(before);
         assertThat(nodesSnapshot()).isEqualTo(nodesBefore);
         assertThat(nodes.pushes).isEmpty();
+    }
+
+    private StatObjectResponse stat(String key) {
+        return call(grpc::statObject, StatObjectRequest.newBuilder().setKey(key).build());
+    }
+
+    /**
+     * counted_replicas is the reconciler's own rule, chunk by chunk.
+     * Mutation: StatObject counts every HEALTHY row, ignoring liveness and the grace.
+     */
+    @Test
+    void countedReplicasPerChunkFollowTheReconcilersRule() {
+        One one = commitOneChunk("counted");
+        assertThat(stat("counted").getChunks(0).getCountedReplicas()).isEqualTo(3);
+
+        markBad(one.chunkId(), one.placed().get(0));
+        assertThat(stat("counted").getChunks(0).getCountedReplicas()).as("BAD never counts").isEqualTo(2);
+
+        String down = one.placed().get(1);
+        dead(down, properties.repairGrace().minusSeconds(1));
+        assertThat(stat("counted").getChunks(0).getCountedReplicas()).as("DEAD within the grace").isEqualTo(2);
+
+        clock.advance(Duration.ofSeconds(2));
+        beatAllBut(down);
+        assertThat(stat("counted").getChunks(0).getCountedReplicas()).as("DEAD past the grace").isEqualTo(1);
+        assertThat(status().getUnderReplicatedChunks()).isEqualTo(1);
+    }
+
+    /** Mutation: LivenessService does not record a transition (the event line is removed). */
+    @Test
+    void livenessEventsAreReturnedNewestFirst() {
+        clock.advance(Duration.ofSeconds(7));
+        beatAllBut("node2");
+        liveness.sweep();
+        clock.advance(Duration.ofSeconds(9));
+        beatAllBut("node2");
+        liveness.sweep();
+        liveness.heartbeat("node2", "test-instance");
+        clock.advance(Duration.ofSeconds(1));
+        liveness.heartbeat("node2", "test-instance");
+        eventLog.flush();
+
+        GetClusterStatusResponse st = status();
+
+        assertThat(st.getRecentLivenessEventsList()).extracting(e -> e.getNodeId() + ":" + e.getFrom() + ">" + e.getTo())
+                .containsExactly(
+                        "node2:NODE_LIVENESS_DEAD>NODE_LIVENESS_ALIVE",
+                        "node2:NODE_LIVENESS_SUSPECT>NODE_LIVENESS_DEAD",
+                        "node2:NODE_LIVENESS_ALIVE>NODE_LIVENESS_SUSPECT");
+        assertThat(st.getRecentLivenessEventsList()).allMatch(e -> e.getAtUnixMillis() > 0 && e.getEventId() > 0);
+        assertThat(st.getLivenessEventsDropped()).isZero();
+    }
+
+    @Test
+    void recentEventsDefaultTo20AndLargerValuesAreClampedNegativeRejected() {
+        jdbc.sql("""
+                INSERT INTO liveness_events (node_id, from_state, to_state, at)
+                SELECT 'node1', 'ALIVE', 'SUSPECT', now() FROM generate_series(1, 150)
+                """).update();
+
+        assertThat(status().getRecentLivenessEventsList()).hasSize(ClusterStatusService.DEFAULT_RECENT_EVENTS);
+        assertThat(call(grpc::getClusterStatus, GetClusterStatusRequest.newBuilder().setRecentEvents(500).build())
+                .getRecentLivenessEventsList()).hasSize(ClusterStatusService.MAX_RECENT_EVENTS);
+        assertThatThrownBy(() -> call(grpc::getClusterStatus, GetClusterStatusRequest.newBuilder().setRecentEvents(-1).build()))
+                .isInstanceOfSatisfying(StatusRuntimeException.class,
+                        e -> assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT));
+    }
+
+    @Test
+    void coordinatorStartupEventsHaveNoFromState() {
+        jdbc.sql("INSERT INTO liveness_events (node_id, from_state, to_state, at) VALUES ('node1', NULL, 'UNKNOWN', now())").update();
+
+        assertThat(status().getRecentLivenessEvents(0).getFrom()).isEqualTo(NodeLiveness.NODE_LIVENESS_UNSPECIFIED);
+        assertThat(status().getRecentLivenessEvents(0).getTo()).isEqualTo(NodeLiveness.NODE_LIVENESS_UNKNOWN);
+    }
+
+    /** This test's own ClusterStatusService, with the given cache TTL and the fake clock. */
+    private ClusterStatusService withCacheTtl(Duration ttl) {
+        CoordinatorProperties p = properties;
+        return new ClusterStatusService(repository, repair, tracker, eventLog, clock, new CoordinatorProperties(
+                p.nodes(), p.nodeRpcTimeout(), p.suspectAfter(), p.deadAfter(), p.recoveryBeats(), p.livenessSweep(),
+                p.repairGrace(), p.repairInterval(), p.repairMaxInflight(), p.repairMaxPerNode(), p.copyTimeout(),
+                p.repairPassRetention(), p.gcInterval(), p.gcReadGrace(), p.gcPendingTimeout(), p.gcBatch(),
+                p.gcMaxInflight(), p.gcMaxPerNode(), p.gcPassRetention(), ttl, p.livenessEventRetention(),
+                p.livenessEventWriter()));
+    }
+
+    /**
+     * The counts are reused within the TTL and recomputed after it.
+     * Mutation: the cache never expires.
+     */
+    @Test
+    void theCountsAreCachedForTheTtl() {
+        ClusterStatusService cached = withCacheTtl(Duration.ofSeconds(1));
+        One one = commitOneChunk("cache");
+        ClusterStatusService.Counts first = cached.status(0, 0).counts();
+        assertThat(first.underReplicatedChunks()).isZero();
+        assertThat(first.asOfUnixMillis()).isPositive();
+
+        markBad(one.chunkId(), one.placed().get(0));
+        clock.advance(Duration.ofMillis(999));
+        assertThat(cached.status(0, 0).counts()).as("within the TTL: the same counts").isSameAs(first);
+
+        clock.advance(Duration.ofMillis(1));
+        assertThat(cached.status(0, 0).counts().underReplicatedChunks()).as("after the TTL: recomputed").isEqualTo(1);
+    }
+
+    @Test
+    void aZeroTtlRecomputesEveryCall() {
+        ClusterStatusService uncached = withCacheTtl(Duration.ZERO);
+        One one = commitOneChunk("nocache");
+        assertThat(uncached.status(0, 0).counts().underReplicatedChunks()).isZero();
+        markBad(one.chunkId(), one.placed().get(0));
+        assertThat(uncached.status(0, 0).counts().underReplicatedChunks()).isEqualTo(1);
     }
 }

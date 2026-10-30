@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -99,7 +99,7 @@
+ 		mux.Handle("GET /{$}", s.cfg.UI)
+ 		mux.Handle("GET /assets/", s.cfg.UI)
+ 	}
+-	return AllowHosts(s.cfg.AllowedHosts, sameOriginWrites(mux))
++	return AllowHosts(s.cfg.AllowedHosts, mux)
+ }
+ 
+ // unmatched explains requests under /objects/ that no route takes: an empty

@@ -40,6 +40,11 @@ type Config struct {
 	// Deadlines for each replica write and read, connection included.
 	ChunkWriteTimeout time.Duration
 	ChunkReadTimeout  time.Duration
+	// Host header values served (host:port, from ParseAllowedHosts); every
+	// other Host gets 403. Empty refuses everything.
+	AllowedHosts []string
+	// The web UI, served at / and /assets/; nil serves no UI.
+	UI http.Handler
 }
 
 // Server serves the HTTP API.
@@ -74,9 +79,10 @@ func New(coord objectstorev1.CoordinatorServiceClient, cfg Config, log *slog.Log
 	}
 }
 
-// Handler returns the routes. {key} matches one path segment, so a key with
-// "/" in it must arrive as %2F; ServeMux matches on the escaped path and hands
-// the handler the unescaped key.
+// Handler returns the routes, behind the Host allowlist and the cross-origin
+// check for writes. {key} matches one path segment, so a key with "/" in it
+// must arrive as %2F; ServeMux matches on the escaped path and hands the
+// handler the unescaped key.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /objects/{key}", s.put)
@@ -89,7 +95,11 @@ func (s *Server) Handler() http.Handler {
 		w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/objects/{rest...}", s.unmatched)
-	return mux
+	if s.cfg.UI != nil {
+		mux.Handle("GET /{$}", s.cfg.UI)
+		mux.Handle("GET /assets/", s.cfg.UI)
+	}
+	return AllowHosts(s.cfg.AllowedHosts, sameOriginWrites(mux))
 }
 
 // unmatched explains requests under /objects/ that no route takes: an empty
@@ -223,7 +233,8 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log = log.With("object_id", obj.ID)
-	out := &responseStream{w: w, rc: http.NewResponseController(w), stall: s.cfg.StallTimeout, size: obj.Size, objectID: obj.ID}
+	out := &responseStream{w: w, rc: http.NewResponseController(w), stall: s.cfg.StallTimeout, size: obj.Size,
+		objectID: obj.ID, key: key}
 	if r.Method == http.MethodHead {
 		out.start()
 		return
@@ -264,6 +275,7 @@ type responseStream struct {
 	stall    time.Duration
 	size     int64
 	objectID string
+	key      string
 	started  bool
 	written  int64
 }
@@ -276,6 +288,8 @@ func (o *responseStream) start() {
 	h := o.w.Header()
 	h.Set("Content-Length", strconv.FormatInt(o.size, 10))
 	h.Set("Content-Type", "application/octet-stream")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Disposition", contentDisposition(o.key))
 	h.Set("X-Object-Id", o.objectID)
 	o.w.WriteHeader(http.StatusOK)
 }

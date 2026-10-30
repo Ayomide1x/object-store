@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/CoordinatorGrpcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/CoordinatorGrpcService.java
+@@ -183,8 +183,7 @@
+                             .setOrigin(r.origin()).setBadReason(r.badReason() == null ? "" : r.badReason())
+                             .setLiveness(toProto(liveness.stateOf(r.nodeId()))));
+                 }
+-                cb.setCountedReplicas(repair.countedReplicas(c.replicas().stream()
+-                        .map(r -> new MetadataRepository.ReplicaRow(r.nodeId(), r.state())).toList()));
++                cb.setCountedReplicas((int) c.replicas().stream().filter(r -> r.state().equals("HEALTHY")).count());
+                 b.addChunks(cb);
+             }
+             return b.build();

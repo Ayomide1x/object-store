@@ -1598,3 +1598,304 @@ That makes 48 Go mutations. 6 new coordinator mutations, all caught by `GatewayR
 That makes 54. The 10 patches against the moved packages are repointed, and C1 and D3 regenerated. Coordinator patches 6, P3 and P5 are regenerated with the same intent: 6's context moved (`MAX_LIST_LIMIT` follows `MIN_REPLICAS`), and P3 and P5 patch the reconciler loop that `countedReplicas` was extracted from. Each is still caught by its named test.
 **Because:** each new rule is shown to be load-bearing. Writing W11 first showed `TestClientDisconnectNeverCommits` could not catch it, because net/http's context cancellation already stops the upload. So the short-read guard got its own unit test.
 **Breaks if:** code edits stop the patches from applying; the scripts refuse to start.
+
+## The browser polls GET /cluster every 2 s; no server push (stage 11)
+**Chose:** the UI polls `GET /cluster` every 2 s. It schedules the next request only when the previous one has finished, so two are never in flight. Nothing is requested while the tab is hidden (`visibilitychange` restarts it at once). Failures back off 2, 4, 8, 16, then every 30 s, and the header says "Retrying in N s" with the last data dimmed.
+**Over:**
+- Server-sent events from the gateway. Each open stream would poll the coordinator, so it costs the same. The alternative is one shared loop fanning out to every stream, and that loop is state kept between requests (invariant 11). SSE also holds one of the browser's six connections per origin open for good.
+- WebSockets: the same problems, plus a protocol.
+- A 1 s interval: heartbeats are every 2 s, so it shows nothing new.
+**Because:** a stopped node is SUSPECT for about 9 s (DEAD_AFTER 15 s minus SUSPECT_AFTER 6 s), and 2 s polls sample that at least four times. Polling is stateless at every hop.
+**Breaks if:** a state the UI must show lasts less than a poll. That already happens to "under-replicated" during repair (see "Browser tests wait on states, never on time").
+
+## GetClusterStatus caches its two counts for 1 s, single-flight (stage 11)
+**Amends:** "GetClusterStatus: read-only, counted with the reconciler's own rule" (stage 10), whose Breaks-if this is.
+**Chose:** `ClusterStatusService` keeps `under_replicated_chunks` and `pending_deletions` with the monotonic time they were computed. It recomputes them when they are older than `COORDINATOR_STATUS_CACHE_TTL` (default 1s; 0 recomputes every call), inside one `synchronized` method, so concurrent callers share one scan. The count still goes through `RepairService.countedReplicas`. The response gains `under_replicated_as_of_unix_millis` (field 8), and the UI says "as of 12:03:04". Node liveness, passes and events are still read fresh on every call.
+**Over:**
+- A count the reconciler refreshes at the end of each pass: up to a repair interval stale, and frozen while passes are skipped (any node UNKNOWN, as after a coordinator restart).
+- A count kept in Postgres by triggers: the count depends on liveness, which lives in memory.
+- Caching in the gateway: state between requests (invariant 11).
+**Because:** however many tabs and gateways poll, the scan runs at most once per second, and not at all when nobody looks. The cache is rebuilt from Postgres and liveness on the next call, so a restart loses nothing (invariant 7). Tests use their own `ClusterStatusService` with the fake clock: the counts are reused for 999 ms, recomputed at 1 s, and recomputed every call with TTL 0.
+**Breaks if:** one scan takes longer than the TTL, at a few million chunks. The cache bounds how often the scan runs, not how big it is; callers would then queue behind it. That needs a maintained count, or a sampled one.
+
+## Liveness transitions are logged off the liveness path, and may be dropped (stage 11)
+**Chose:** migration V8 adds `liveness_events(event_id, node_id, from_state, to_state, at)`. `from_state` is NULL for the events written at coordinator startup, when every node becomes UNKNOWN.
+- `LivenessService` records each transition after the tracker's lock is released, before it updates `nodes` as it always has. A failing `nodes` update therefore can't lose the event.
+- `LivenessEventLog.record` only `offer`s the event to a bounded queue (1024): no Postgres, no blocking, no exceptions.
+- A writer thread drains the queue in batches of up to 256.
+- A full queue, or a failed batch write, drops events. Each drop is logged with its node, and counted. The count goes out as `liveness_events_dropped` (field 10), and the feed says "N liveness changes were not recorded".
+- `COORDINATOR_LIVENESS_EVENT_RETENTION` (24h) is pruned at the start of each repair pass, like `repair_passes`.
+- `GetClusterStatus` returns the newest `recent_events` (0 → 20, clamped to 100, negative rejected).
+
+`LivenessEventIT` runs the real writer thread with a sink that works, fails or hangs. Under a failing sink and a hanging one (queue overfilled past capacity), an outage script produces the same transitions at the same ticks with the same persisted `nodes` states, finishes in under 2 s, and the drops are counted exactly.
+**Over:**
+- Writing the event in the same transaction as the `nodes` update, my first proposal: a slow Postgres would then slow liveness itself. You ruled that out.
+- The UI diffing snapshots: lost on reload, nothing while the tab is closed, and a flap faster than one poll is never seen.
+- Retrying failed writes: an unbounded backlog behind a down database, for a history no decision reads.
+**Because:** the activity feed needs history the `nodes` table doesn't keep, and the order of transitions must be provable (the browser test reads it from the feed). Liveness must behave exactly as before whatever happens to Postgres.
+**Breaks if:** something starts deciding from this table. It is observability only, and it can have gaps.
+
+## StatObject reports each chunk's counted replicas (stage 11)
+**Chose:** `ChunkStatus.counted_replicas` (field 6), computed by `RepairService.countedReplicas` on a fresh liveness snapshot. The grid's row status ("3 of 3", or "2 of 3, under-replicated") is that number, never recounted in the browser. Above the target it reads "4 (target 3)": a node that comes back after its copies were replaced still holds them.
+**Over:** counting HEALTHY rows on live nodes in the UI. It would ignore the DEAD grace window, and disagree with the header's count for 30 s after every node death.
+**Because:** one rule, in one place, for everything that says "under-replicated". A test walks one chunk through BAD, DEAD within the grace and DEAD past it.
+**Breaks if:** the repair rule gains an input `countedReplicas(List<ReplicaRow>)` doesn't see.
+
+## The grid polls StatObject for one object; the list is fetched on demand (stage 11)
+**Chose:**
+- **Grid:** `GET /objects/{key}/stat` every 2 s, for the selected object only, while it is selected and the tab is visible. The key lives in `?key=` (`history.replaceState`), so a link opens the same view.
+- **List:** fetched at once on load, after a 250 ms pause in typing a prefix, after an upload or delete from this tab, and on Refresh. 100 keys a page, with *Load more* following `next_start_after`. Only the latest list request may update the list, and changing the prefix clears the old keys and cursor at once.
+**Over:**
+- Polling the stat of every listed object: N scans of chunk rows every 2 s, for rows nobody is looking at.
+- Polling the list: a full page every 2 s to catch a rare change.
+**Because:** the cost of watching is one object's chunk rows and one status call per tab every 2 s. The latest-response rule came from the browser tests: the unfiltered first page, answering after the filtered one, overwrote it, and *Load more* then continued the wrong listing.
+**Breaks if:** someone expects the list to show other people's uploads live. They need Refresh.
+
+## Browser uploads use XMLHttpRequest with the File as the body (stage 11)
+**Chose:** `XMLHttpRequest` PUT with the `File` as the body, to `/objects/{encodeKey(key)}`. The browser streams the file from disk and sets Content-Length. `upload.onprogress` drives a `<progress>` bar. `upload.onload` (the whole body sent) switches the label to "Sent. Storing…" and marks the upload as fully sent, which decides what a dropped connection means.
+**Over:** `fetch`, which has no upload progress. A streaming request body would need chunked encoding, which the gateway refuses (411).
+**Because:** progress on a 5 GiB upload is the difference between waiting and wondering, and the file never sits in memory.
+**Breaks if:** browsers drop XHR upload events. `fetch` upload progress would then be the replacement.
+
+## Keys "." and ".." are refused by the UI, and labelled in the list (stage 11)
+**Chose:** the UI refuses to upload under "." or "..", with "Keys "." and ".." can't be reached from a browser, so the UI won't upload them. Use osctl." It lists them as "Not reachable from a browser; use osctl.", with no download or delete. `encodeKey` throws for them, so no code path can build their URL.
+**Over:**
+- A second addressing form (`?key=`): two URLs for one object, and a second parser to secure.
+- Hiding them: the list would lie.
+**Because:** browsers parse every URL with the WHATWG URL parser, which removes "." and ".." path segments, and treats "%2e" and "%2e%2e" the same way. `XMLHttpRequest`, `fetch` and `<a href>` all do this, so such an object can't be addressed from a page at all. curl and osctl send `%2E%2E` untouched (stage 10).
+**Breaks if:** the gateway grows another way to name an object.
+
+## Upload outcomes: what each failure means, and how Chrome reports a 503 (stage 11)
+**Chose:** one function, `describeUpload`, turns each outcome into a message and whether to offer Retry:
+
+| Outcome | Message | Retry |
+|---|---|---|
+| Connection dropped before the whole body was sent | "Upload interrupted before the whole file was sent; nothing was stored. The gateway may have been busy: try again." | Yes, at once |
+| Connection dropped after the whole body was sent | "…whether it was stored is unknown. Check the object's committed time below, or upload it again." The UI selects the key so its stat shows. | Yes |
+| 503 BUSY | "Gateway busy: … Nothing was stored. Retry in N s.", N from Retry-After | Enabled when the countdown ends |
+| Other 503 / 5xx | The gateway's message, "Nothing was stored." | Yes |
+| 411 | "The browser sent no file length…" | No |
+| 413 | "This file is larger than the 5 GiB limit." | No |
+
+The UI also refuses files over 5 GiB itself, before sending (exactly 5 GiB is allowed, as in the gateway).
+
+**Measured:** a temporary third gateway with `GATEWAY_MAX_CONCURRENT_UPLOADS=1`, its one slot held by a slow curl upload, received XHR PUTs from Google Chrome 156.0.8078.79 on macOS, 3 runs per size:
+- **1 KiB:** a 503 with `Retry-After: 1` and the BUSY body each time, in 2–19 ms. The body was fully sent before the answer.
+- **100 MiB:** a 503 with `Retry-After: 1` each time, after Chrome had sent about 1.3–1.4 MiB, in 538–557 ms. Chrome read the early response while still sending; `upload.onload` never fired.
+
+So Chrome shows the busy message, not a dropped connection, at both sizes. The dropped-connection message remains for a real reset, or a browser that behaves differently. There is no workaround in code.
+**Over:**
+- The gateway draining the body before answering 503: it would accept up to 5 GiB just to refuse it (stage 10's `Connection: close`).
+- A capacity check before uploading: a race, and nothing a stateless gateway could reserve.
+- Retrying automatically: the person decides.
+**Because:** a drop before the last byte can't have committed (the gateway completes an upload only after reading every Content-Length byte), so "nothing was stored" is true there and only there. After the last byte the commit may have happened, so the message says it doesn't know.
+**Breaks if:** the gateway starts committing before the whole body arrives.
+
+## Downloads are plain links; JavaScript never holds object bytes (stage 11)
+**Chose:** a plain `<a href="/objects/{key}" download>`. The browser streams the response to disk, and its download manager shows the progress. ESLint (`no-restricted-syntax`, in CI) forbids `URL.createObjectURL`, `new Blob` and `.blob()`, `.arrayBuffer()` and `.bytes()` calls in `web/src`. A mutation that downloads through a blob is caught by that rule.
+
+If a download breaks partway, the gateway aborts the connection (stage 10), and the browser marks the download failed and keeps no file under the final name. The page can't observe an `<a download>`, so the detail pane says so in one line. The browser test `04-broken-download` checks Playwright's `download.failure()` is non-null for an object whose middle chunk has no good replica.
+**Over:** fetch into a Blob and save it. That buffers the whole object (up to 5 GiB) in the tab, and makes "complete" a JavaScript decision that can be got wrong.
+**Because:** the browser already does streaming, progress and failure correctly. The only way to show a broken download as complete is to handle the bytes yourself.
+**Breaks if:** the UI needs to post-process downloads, such as verifying a whole-object hash in the browser.
+
+## GET /objects/{key} is always an attachment, named per RFC 6266 and 5987 (stage 11)
+**Chose:** every object response carries:
+- `Content-Disposition: attachment; filename="<fallback>"; filename*=UTF-8''<exact>`;
+- `X-Content-Type-Options: nosniff`, alongside the existing `application/octet-stream`.
+
+The name is the key's last "/" segment, or "download" for an empty segment, ".", or "..". The ASCII fallback replaces control characters, non-ASCII, `"`, `\` and `%` with `_`. The exact name percent-encodes every byte outside RFC 5987's attr-chars. `TestContentDispositionEncodesKey` covers quotes, `;`, UTF-8, CR/LF and the empty segment. Chrome, it turned out, also replaces `"` with `_` in the saved name, so the browser test uses a key with UTF-8, spaces, parentheses and `%` instead.
+**Over:**
+- Inline for some types: an uploaded `.html` opened inline would run on the UI's origin and could delete keys.
+- Setting the name only in the link's `download` attribute: curl and direct links would get the encoded path as the name.
+**Because:** downloads get the name people expect, and no object is ever rendered by the gateway's origin.
+**Breaks if:** someone wants objects viewable in the browser. That needs a separate origin, not inline.
+
+## Host allowlist on every route; the health probe sends an allowed Host (stage 11)
+**Amends:** "Two gateway instances; /healthz is the process, scripts wait on /cluster" (stage 10): `/healthz` is now behind the Host check too.
+**Chose:** `GATEWAY_ALLOWED_HOSTS` is required: comma-separated `host:port`, compared without case, port included. Compose sets `127.0.0.1:9081,localhost:9081`, and the same for 9082. The gateway refuses to start without it. `AllowHosts` answers any other Host with 403 `HOST_NOT_ALLOWED` and `Connection: close`, on every route: reads, writes, `/healthz` and the UI. `gateway health` connects to the listen address but sets Host to the first allowed entry.
+**Over:**
+- Exempting `/healthz`: harmless today, but an exception list grows.
+- Checking only writes: a rebinding page could still read every object and key.
+- Allowing any 127.0.0.1-looking Host: the attacker controls the name, not the address.
+**Because:** DNS rebinding. A hostile domain that resolves to 127.0.0.1 is same-origin with the gateway as far as the browser is concerned, but its requests carry that domain in Host. `TestHostNotAllowedIsRefused` covers seven routes and four hostile Hosts, `TestHealthProbeSendsAnAllowedHost` covers the probe, and the stage 11 script checks both gateways' Docker health and curls eight routes with a foreign Host.
+The stage 10 acceptance script's two hand-written requests sent `Host: x` and got 403 instead of 411 and 413. They now send `Host: 127.0.0.1:9081`, as a real client does.
+**Breaks if:** the gateway is reached under another name (a reverse proxy, a LAN address). That name must be added, or every request gets 403.
+
+## Cross-origin writes refused with the standard library's CrossOriginProtection (stage 11)
+**Chose:** `http.NewCrossOriginProtection()` (Go 1.25+) wraps every route. It refuses non-GET/HEAD/OPTIONS requests whose `Sec-Fetch-Site` is not `same-origin` or `none`, or, without that header, whose `Origin` doesn't match Host. They get 403 `CROSS_ORIGIN`. Requests with neither header (curl, scripts) pass.
+**Over:** parsing Origin by hand. The standard library already handles `Sec-Fetch-Site`, `null` origins and missing headers.
+**Because:** defence in depth. A cross-site page can't send PUT or DELETE without a CORS preflight the gateway never approves, and a rebinding page is refused by Host. If either of those ever changes, this still holds. The Vite dev server works without a trusted-origin entry, because the browser sees its requests as same-origin.
+**Breaks if:** a legitimate cross-origin UI is added. It would need `AddTrustedOrigin`, deliberately.
+
+## Keys are text, never markup: React, lint, and a CSP without unsafe-inline (stage 11)
+**Chose:**
+- Keys, which users type and which may be hostile, render only as React text children (`KeyText`).
+- ESLint, in CI, forbids `react/no-danger`, `innerHTML` and `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and `new Function`.
+- Object URLs are built only by `encodeKey` under `/objects/`, so no `javascript:` URL can be made.
+- The UI responses carry `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; …; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, plus `nosniff` and `Referrer-Policy: no-referrer`.
+- Vite's build emits no inline script, and `assetsInlineLimit: 0` keeps fonts and icons as files, so the policy needs no exceptions.
+**Over:** sanitising keys. There is nothing to sanitise if they are never parsed as HTML.
+**Because:** each layer catches what the previous one misses. `KeyText renders markup in a key as text` fails under the `dangerouslySetInnerHTML` mutation, and so does lint. `TestEveryResponseCarriesTheSecurityHeaders` fails if the policy allows inline scripts.
+**Breaks if:** a dependency needs inline scripts or styles. The policy would then need hashes, not `unsafe-inline`.
+
+## The UI is embedded with go:embed; a fresh clone builds without it (stage 11)
+**Chose:**
+- `gateway/internal/webui/build/` holds a committed `README.md`. Vite writes to `build/dist/`, which is gitignored and dockerignored.
+- The gateway embeds `//go:embed all:build` and serves `fs.Sub(build, "dist")`: `/` returns `index.html` with `Cache-Control: no-cache`, and `/assets/*` (hashed names) returns `immutable, max-age=31536000`. Directory listings are refused.
+- The pattern always matches the README, so `go build`, `go vet` and `go test ./...` work on a fresh clone with no Node. A binary built without the UI logs a warning and answers 503 "web UI not built" at `/`; the API is unaffected.
+- The gateway image runs the UI build first and fails if `index.html` is missing.
+- Handler tests use `fstest.MapFS`.
+**Over:**
+- A committed placeholder `dist/`: Vite's `emptyOutDir` deletes it, and it looks like build output.
+- A `webui` build tag: two build modes, and forgetting the tag silently ships no UI.
+**Because:** the Go module stays buildable by Go alone, and the image can't ship without the UI.
+**Breaks if:** the UI needs server-side routes beyond `/` and `/assets/`. There is no client router; state is in the query string.
+
+## go.mod ignores web/, and gofmt checks only the repository's own Go files (stage 11)
+**Chose:** `ignore ./web` in go.mod (Go 1.25+), so `./...` patterns skip `web/`. The Makefile's gofmt check now lists files with `git ls-files --cached --others --exclude-standard '*.go'`, rather than walking `.`.
+**Over:** a stub `web/go.mod` to make `web/` a separate module: it hides the intent, and gofmt walks into it anyway.
+**Because:** after `npm ci`, `web/node_modules` contains third-party `.go` files (one npm package ships a Go port). `go test ./...` then tried to build them, and `gofmt -l .` would check them.
+**Breaks if:** Go code is ever added under `web/`.
+
+## Node build stage and exact, aged dependency pins (stage 11)
+**Chose:** the gateway Dockerfile gains `FROM node:24 AS web`: `npm ci` from the committed `package-lock.json`, then `npm run build`. `node:24` (LTS) is added to `check-arm64.sh`'s list; it publishes `linux/arm64/v8`. Every dependency in `package.json` is an exact version, published at least two weeks before it was chosen:
+- React 19.3.1;
+- Vite 8.3.4;
+- Vitest 5.0.5;
+- Playwright 1.64.1;
+- TypeScript 6.0.3;
+- ESLint 9.39.5.
+
+`.npmrc` sets `save-exact` and `engine-strict`. TypeScript 7 and ESLint 10 are newer, but typescript-eslint supports TypeScript below 6.1, and eslint-plugin-react ESLint up to 9.
+**Over:**
+- Caret ranges: a lockfile pins them anyway, but exact pins make every upgrade a visible diff.
+- Building the UI in the Go stage with Node installed: two toolchains in one layer.
+- Committing the build output: a second source of truth that drifts.
+**Because:** a supply-chain compromise is usually found within days, so an aged pin avoids most of them. The image build is reproducible from the lockfile.
+**Breaks if:** a pinned version gets a security fix. Upgrading is a deliberate diff.
+
+## No UI kit; native elements and one stylesheet (stage 11)
+**Chose:** no component library. The UI uses:
+- native `<dialog>` with `showModal()`: focus trapped, Esc closes it, focus returns to the opener;
+- a radio group for the theme;
+- a real `<table>` for the grid, with chunk rows and node columns as headers, so screen readers move by row and column;
+- `<progress>` for uploads;
+- buttons and links everywhere else.
+
+Styling is one CSS file of tokens and rules. Runtime dependencies are React, React DOM and two self-hosted font packages.
+**Over:**
+- **shadcn/ui:** it brings Tailwind, Radix and a recognisable rounded-card look, many files to own, and a visual language that isn't this one.
+- **Radix Primitives:** unstyled and excellent, but it solves menus, comboboxes and tooltips with real keyboard behaviour, which this UI doesn't have.
+- **A data-fetching library** (TanStack Query): polling with no overlap, pausing when hidden and backing off is about 90 lines here, and tested.
+**Because:** every widget the UI needs exists natively with correct keyboard and focus behaviour, and fewer dependencies mean fewer arm64 and supply-chain questions.
+**Breaks if:** the UI gains menus, comboboxes or tooltips. Radix Primitives, unstyled, is the next step.
+
+## Visual direction: drive bays, states as glyph plus word (stage 11)
+**Chose:** the UI reads as a storage server's front panel.
+- **Bays:** each node is a bay. Its card is the column header of the placement grid, and its slots run down under it, so a Dead node's whole column is hatched from card to last chunk.
+- **Colour:** cool steel `#E8ECF0`, white bays and blue-black ink `#16222D`. Dark mode is slate `#0F1923`, bays `#182433`, ink `#DDE5ED`. Signal colours, each checked against its background: healthy green, repair blue, suspect amber, fault red.
+- **Type:** Atkinson Hyperlegible Next, with its Mono for object IDs only. It was designed so `l 1 I` and `0 O` can't be confused. Tabular figures, a 1.25 scale from 16 px, sentence case.
+- **States:** every state is an inline-SVG glyph plus a word; colour only repeats it:
+
+| State | Glyph and word |
+|---|---|
+| Alive | ● Alive |
+| Suspect | ◐ Suspect |
+| Dead | ○ Dead, name struck through |
+| Unknown | ? Unknown |
+| Healthy copy | ■ Healthy |
+| Repair copy | ◆ Repair copy |
+| Bad copy | ✕ Bad |
+| No copy | dotted square, No copy |
+
+- **Narrow screens:** below 760 px the grid shows glyphs only; the words stay in each cell's `aria-label` and the legend.
+- **Motion:** one moment. A repair copy's glyph lights up over 400 ms, and not at all under `prefers-reduced-motion`.
+- **Focus:** a 3 px ring on every control.
+- **Theme:** Light, Dark or System, remembered in `localStorage` when available.
+- **Observe-only:** no control stops a node, starts a pass or changes the cluster. The only actions are upload, download and delete.
+- **Test hooks:** every state a test checks is a `data-state`, `data-origin`, `data-counted` or `data-to` attribute.
+
+The frontend-design skill's review replaced my first draft (warm paper, hairline rules, monospace for all data). Those are its listed defaults for generated pages.
+**Over:** a generic dashboard of cards and big-number tiles. The counts are one sentence in the header, because a count is a fact, not a headline.
+**Because:** the chunk × node matrix is what this system is about, and making each node a physical bay makes a failure readable in one glance down the column.
+**Breaks if:** clusters grow past about 8 nodes. The bays then need horizontal scrolling, which the grid already allows, or grouping.
+
+## Browser tests wait on states, never on time (stage 11)
+**Chose:** Playwright, Chromium (or installed Chrome with `PW_CHANNEL=chrome`), one worker, files in name order against the real stack. Every wait is an auto-retrying assertion on a `data-*` attribute, with a timeout derived from the Compose timings, which are read with `docker compose config`. ESLint forbids `waitForTimeout`, `networkidle`, `setTimeout` and `force` in `web/e2e`. Two states are too brief to wait on, and the tests check what records them instead:
+- **Chunks under-replicated during repair.** After the grace, a chunk shows "2 of 3" only until the next pass copies it. Passes run every 10 s on their own schedule, so that is 0–10 s, and a 2 s poll can miss it. The demo test asserts instead that the activity feed shows the repair pass that found exactly the chunks the stopped node held ("Repair found 8 under-replicated chunks: 8 copies started, 8 recorded"; persisted, so deterministic). It then checks that exactly that many repair copies appear, none in the dead bay, with every row back at 3 of 3.
+- **A Bad copy's chunk at "2 of 3".** The bad-replica report hints the reconciler, which usually copies the chunk within 2 s. The tests assert Bad, then the row back to 3 of 3 with a repair copy, while the Bad cell stays.
+
+Suspect lasts about 9 s, so the card is asserted directly. The feed then proves the order (Dead above Suspect).
+**Over:**
+- Fixed sleeps, which are slow and flaky both ways.
+- Slowing the reconciler for tests: it changes what is tested, and the window still depends on phase.
+**Because:** a test that sometimes misses a 1 s window is worse than one that checks the durable record of the same fact.
+**Breaks if:** repair passes stop being recorded with their counts.
+
+## Stage 11 acceptance: one script, a fresh stack, the browser suite (stage 11)
+**Chose:** `scripts/stage11-ui-check.sh`:
+1. Runs `down -v` and `up --build --wait`.
+2. Waits for 4 nodes ALIVE and both gateways ready, and checks both gateways' Docker healthchecks are healthy with the allowlist set.
+3. Runs the Playwright suite:
+   - `01-demo`: demo.sh with `DEMO_PAUSE=5`; demo.sh must pass too.
+   - `02-objects`: round trips both ways at 0 B, 1 B, 4 MiB and 10 MiB; paging; delete with confirmation; the dot keys.
+   - `03-corrupt`.
+   - `04-broken-download`.
+4. Curls the Host and origin checks and the CSP on both gateways.
+
+`UPDATE_SCREENSHOTS=1` copies the demo test's screenshots (light and dark, taken while the node is still Dead and its chunks repaired; and after the corrupt step) into `docs/` for the README. acceptance.yml runs it after stage 10, and installs Node, the lockfile and Chromium.
+**Over:**
+- A separate screenshot script: the demo test already reaches the exact states worth showing.
+- A recorded video: GitHub doesn't render repository video files in READMEs.
+**Because:** stage 11's acceptance is about the browser, and the screenshots come from a verified run, not a staged one.
+**Breaks if:** the demo's object or timings change. The test reads timings from Compose but assumes demo.sh's 40 MiB key.
+
+## Mutation scripts extended for stage 11 (stage 11)
+**Extends:** "Mutation scripts extended for stage 10" (stage 10).
+**Chose:**
+
+New Go mutations (54 in total), each caught by its named test:
+
+| Mutation | Change | Caught by |
+|---|---|---|
+| W14 | skips the Host check | `TestHostNotAllowedIsRefused` |
+| W15 | skips the cross-origin check | `TestCrossOriginMutationIsRefused` |
+| W16 | keeps raw characters in the filename fallback | `TestContentDispositionEncodesKey` |
+| W17 | `inline` | `TestDownloadIsAnAttachment` |
+| W18 | the health probe sends the listen address as Host | `TestHealthProbeSendsAnAllowedHost` |
+| W19 | the CSP allows inline scripts | `TestEveryResponseCarriesTheSecurityHeaders` |
+
+New coordinator mutations (59 in total):
+
+| Mutation | Change | Caught by |
+|---|---|---|
+| S7 | no event recorded | `GatewayRpcIT.livenessEventsAreReturnedNewestFirst` |
+| S8 | the cache never expires | `theCountsAreCachedForTheTtl` |
+| S9 | StatObject counts raw HEALTHY rows | `countedReplicasPerChunkFollowTheReconcilersRule` |
+| S10 | `record` blocks on a full queue | `LivenessEventIT.aBlockedEventWriteNeverBlocksLiveness` |
+| S11 | `record` writes through the sink on the caller's thread | `aFailingEventWriteChangesNoStateAndDelaysNoTransition` |
+
+P9 and S6 were regenerated with the same intent; their context moved.
+
+New `scripts/web-mutation-check.sh`, 12 UI mutations, each caught by a named Vitest test or lint rule:
+
+| Mutation | Change | Caught by |
+|---|---|---|
+| U1 | `encodeURI` | key encoding test |
+| U2 | no dot-segment refusal | key encoding test |
+| U3 | repair copies shown as upload | grid test |
+| U4 | Bad shown as healthy | grid test |
+| U5 | absent shown as Bad | grid test |
+| U6 | Retry-After ignored | upload message test |
+| U7 | a drop after the full send reported as "nothing stored" | upload message test |
+| U8 | the 5 GiB limit exclusive | size test |
+| U9 | a key rendered as markup | `KeyText` test |
+| U10 | a download through a blob | lint, `no-restricted-syntax` |
+| U11 | the poller overlaps requests | poller test |
+| U12 | the poller ignores visibility | poller test |
+
+The end-to-end mutation (the gateway's stage 10 W1, a normal return instead of the abort, must fail `04-broken-download`) needs an image rebuild, so its commands are in the script's header rather than its loop.
+**Because:** each rule is shown to be load-bearing. U12 first went undetected: visibility was checked in two places, so removing one changed nothing. The poller now reads visibility in one place, and the mutation targets that.
+**Rule:** never run a patch-and-rebuild experiment (such as the end-to-end mutation above) while a mutation script is running: they share the working tree, and a patch applied by one is in the tree the other builds and reverts. Run them one after the other. During this stage's verification the end-to-end mutation was run while the coordinator mutation script ran. Its patch touched only the gateway, which the coordinator script doesn't build, and both were reverted, but the overlap was the mistake this rule prevents.
+**Breaks if:** code edits stop the patches from applying; the scripts refuse to start.

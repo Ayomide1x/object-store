@@ -3,3 +3,5 @@ bin/
 coordinator/build/
 coordinator/.gradle/
 .env
+# The web UI's build output, embedded by the gateway; built, never committed.
+gateway/internal/webui/build/dist/

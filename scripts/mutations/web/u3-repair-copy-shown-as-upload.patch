@@ -1,0 +1,11 @@
+--- a/web/src/grid.ts
++++ b/web/src/grid.ts
+@@ -76,7 +76,7 @@
+       const r = byNode.get(nodeId);
+       const nodeLiveness = liveness.get(nodeId) ?? "UNKNOWN";
+       const state: CellState = r === undefined ? "ABSENT" : r.state;
+-      const repairCopy = r !== undefined && r.state === "HEALTHY" && r.origin !== "upload";
++      const repairCopy = false;
+       const badReason = r?.state === "BAD" ? (r.bad_reason ?? "") : "";
+       const words = cellWords({ state, repairCopy, badReason });
+       const nodeNote = r !== undefined && nodeLiveness !== "ALIVE" ? ` (node ${LIVENESS_WORD[nodeLiveness]})` : "";

@@ -77,6 +77,11 @@ expected_test() {
     s4-unspecified-is-internal) echo "GatewayRpcIT|theCallerChoosesClientOrInternalAddresses()" ;;
     s5-status-counts-raw-healthy-rows) echo "GatewayRpcIT|underReplicatedIsCountedExactlyAsTheReconcilerCounts()" ;;
     s6-status-prunes-passes) echo "GatewayRpcIT|theStatusIsReadOnly()" ;;
+    s7-liveness-event-not-recorded) echo "GatewayRpcIT|livenessEventsAreReturnedNewestFirst()" ;;
+    s8-status-cache-never-expires) echo "GatewayRpcIT|theCountsAreCachedForTheTtl()" ;;
+    s9-stat-counts-raw-healthy-rows) echo "GatewayRpcIT|countedReplicasPerChunkFollowTheReconcilersRule()" ;;
+    s10-event-record-blocks) echo "LivenessEventIT|aBlockedEventWriteNeverBlocksLiveness()" ;;
+    s11-event-written-synchronously) echo "LivenessEventIT|aFailingEventWriteChangesNoStateAndDelaysNoTransition()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

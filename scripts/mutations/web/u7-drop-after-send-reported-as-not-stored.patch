@@ -1,0 +1,13 @@
+--- a/web/src/uploadMessages.ts
++++ b/web/src/uploadMessages.ts
+@@ -38,9 +38,7 @@
+     case "dropped":
+       // Before the whole body was sent the gateway cannot have committed: it
+       // completes an upload only after reading every Content-Length byte.
+-      return outcome.sentAll
+-        ? { tone: "unknown", text: OUTCOME_UNKNOWN, retry: true, retryAfterSeconds: 0 }
+-        : { tone: "error", text: INTERRUPTED, retry: true, retryAfterSeconds: 0 };
++      return { tone: "error", text: INTERRUPTED, retry: true, retryAfterSeconds: 0 };
+     case "http":
+       return describeStatus(outcome);
+   }

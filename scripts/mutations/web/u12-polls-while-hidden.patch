@@ -1,0 +1,11 @@
+--- a/web/src/poller.ts
++++ b/web/src/poller.ts
+@@ -30,7 +30,7 @@
+   const doc = deps.doc ?? document;
+   const setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+   const clearTimer = deps.clearTimer ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));
+-  const hidden = () => doc.hidden;
++  const hidden = () => false;
+   const abort = new AbortController();
+   let timer: unknown = null;
+   let inFlight = false;

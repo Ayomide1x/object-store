@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/security.go
++++ b/gateway/internal/httpapi/security.go
+@@ -87,7 +87,7 @@
+ 	for _, r := range name {
+ 		// Quotes and backslashes end or escape the quoted string; % is
+ 		// decoded by some browsers; the rest is not printable ASCII.
+-		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' || r == '%' {
++		if r < 0x20 || r > 0x7e {
+ 			fallback.WriteByte('_')
+ 		} else {
+ 			fallback.WriteRune(r)

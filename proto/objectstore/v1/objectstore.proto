@@ -125,6 +125,10 @@ message ChunkStatus {
   bytes sha256 = 4;
   // Every recorded replica, by node ID.
   repeated ReplicaStatus replicas = 5;
+  // Replicas that count toward the replication target, by the reconciler's
+  // own rule (as GetClusterStatus counts): HEALTHY rows on nodes that are
+  // ALIVE, SUSPECT, or DEAD for less than the repair grace.
+  int32 counted_replicas = 6;
 }
 
 message ReplicaStatus {
@@ -162,6 +166,9 @@ message GetClusterStatusRequest {
   // How many recent passes of each kind to return. 0 means 10; larger values
   // are clamped to 100; negative values are INVALID_ARGUMENT.
   int32 recent_passes = 1;
+  // How many recent liveness events to return. 0 means 20; larger values are
+  // clamped to 100; negative values are INVALID_ARGUMENT.
+  int32 recent_events = 2;
 }
 
 message GetClusterStatusResponse {
@@ -179,6 +186,27 @@ message GetClusterStatusResponse {
   // The most recent passes that did any work or were skipped, newest first.
   repeated RepairPass recent_repair_passes = 6;
   repeated GcPass recent_gc_passes = 7;
+  // When under_replicated_chunks and pending_deletions were computed, in
+  // milliseconds since the Unix epoch. They are cached for a short time
+  // (COORDINATOR_STATUS_CACHE_TTL), so they can be older than the rest.
+  int64 under_replicated_as_of_unix_millis = 8;
+  // The most recent liveness transitions, newest first.
+  repeated LivenessEvent recent_liveness_events = 9;
+  // Liveness events not recorded since this coordinator started (the event
+  // queue was full or the write failed). Liveness itself is unaffected.
+  int64 liveness_events_dropped = 10;
+}
+
+// A node's liveness transition, as recorded in liveness_events.
+message LivenessEvent {
+  int64 event_id = 1;
+  string node_id = 2;
+  // UNSPECIFIED when the coordinator started, which sets every node UNKNOWN.
+  NodeLiveness from = 3;
+  NodeLiveness to = 4;
+  // When the coordinator made the transition, in milliseconds since the Unix
+  // epoch. Wall clock, informational only.
+  int64 at_unix_millis = 5;
 }
 
 message NodeStatus {
