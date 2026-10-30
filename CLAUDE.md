@@ -11,6 +11,8 @@ The core design rule: **metadata plane and data plane are separate.** The coordi
 | `coordinator/` | Java 25, Spring Boot, grpc-java | Metadata, placement, liveness, re-replication. PostgreSQL via Flyway-managed schema. |
 | `node/` | Go | Stores chunk files on local disk, serves reads, replicates to peers, heartbeats to coordinator. |
 | `client/` | Go | CLI: `put`, `get`, `ls`, `rm`, `stat`. |
+| `gateway/` | Go | Stateless HTTP front door. A client of the system: gRPC to the coordinator for metadata, gRPC to nodes for bytes. Serves the web UI. |
+| `web/` | React + TypeScript | Browser UI, built into the gateway binary (`go:embed`). |
 | `proto/` | Protocol Buffers | Single schema. Generates Go code (node, client) and Java code (coordinator). |
 | Infra | Docker Compose, PostgreSQL | One coordinator, four nodes (from stage 4), one Postgres. |
 
@@ -34,6 +36,8 @@ go.mod                  single Go module (github.com/Ayomide1x/object-store)
 gen/go/                 generated Go code from proto/ (committed)
 node/                   storage node; cmd/node, internal/...
 client/                 CLI; cmd/osctl
+gateway/                HTTP gateway; cmd/gateway, internal/...
+web/                    UI source; build output embedded in the gateway
 scripts/                demo and chaos scripts
 docker-compose.yml
 buf.yaml
@@ -175,6 +179,41 @@ Strict. One stage at a time. A stage is done only when its acceptance check pass
 - All images build for `linux/arm64`.
 - *Accept:* the script runs end to end from a clean state.
 
+**10. HTTP gateway.**
+- A stateless Go service and the only HTTP entry point.
+- It reuses the client's upload and download logic, which moves out of `client/internal/` into a shared package at the module root (like `internal/chunkwrite`), since Go's `internal` rule stops `gateway/` from importing it.
+- Endpoints:
+  - `PUT /objects/{key}` (`Content-Length` required; streamed, never buffered whole)
+  - `GET /objects/{key}` (streamed)
+  - `DELETE /objects/{key}`
+  - `GET /objects?prefix=`
+  - `GET /objects/{key}/stat`
+  - `GET /cluster`
+- `GET /cluster` is backed by a new read-only coordinator RPC: node liveness, under-replicated chunk count, pending deletions, recent repair and GC passes.
+- A download that fails after the response has started aborts the connection. It never sends unverified bytes and never completes as if successful.
+- gRPC errors map to HTTP status codes.
+- Bound to 127.0.0.1; no auth (out of scope).
+- *Accept:*
+  - `curl` round-trips of 0 B, 1 B, exactly 4 MiB and 100 MiB are byte-identical.
+  - `PUT` without `Content-Length` → 411.
+  - A `GET` where every replica of a later chunk is corrupt ends with an aborted connection and a short body (`curl` reports an error), never a complete-looking response.
+  - Two gateway instances serve the same objects, and restarting one loses nothing.
+  - Overwrite and `rm` behave exactly as they do through `osctl`.
+
+**11. Web UI.**
+- Served by the gateway (same origin, no CORS), embedded into its image.
+- Objects: upload (drag and drop, progress), download, list, stat, rm.
+- Live cluster view:
+  - node cards with liveness;
+  - a per-object chunk grid (rows are chunks, columns are nodes; `HEALTHY`, `BAD` or absent);
+  - counters (under-replicated chunks, pending deletions);
+  - an activity feed (liveness transitions, repair and GC passes).
+- It observes only: no buttons that stop nodes or change cluster state.
+- *Accept:*
+  - A file uploaded in the browser downloads identically with `osctl`, and vice versa.
+  - While `scripts/demo.sh` runs, the UI shows the stopped node going `SUSPECT` then `DEAD`, its chunks turning under-replicated, then healthy again as repair copies land.
+  - A corrupted replica shows as `BAD`, then repaired.
+
 ## Invariants
 
 These must hold at every stage after the one that introduces them. Code that would violate one is wrong even if tests pass.
@@ -189,13 +228,14 @@ These must hold at every stage after the one that introduces them. Code that wou
 8. **Re-replication is idempotent and bounded.** Running the reconciler twice causes no harm, and it never saturates the cluster.
 9. **Wire compatibility.** Field numbers are never reused or renumbered.
 10. **arm64-clean.** Every image builds and runs on `linux/arm64`. No dependency without an arm64 build.
+11. **The gateway is just a client.** It holds no state between requests and has no access `osctl` lacks: everything it does goes through the same coordinator and node RPCs.
 
 ## Out of scope
 
 Do not build these. If a stage seems to need one, stop and say so.
 
 - Coordinator high availability, leader election, or consensus (Raft/Paxos). The coordinator is a known single point of failure.
-- S3 HTTP API compatibility, presigned URLs, bucket policies.
+- S3 HTTP API compatibility, presigned URLs, bucket policies. (The gateway has its own simple HTTP API, not S3's.)
 - Authentication, authorization, encryption at rest or in transit.
 - Erasure coding.
 - Content-addressed deduplication.
@@ -208,6 +248,7 @@ Do not build these. If a stage seems to need one, stop and say so.
 - Block reports and background scrubbing. Silent disk loss is detected only at read time.
 - Fencing tokens for stale nodes.
 - Multi-region.
+- Admin or chaos controls in the UI.
 
 ## Verification notes
 
