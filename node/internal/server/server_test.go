@@ -37,16 +37,22 @@ type testNode struct {
 
 func startServer(t *testing.T, maxReads int) testNode {
 	t.Helper()
+	return startServerLimits(t, maxReads, 4)
+}
+
+// startServerLimits is startServer with a chosen write limit.
+func startServerLimits(t *testing.T, maxReads, maxWrites int) testNode {
+	t.Helper()
 	dir := t.TempDir()
 	store, err := chunkstore.New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New("test-node", store, log, maxReads)
+	srv := New("test-node", store, log, maxReads, maxWrites)
 
 	lis := bufconn.Listen(16 << 20)
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(GRPCOptions()...)
 	objectstorev1.RegisterStorageNodeServiceServer(gs, srv)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
@@ -395,6 +401,55 @@ func TestReadChunkConcurrencyLimit(t *testing.T) {
 	}
 }
 
+// TestWriteChunkConcurrencyLimit: a write beyond the limit is refused at once
+// with RESOURCE_EXHAUSTED, before any data is stored, and a write releases its
+// slot when it ends.
+func TestWriteChunkConcurrencyLimit(t *testing.T) {
+	n := startServerLimits(t, 4, 2)
+
+	// Occupy every slot, as two in-flight writes would.
+	n.srv.writeSlots <- struct{}{}
+	n.srv.writeSlots <- struct{}{}
+	b := []byte("refused while full")
+	_, err := write(t.Context(), n.client, []*objectstorev1.WriteChunkRequest{
+		{Frame: &objectstorev1.WriteChunkRequest_Header{Header: &objectstorev1.WriteChunkHeader{ChunkId: testChunkID, SizeBytes: int64(len(b))}}},
+		data(b), trailer(sha(b)),
+	})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code with all slots taken = %v, want ResourceExhausted", got)
+	}
+	if _, err := os.Stat(n.finalPath(testChunkID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused write left a chunk file: %v", err)
+	}
+	if got := n.tempCount(t); got != 0 {
+		t.Fatalf("refused write left %d temp files", got)
+	}
+
+	<-n.srv.writeSlots
+	writeValid(t, n, testChunkID, b)
+	if got := len(n.srv.writeSlots); got != 1 {
+		t.Errorf("slots in use after write = %d, want 1 (the write must release its slot)", got)
+	}
+}
+
+// TestOversizedMessageRefusedByGRPC: a message larger than one frame plus
+// overhead is refused by gRPC itself, before it is decoded in full, so it
+// never costs the node more memory than a frame.
+func TestOversizedMessageRefusedByGRPC(t *testing.T) {
+	n := startServer(t, 4)
+	b := bytes.Repeat([]byte("x"), 2*MaxFrameSize)
+	_, err := write(t.Context(), n.client, []*objectstorev1.WriteChunkRequest{
+		{Frame: &objectstorev1.WriteChunkRequest_Header{Header: &objectstorev1.WriteChunkHeader{ChunkId: testChunkID, SizeBytes: int64(len(b))}}},
+		data(b), trailer(sha(b)),
+	})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code for a %d-byte frame = %v (%v), want ResourceExhausted from gRPC's message limit", len(b), got, err)
+	}
+	if got := n.tempCount(t); got != 0 {
+		t.Fatalf("refused write left %d temp files", got)
+	}
+}
+
 // flip inverts one byte of a file in place.
 func flip(t *testing.T, path string, offset int64) {
 	t.Helper()
@@ -544,12 +599,12 @@ func startTCPNode(t *testing.T, nodeID string) (testNode, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(nodeID, store, slog.New(slog.NewTextHandler(io.Discard, nil)), 4)
+	srv := New(nodeID, store, slog.New(slog.NewTextHandler(io.Discard, nil)), 4, 4)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(GRPCOptions()...)
 	objectstorev1.RegisterStorageNodeServiceServer(gs, srv)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)

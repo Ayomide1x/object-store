@@ -50,6 +50,8 @@ expected_test() {
     t4-no-tombstone-sweep-at-startup) echo "TestRecoverStore" ;;
     t5-unlink-before-tombstone-durable) echo "TestDeleteOrder" ;;
     t6-delete-ignores-addressed-node) echo "TestDeleteChunks/addressed_to_another_node:_nothing_deleted" ;;
+    m1-no-write-limit) echo "TestWriteChunkConcurrencyLimit" ;;
+    m2-no-recv-message-limit) echo "TestOversizedMessageRefusedByGRPC" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

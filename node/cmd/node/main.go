@@ -35,6 +35,7 @@ type config struct {
 	listenAddr        string
 	dataDir           string
 	maxReads          int
+	maxWrites         int
 	coordinatorAddr   string
 	heartbeatInterval time.Duration
 }
@@ -79,8 +80,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("listen on %s: %w", cfg.listenAddr, err)
 	}
 
-	srv := grpc.NewServer()
-	objectstorev1.RegisterStorageNodeServiceServer(srv, server.New(cfg.nodeID, store, log, cfg.maxReads))
+	srv := grpc.NewServer(server.GRPCOptions()...)
+	objectstorev1.RegisterStorageNodeServiceServer(srv, server.New(cfg.nodeID, store, log, cfg.maxReads, cfg.maxWrites))
 	// SERVING only now: temp cleanup is done and the listener is open.
 	healthSrv := health.NewServer()
 	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
@@ -88,7 +89,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Info("node listening", "addr", cfg.listenAddr, "data_dir", cfg.dataDir, "max_concurrent_reads", cfg.maxReads)
+		log.Info("node listening", "addr", cfg.listenAddr, "data_dir", cfg.dataDir,
+			"max_concurrent_reads", cfg.maxReads, "max_concurrent_writes", cfg.maxWrites)
 		serveErr <- srv.Serve(lis)
 	}()
 
@@ -211,6 +213,14 @@ func loadConfig() (config, error) {
 			return config{}, fmt.Errorf("NODE_MAX_CONCURRENT_READS must be a positive integer, got %q", v)
 		}
 		cfg.maxReads = n
+	}
+	cfg.maxWrites = 16
+	if v := os.Getenv("NODE_MAX_CONCURRENT_WRITES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return config{}, fmt.Errorf("NODE_MAX_CONCURRENT_WRITES must be a positive integer, got %q", v)
+		}
+		cfg.maxWrites = n
 	}
 	return cfg, nil
 }

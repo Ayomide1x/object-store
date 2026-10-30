@@ -38,7 +38,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+# sha256sum is GNU coreutils (Linux); macOS has shasum. Minimal Linux images
+# may lack shasum (it is Perl), so prefer sha256sum when present.
+if command -v sha256sum >/dev/null; then
+  sha() { sha256sum "$1" | cut -d' ' -f1; }
+else
+  sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+fi
 
 echo "generating two ${size_mib} MiB files"
 head -c $((size_mib << 20)) /dev/urandom > "$work/A"

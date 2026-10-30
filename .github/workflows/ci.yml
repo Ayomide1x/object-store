@@ -1,0 +1,62 @@
+# On every push and pull request: the fast checks. Go formatting, vet and
+# tests; the protobuf lint and wire-compatibility check (invariant 9); the
+# coordinator's tests against a real Postgres (Testcontainers uses the
+# runner's Docker). The slow checks run weekly, in acceptance.yml.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# bash, not the default sh: -eo pipefail, so a `| tee` can't hide a failure.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking compares against an earlier commit
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt and go vet
+        run: make vet
+      - name: go test
+        run: go test -count=1 ./...
+      - name: buf lint
+        run: make proto-lint
+      # Against the PR's base, or the commit before this push. (make
+      # proto-breaking compares against the local main branch, which is
+      # this commit itself on a push to main.)
+      - name: buf breaking
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            echo "no earlier commit to compare against (a new branch); skipped"
+            exit 0
+          fi
+          go run github.com/bufbuild/buf/cmd/buf@v1.75.0 breaking --against ".git#ref=$BASE"
+
+  coordinator:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: coordinator tests
+        working-directory: coordinator
+        run: ./gradlew test
+      - name: test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coordinator-test-reports
+          path: coordinator/build/reports/tests/test

@@ -1,0 +1,11 @@
+diff --git a/node/internal/server/server.go b/node/internal/server/server.go
+--- a/node/internal/server/server.go
++++ b/node/internal/server/server.go
+@@ -66,7 +66,6 @@
+ // plus one message as received and as decoded.
+ func GRPCOptions() []grpc.ServerOption {
+ 	return []grpc.ServerOption{
+-		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+ 		grpc.StaticStreamWindowSize(streamWindow),
+ 		grpc.StaticConnWindowSize(connWindow),
+ 	}

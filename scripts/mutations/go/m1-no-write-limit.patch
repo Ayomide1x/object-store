@@ -1,0 +1,17 @@
+diff --git a/node/internal/server/server.go b/node/internal/server/server.go
+--- a/node/internal/server/server.go
++++ b/node/internal/server/server.go
+@@ -95,13 +95,6 @@
+ 
+ 	log := s.log.With("node_id", s.nodeID, "object_id", header.GetObjectId(), "chunk_id", header.GetChunkId())
+ 
+-	select {
+-	case s.writeSlots <- struct{}{}:
+-		defer func() { <-s.writeSlots }()
+-	default:
+-		log.Warn("write rejected: concurrent write limit reached", "limit", cap(s.writeSlots))
+-		return status.Errorf(codes.ResourceExhausted, "node %s is serving %d writes; retry later", s.nodeID, cap(s.writeSlots))
+-	}
+ 
+ 	// Fail fast before receiving the data. This is not the guarantee: the
+ 	// final link in Commit is what refuses to replace a chunk.

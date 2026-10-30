@@ -1,0 +1,159 @@
+# object-store
+
+A small S3-style distributed object store. Clients upload objects under a key; each object is split into 4 MiB chunks, every chunk is checksummed and replicated to three of four storage nodes, and a coordinator keeps all metadata in PostgreSQL. It tracks node liveness through heartbeats and re-replicates chunks that lose a replica.
+
+The core rule: **the metadata plane and the data plane are separate.** The coordinator decides where bytes go and records what exists. It never carries object bytes: clients and storage nodes move them between themselves.
+
+![demo](docs/demo.gif)
+
+The recording above is [`scripts/demo.sh`](scripts/demo.sh) running on the shipped configuration (idle time compressed to 2 s). Replay it in a terminal with `asciinema play docs/demo.cast`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    osctl["osctl (CLI)"]
+    coord["coordinator<br/>Java, Spring Boot"]
+    pg[("PostgreSQL<br/>all metadata")]
+    subgraph nodes["storage nodes (Go)"]
+        n1[node1]
+        n2[node2]
+        n3[node3]
+        n4[node4]
+    end
+
+    osctl -- "metadata: initiate, complete, get,<br/>ls, stat, rm, bad-replica reports" --> coord
+    osctl == "chunk bytes: write to 3 nodes,<br/>read from 1 (failover)" ==> nodes
+    coord --> pg
+    coord -- "StatChunks, VerifyChunk,<br/>PushChunk, DeleteChunks" --> nodes
+    nodes -- "heartbeats" --> coord
+    n1 == "repair copy<br/>(node to node)" ==> n4
+```
+
+Thick arrows carry object bytes; thin ones carry metadata only.
+
+**Life of a put**
+1. `osctl put` asks the coordinator to initiate an upload. The coordinator creates a `PENDING` object and plans its chunks: an ID and 3 ALIVE nodes each.
+2. The client streams each chunk to its 3 nodes in parallel, in frames of at most 1 MiB, with the chunk's SHA-256.
+3. Each node verifies size and hash, writes a temp file, fsyncs it, links it to its final name (never replacing anything) and fsyncs the directory.
+4. The client calls CompleteUpload. The coordinator asks each node what it holds (`StatChunks`, answered under the node's own ID), records only the replicas that check out, and commits only if every chunk has at least 2.
+5. Commit swaps the key's pointer to the new object in the same transaction. Readers see the old version or the new one, never a mix.
+
+**Life of a get**
+1. `osctl get` asks the coordinator for the chunk list: each chunk's hash and its healthy replicas, with each node's liveness.
+2. For each chunk the client reads one replica (ALIVE nodes first). The node verifies the chunk before sending a byte, and the client checks the received bytes against the recorded hash.
+3. On an error, a timeout or a hash mismatch, the client fails over to the next replica. A bad copy is reported; the coordinator asks that node to verify its own copy and marks it `BAD` only if the node confirms.
+
+**In the background**
+- **Liveness:** nodes heartbeat every 2 s. After 6 s of silence a node is `SUSPECT`, after 15 s `DEAD`; it needs 2 consecutive beats to come back.
+- **Repair:** a reconciler finds chunks with fewer than 3 healthy replicas (a `DEAD` node's copies stop counting 30 s after it died) and orders a node-to-node copy from a verified replica. It is idempotent and bounded.
+- **Garbage collection:** `rm` removes the key at once; the object's files are deleted after a read grace, and uploads left `PENDING` are abandoned and collected. A row is removed only when the node itself confirms its file is gone.
+
+## Run it
+
+You need Docker (with Compose v2), Go 1.27, and Python 3 for the scripts.
+
+```sh
+docker compose up --build --wait   # Postgres, the coordinator, 4 nodes
+make build                         # bin/osctl and bin/node
+
+bin/osctl put ./photo.jpg photos/1.jpg
+bin/osctl get photos/1.jpg ./copy.jpg
+bin/osctl ls photos/
+bin/osctl stat photos/1.jpg        # chunks, replicas, liveness
+bin/osctl rm photos/1.jpg
+```
+
+Every port is bound to 127.0.0.1: there is no authentication. `osctl` talks to `127.0.0.1:9090` unless `OSCTL_COORDINATOR` says otherwise. All configuration is environment variables, documented in [`docker-compose.yml`](docker-compose.yml).
+
+Reset everything with `docker compose down -v`.
+
+## The demo
+
+```sh
+docker compose down -v && docker compose up --build --wait
+make build
+scripts/demo.sh
+```
+
+About two minutes, on the shipped settings. It uploads a 40 MiB file, stops a node (SUSPECT, then DEAD), waits out the repair grace and shows each chunk being copied, starts the node again, corrupts one replica on disk and downloads the file intact anyway (the replica is marked `BAD` and the chunk repaired), and ends with `osctl stat`.
+
+The demo is also an acceptance test: every step checks that what it shows happened and stops with `FAIL` and the reason if not. `DEMO_PAUSE=5 scripts/demo.sh` holds 5 s after each step. `scripts/record-demo.sh` records it (needs `asciinema` 3 and `agg`).
+
+## Invariants
+
+These hold at every stage after the one that introduced them; code that would break one is wrong even if its tests pass.
+
+1. **No partial reads.** A key resolves only to a `COMMITTED` object. A Postgres foreign key makes the key pointer reference only committed objects.
+2. **Commit implies durability.** An object commits only if every chunk has at least 2 replicas that acknowledged a checksum-verified, fsynced write, as confirmed by the nodes themselves.
+3. **Metadata never overstates.** A replica row exists only for a replica that acknowledged, and facts about a node come only from a response that identifies as that node.
+4. **Chunks are immutable.** A chunk file is never modified in place (writes link without replacing); chunk IDs are assigned by the coordinator and never reused. Deleted IDs are tombstoned.
+5. **Every byte served is verified.** Nodes check a chunk's SHA-256 before sending it to a client or a peer.
+6. **The coordinator carries no object bytes.** Re-replication is node to node.
+7. **Postgres is the only metadata truth.** Restarting the coordinator loses nothing.
+8. **Re-replication is idempotent and bounded.** Running it twice is harmless; copies in flight are capped cluster-wide and per node.
+9. **Wire compatibility.** Protobuf field numbers are never reused or renumbered (`buf breaking` in CI).
+10. **arm64-clean.** Every image builds and runs on `linux/arm64` ([`scripts/check-arm64.sh`](scripts/check-arm64.sh)).
+
+## How it's tested
+
+| Layer | What | Run |
+|---|---|---|
+| Go unit tests | node chunk store (durability order, tombstones, crash recovery), node RPCs, heartbeats, client upload and failover | `go test ./...` |
+| Coordinator integration tests | 96 tests against a real Postgres (Testcontainers) and in-process fake nodes: the commit protocol, bad-replica reports, liveness, repair, GC | `cd coordinator && ./gradlew test` |
+| Acceptance scripts | one per stage, against the real Compose stack; each checks what actually happened on disk and in Postgres, and fails as inconclusive rather than passing on a run that didn't test anything | below |
+| Mutation checks | each patch in `scripts/mutations/` breaks one rule; the named test must fail | `scripts/go-mutation-check.sh`, `scripts/coordinator-mutation-check.sh` |
+
+| Script | Proves |
+|---|---|
+| `stage2-roundtrip.sh`, `stage2-overwrite-check.sh` | 0 B / 1 B / 4 MiB / 100 MiB round trips; a get during overwrites sees the old or the new object, never a mix |
+| `stage3-corrupt-check.sh`, `stage3-crash-check.sh`, `stage3-fsync-trace.sh` | a flipped byte fails the get loudly; a node killed mid-write leaves no partial file; the fsync order, traced |
+| `stage4-replication-check.sh` | 3 replicas per chunk; uploads with a node stopped or hung; clean failure with too few nodes |
+| `stage5-failover-check.sh` | reads fail over and the bad replica is marked, only on its node's word |
+| `stage6-liveness-check.sh` | ALIVE → SUSPECT → DEAD → ALIVE within the configured windows |
+| `stage7-repair-check.sh` | every chunk of a stopped node gets back to 3 replicas; a target killed mid-copy leaves nothing partial |
+| `stage8-gc-check.sh` | after a client is killed mid-upload, no orphan chunk files remain; rm, overwrite and GC with a node down |
+| `demo.sh` | the demo story, end to end |
+
+Scripts that corrupt files restore them afterwards and check that every file they touched is gone or verifies. A mutation counts as detected when its named test fails (for the coordinator, in a run of only that test's class); each script then runs the full unmutated suite once. CI runs the Go and coordinator tests on every push, and the acceptance scripts and both mutation checks weekly.
+
+## Design decisions
+
+Every non-obvious choice is recorded in [DECISIONS.md](DECISIONS.md): what was chosen, over what, why, and when it would become wrong. A few worth reading first:
+
+- [Client fan-out writes](DECISIONS.md#client-fan-out-writes-per-replica-writer-in-a-shared-package-stage-4) rather than a primary that forwards to replicas
+- [A commit quorum of 2 of 3](DECISIONS.md#commit-quorum-at-least-2-verified-replicas-per-chunk-else-failed_precondition-stage-4)
+- [The node's durable, no-replace write path](DECISIONS.md#node-write-path-temp--fsync--link-no-replace--fsync-dir--unlink-temps-cleaned-before-listening-stage-3)
+- [A bad-replica report is a hint the node must confirm](DECISIONS.md#a-clients-bad-replica-report-is-a-hint-the-node-confirms-it-before-anything-is-marked-stage-5)
+- [Repair waits a grace period after DEAD](DECISIONS.md#repair-waits-a-grace-period-after-dead-stage-7)
+- [Tombstones, a check after the link, and a sweep at startup](DECISIONS.md#tombstones-on-the-node-a-check-after-the-link-a-sweep-at-startup-stage-8)
+- [Garbage collection always makes progress](DECISIONS.md#gc-bounds-gc_passes-and-v7-stage-8)
+
+## Before deploying
+
+Nothing is deployed yet. The shipped Compose file is the development and demo stack; a deploy (for example to a single small ARM VM) would need:
+
+- **A real Postgres password:** set `OBJECTSTORE_DB_PASSWORD` (copy `.env.example` to `.env`).
+- **Production GC timings:** the shipped `COORDINATOR_GC_READ_GRACE` (60 s) and `COORDINATOR_GC_PENDING_TIMEOUT` (120 s) are demo values; use the code defaults, 15 min and 24 h.
+- **Ports kept on loopback:** with no authentication, reach the services through an SSH tunnel. Drop or remap Postgres's host port (5432) if the host runs another Postgres; only the scripts use it.
+- **Memory:** every service has a hard limit, about 2.5 GiB in total, derived from worst-case bounds (see DECISIONS.md, stage 9).
+- **Restart policies and log rotation:** none are set (the crash tests stop nodes on purpose); add `restart: unless-stopped` and json-file `max-size` for a long-running host.
+- **Backups:** Postgres is the only metadata truth, and the coordinator is a single point of failure by design. Schedule `pg_dump`.
+
+## Out of scope
+
+Coordinator high availability or consensus, S3 API compatibility, authentication and encryption, erasure coding, deduplication, compression, versioning beyond atomic overwrite, range reads, resumable uploads, rack awareness, rebalancing, background scrubbing, fencing tokens, multi-region. [CLAUDE.md](CLAUDE.md) has the full list and the build plan.
+
+## Repo layout
+
+```
+proto/objectstore/v1/   the wire format (the only source of truth)
+coordinator/            Java 25, Spring Boot, grpc-java; Flyway migrations
+node/                   storage node (Go): cmd/node, internal/chunkstore, internal/server
+client/                 osctl (Go): cmd/osctl, internal/upload, internal/download
+internal/chunkwrite/    per-replica chunk writer shared by the client and nodes
+gen/go/                 generated Go code (committed)
+scripts/                demo, acceptance and mutation scripts
+docs/                   the demo recording
+DECISIONS.md            every design decision
+```

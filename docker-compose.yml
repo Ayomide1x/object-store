@@ -1,12 +1,27 @@
 # One Postgres, one coordinator, four storage nodes. Each chunk is placed on
 # three of the four nodes. Every port is bound to 127.0.0.1 only: there is no
 # authentication.
+#
+# Memory: every service has a hard limit (mem_limit, with memswap_limit equal
+# so it can't spill into swap). The limits come from worst-case bounds, not
+# measured averages; DECISIONS.md "Memory limits from worst-case bounds"
+# (stage 9) has the arithmetic. About 2.5 GiB in total.
+#
+# OBJECTSTORE_DB_PASSWORD sets the Postgres password for both Postgres and the
+# coordinator. Unset, it is "objectstore", for local development only: set it
+# (for example in a gitignored .env; see .env.example) for anything else.
 
 # Settings shared by every storage node.
 x-node: &node
   build:
     context: .
     dockerfile: node/Dockerfile
+  # 32 reads x ~5.1 MiB + 16 writes x ~3.1 MiB + ~16 MiB baseline = ~230 MiB
+  # live at most. GOMEMLIMIT (288MiB, per node below) makes Go's GC work
+  # harder before the heap reaches the limit, instead of letting it grow to
+  # twice the live data.
+  mem_limit: 320m
+  memswap_limit: 320m
   # Healthy once the node's gRPC health service reports SERVING, which it does
   # only after stray temp files are cleaned and the listener is open. The image
   # is distroless (no shell), so the node binary probes itself. `docker compose
@@ -25,7 +40,10 @@ services:
     environment:
       POSTGRES_DB: objectstore          # database name
       POSTGRES_USER: objectstore        # superuser created on first start
-      POSTGRES_PASSWORD: objectstore    # local development only
+      POSTGRES_PASSWORD: ${OBJECTSTORE_DB_PASSWORD:-objectstore}
+    # shared_buffers 128 MB (the default) + up to 10 coordinator connections.
+    mem_limit: 512m
+    memswap_limit: 512m
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -43,7 +61,12 @@ services:
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/objectstore   # metadata database
       SPRING_DATASOURCE_USERNAME: objectstore
-      SPRING_DATASOURCE_PASSWORD: objectstore
+      SPRING_DATASOURCE_PASSWORD: ${OBJECTSTORE_DB_PASSWORD:-objectstore}
+      # Heap at most half the container limit (384 MiB of 768 MiB); the rest
+      # is for metaspace, code cache, threads and gRPC's direct buffers,
+      # capped at 64 MiB (the coordinator carries no object bytes, so its
+      # messages are small). The JVM prints "Picked up JAVA_TOOL_OPTIONS".
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=50 -XX:MaxDirectMemorySize=64m"
       SPRING_GRPC_SERVER_PORT: "9090"                                       # coordinator gRPC port
       # Storage nodes, comma-separated node_id|internal_addr|client_addr.
       # internal_addr: how the coordinator reaches a node (StatChunks at commit).
@@ -96,6 +119,8 @@ services:
       COORDINATOR_GC_MAX_PER_NODE: "1"
       # How long rows in the gc_passes table are kept:
       COORDINATOR_GC_PASS_RETENTION: 24h
+    mem_limit: 768m
+    memswap_limit: 768m
     ports:
       - "127.0.0.1:9090:9090"
     # Healthy once the gRPC server accepts connections, which happens only after
@@ -116,6 +141,8 @@ services:
   # same port inside the container and on the host. NODE_DATA_DIR holds chunk
   # files in chunks/ and in-progress writes in tmp/. NODE_MAX_CONCURRENT_READS:
   # reads beyond this get RESOURCE_EXHAUSTED; each holds up to 4 MiB in memory.
+  # NODE_MAX_CONCURRENT_WRITES: the same for writes; each holds about 3 MiB in
+  # gRPC buffers. GOMEMLIMIT: Go's soft memory limit, under mem_limit above.
   # COORDINATOR_ADDR is where heartbeats go; NODE_HEARTBEAT_INTERVAL how often
   # (with +/-10% jitter). Nodes keep serving while the coordinator is down.
   node1:
@@ -125,6 +152,8 @@ services:
       NODE_LISTEN_ADDR: ":9101"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      NODE_MAX_CONCURRENT_WRITES: "16"
+      GOMEMLIMIT: 288MiB
       COORDINATOR_ADDR: coordinator:9090
       NODE_HEARTBEAT_INTERVAL: 2s
     ports:
@@ -139,6 +168,8 @@ services:
       NODE_LISTEN_ADDR: ":9102"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      NODE_MAX_CONCURRENT_WRITES: "16"
+      GOMEMLIMIT: 288MiB
       COORDINATOR_ADDR: coordinator:9090
       NODE_HEARTBEAT_INTERVAL: 2s
     ports:
@@ -153,6 +184,8 @@ services:
       NODE_LISTEN_ADDR: ":9103"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      NODE_MAX_CONCURRENT_WRITES: "16"
+      GOMEMLIMIT: 288MiB
       COORDINATOR_ADDR: coordinator:9090
       NODE_HEARTBEAT_INTERVAL: 2s
     ports:
@@ -167,6 +200,8 @@ services:
       NODE_LISTEN_ADDR: ":9104"
       NODE_DATA_DIR: /data
       NODE_MAX_CONCURRENT_READS: "32"
+      NODE_MAX_CONCURRENT_WRITES: "16"
+      GOMEMLIMIT: 288MiB
       COORDINATOR_ADDR: coordinator:9090
       NODE_HEARTBEAT_INTERVAL: 2s
     ports:

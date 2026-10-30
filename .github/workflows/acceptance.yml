@@ -1,0 +1,75 @@
+# Weekly, and on demand: the slow checks, on amd64 and arm64 (GitHub's arm64
+# runners are free for public repositories). Every acceptance script runs
+# against the real Compose stack, then both mutation checks. It doesn't gate
+# pushes: timing-sensitive scripts on shared runners can flake, and a flake is
+# something to look into, not a reason to block a push.
+name: acceptance
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # Mondays, 05:00 UTC
+  workflow_dispatch:
+
+# bash, not the default sh: -eo pipefail, so a `| tee` can't hide a failure.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  acceptance:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: build
+        run: |
+          make build
+          docker compose build
+      # Only arm64 can prove the images run natively there; on amd64 the
+      # check's first half fails by design.
+      - name: check-arm64
+        if: matrix.runner == 'ubuntu-24.04-arm'
+        run: scripts/check-arm64.sh
+      # The demo needs a fresh stack; each script after it is run on the
+      # stack the previous one left, as on a developer's machine.
+      - name: acceptance scripts
+        run: |
+          mkdir -p logs
+          docker compose up --wait -d
+          status=0
+          for s in demo stage2-roundtrip stage2-overwrite-check stage3-corrupt-check stage3-crash-check \
+                   stage3-fsync-trace stage4-replication-check stage5-failover-check stage6-liveness-check \
+                   stage7-repair-check stage8-gc-check; do
+            if scripts/$s.sh > logs/$s.log 2>&1; then
+              echo "$s: PASS"
+            else
+              echo "$s: FAIL"; status=1
+            fi
+          done
+          exit $status
+      - name: go mutation check
+        if: always()
+        run: scripts/go-mutation-check.sh | tee logs/go-mutation.log
+      - name: coordinator mutation check
+        if: always()
+        run: scripts/coordinator-mutation-check.sh | tee logs/coordinator-mutation.log
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-logs-${{ matrix.runner }}
+          path: |
+            logs
+            coordinator/build/test-results

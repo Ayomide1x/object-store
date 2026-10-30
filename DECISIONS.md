@@ -1145,3 +1145,161 @@ Tests: `deletesAreBatchedAndBounded` (30 deletes with a batch of 4, 1 per node, 
 **Over:** the whole suite under every mutation (47 × about 6 min, and one hang stalled it all); a per-mutation wall-clock limit in the script (it would not say which test hung).
 **Because:** a mutation targets one rule, and that rule's test is in one class. Nothing is lost on the unmutated side, since that run still covers every class. The kill-safe revert matters because a run interrupted by a kill would otherwise leave a mutation in the tree. A later commit could then ship it.
 **Breaks if:** a mutation's only detecting test moves to another class without the `Class|test` entry changing (the script then reports NOT DETECTED, loudly); a mutation would also have broken another class's tests and that mattered (it is no longer seen); or a test legitimately needs more than 30 s and gets its own `@Timeout`.
+
+## Node writes bounded: NODE_MAX_CONCURRENT_WRITES, RESOURCE_EXHAUSTED when full (stage 9)
+**Amends:** "Concurrent reads bounded by a semaphore; RESOURCE_EXHAUSTED when full" (stage 3), whose *Breaks if* noted that write concurrency was unlimited.
+**Chose:** a second buffered channel, `writeSlots`, of capacity `NODE_MAX_CONCURRENT_WRITES` (default 16), taken without waiting right after the header frame, so the refusal log line carries the chunk ID. A write beyond the limit fails at once with `RESOURCE_EXHAUSTED` before anything is stored, and a write gives its slot back when it ends, however it ends. Repair copies count too: a `PushChunk` arrives at its target as an ordinary `WriteChunk`.
+- **What a refusal means to clients:** `osctl` treats it like any failed replica. It skips that node for the rest of the upload ("Per-replica write deadline; a failed node is skipped for the rest of that upload", stage 4), and a chunk left with fewer than 2 replicas fails the upload. A repair copy to a full target is `TARGET_FAILED` and is retried on the next pass.
+- **Measured under overload:** 48 concurrent 16 MiB uploads, about 36 writes per node against 16 slots, then 64 concurrent downloads. 21 uploads committed and 27 failed cleanly (32 client logs show `ResourceExhausted`). No container was OOM-killed, and nodes peaked at 158–200 MiB of their 320 MiB.
+
+Tests: `TestWriteChunkConcurrencyLimit` (full → `RESOURCE_EXHAUSTED`, nothing written, no temp file; a freed slot lets the write through, and the write gives its slot back). Mutation M1 removes the limit.
+**Over:** no limit (a memory limit then turns a burst of writes into an OOM kill mid-write); a waiting semaphore (hides overload, holds connections; the stage 3 reasoning); retrying a refused write in `osctl` (new client behavior, not needed at today's load).
+**Because:** with a hard memory limit, every source of node memory needs a bound, and writes were the one without one.
+**Breaks if:** legitimate load exceeds 16 concurrent writes per node. Uploads then fail under load where they used to succeed, and `osctl` would need to retry with backoff.
+
+## The node's gRPC server bounds its own buffers: message size and static flow-control windows (stage 9)
+**Amends:** "Chunk streams framed at ≤ 1 MiB, header frame first" (stage 1).
+**Chose:** `server.GRPCOptions()`, used by the node binary and by the server tests:
+- `MaxRecvMsgSize(1 MiB + 16 KiB)`: one data frame plus protobuf overhead. gRPC's default of 4 MiB let an oversized frame be decoded in full before `receiveData` rejected it. The largest other request, a `StatChunks` or `DeleteChunks` batch of 4096 IDs, is under 200 KB.
+- `StaticStreamWindowSize(1 MiB)` and `StaticConnWindowSize(16 MiB)`: how much unread data gRPC buffers per stream and per connection. grpc-go v1.85.0 otherwise estimates bandwidth (BDP) and can grow both windows to 16 MiB (`bdpLimit`). One slow-disk write could then buffer 16 MiB.
+
+With these, a write holds at most about 3.1 MiB in gRPC: one stream window of unread data, plus one message as received and as decoded.
+
+Test: `TestOversizedMessageRefusedByGRPC` (a 2 MiB frame is refused by gRPC with `RESOURCE_EXHAUSTED`, not by our frame check with `INVALID_ARGUMENT`). Mutation M2 removes the message limit. **The windows have no test.** A unit test can't observe how much gRPC buffers, and a window can't be mutation-checked. They are set in one place, `GRPCOptions`, beside the arithmetic they support.
+**Over:** keeping gRPC's defaults and budgeting their worst case (about 21 MiB per write: a 16 MiB window plus a 4 MiB message, which makes the node limit about 600 MiB); raising nothing (CLAUDE.md: raising the limit is not the fix, and here it is lowered).
+**Because:** the node limit is derived from per-operation bounds, so each operation needs one that holds by construction, not only on average.
+**Breaks if:** nodes are reached over a high-latency link, where a 1 MiB window caps throughput (about 1 MiB per round trip per stream). Or many clients open many connections and streams the node refuses: refused streams still get up to a window of data buffered until they are reset. With no auth and loopback-only ports this is out of scope, but it is the bound's weak point.
+
+## Memory limits from worst-case bounds (stage 9)
+**Chose:** a hard limit per service (`mem_limit`, with `memswap_limit` equal so a container can't spill into swap and hide the overrun), about 2.5 GiB in total:
+- **Node: 320 MiB.**
+  - Reads: 32 × about 5.1 MiB (the 4 MiB chunk held for verification, plus about 1 MiB for the frame being encoded and sent) = 164 MiB. This holds for ReadChunk, VerifyChunk and PushChunk, which share the read slots.
+  - Writes: 16 × about 3.1 MiB = 50 MiB.
+  - Baseline: Go runtime, gRPC and heartbeats, about 16 MiB (idle RSS is 8–10 MiB).
+  - Live bound: about 230 MiB.
+  - `GOMEMLIMIT=288MiB` (the bound plus 25%) makes Go's GC work harder near the limit. Go's runtime doesn't read the container's memory limit, so without it GOGC=100 lets the heap grow to twice the live data before collecting, about 460 MiB, over any sensible limit.
+  - 320 MiB leaves about 32 MiB above `GOMEMLIMIT` for memory outside the Go heap.
+- **Coordinator: 768 MiB.**
+  - `-XX:MaxRAMPercentage=50` gives a 384 MiB heap (checked: `MaxHeapSize = 402653184`).
+  - The other half covers metaspace (Spring, gRPC, JDBC: about 100–150 MiB), code cache, thread stacks and gRPC's Netty direct buffers, capped by `-XX:MaxDirectMemorySize=64m`. The coordinator carries no object bytes, so its messages are small.
+  - The heap is a percentage of the container limit, not a fixed `-Xmx`, so changing the limit moves the heap with it.
+  - The JVM reads the container's limit itself (container support since JDK 10), with a default `MaxRAMPercentage` of 25%: 192 MiB of 768 MiB. That would leave 576 MiB for non-heap memory that needs about 200–250 MiB, so 50% gives the difference to the heap.
+  - The 1.94 GB heap measured before stage 9 came from having no container limit at all. The JVM then took 25% of the Docker VM's 7.7 GB, and would take about 6 GB on a 24 GB host.
+  - Idle use is 242 MiB; the peak under the overload test was 383 MiB.
+- **Postgres: 512 MiB.** shared_buffers is 128 MB (the default), and the coordinator opens at most 10 connections (Hikari's pool), each with work_mem of 4 MB. Idle use is 49 MiB; the overload peak was 70 MiB.
+
+The settings are environment variables in `docker-compose.yml` (`GOMEMLIMIT`, `JAVA_TOOL_OPTIONS`), beside the limits they depend on.
+**Over:** limits from measured peaks alone (a measurement can miss the worst case; stage 9's sampling caught 7 points in a run); no limits (with no container limit the JVM sizes its heap from the host, a quarter of the host's memory, on a host shared with another workload); a fixed `-Xmx` (drifts from the container limit).
+**Because:** an OOM kill in the middle of a write or a commit is a failure this system should never cause by itself. A bound derived from worst cases holds in situations no test measured.
+**Breaks if:** a code change adds per-operation memory (a buffer, a cache) without updating this arithmetic, or the read or write limits are raised without raising `mem_limit`.
+
+## Deploy-readiness: the password from the environment, the rest documented (stage 9)
+**Chose:**
+- **Fixed now:** the Postgres password comes from `OBJECTSTORE_DB_PASSWORD` (read by both Postgres and the coordinator), defaulting to `objectstore` for local use. `.env.example` is committed and `.env` is gitignored. Memory limits are fixed now too (entry above).
+- **Documented** in the README's "Before deploying", for a later deploy decision:
+  - GC timings: the demo's 60 s and 120 s against the code defaults, 15 min and 24 h;
+  - ports kept on loopback and reached through an SSH tunnel, with Postgres's host port dropped or remapped when the host runs another Postgres;
+  - restart policies and log rotation;
+  - `pg_dump` backups.
+- **Not changed:** restart policies (stage 3's crash check kills a node and expects it to stay down) and the port bindings (with no authentication, loopback is the security boundary).
+
+**Over:** `${OBJECTSTORE_DB_PASSWORD:?}` (it breaks clone-and-run); Docker secrets (Swarm-style machinery for one value); a production override file now (configuration nothing tests).
+**Because:** fixing what changes tested behavior now (memory) or costs nothing (the password variable) is cheap, while deploy-only settings belong to the deploy decision, which comes after stage 11.
+**Breaks if:** someone deploys with the default password. The README says not to, and nothing enforces it.
+
+## The demo runs on the shipped configuration; its timings come from docker compose config (stage 9)
+**Extends:** "Scripts are deterministic again under liveness" (stage 6), which rejected shortening thresholds for scripts.
+**Chose:** `scripts/demo.sh` uses `docker-compose.yml` unchanged. It reads every timing it narrates or waits on from `docker compose config --format json` (`COORDINATOR_SUSPECT_AFTER`, `_DEAD_AFTER`, `_REPAIR_GRACE`, `_REPAIR_INTERVAL`, `_RECOVERY_BEATS`, `_GC_READ_GRACE` and `NODE_HEARTBEAT_INTERVAL`), so "DEAD after 15 s" is what the running stack does. Timeouts are the configured value plus a 15 s margin. Waits are narrated with a countdown; the recording compresses idle time instead (entry below). A run takes about 70 s of waiting plus narration.
+**Over:** a demo Compose override with short timings (the demo, the recording and its acceptance run would show behavior nobody runs); timings hardcoded like the other scripts (fine there, but the demo's narration would drift silently).
+**Because:** a demo is where shortening timings is most tempting and misleads the most.
+**Breaks if:** a timing setting moves out of Compose's environment (into code or a file), where the demo can't read it.
+
+## The demo's story and checks (stage 9)
+**Chose:** six steps on a 40 MiB object (10 chunks):
+1. Upload.
+2. Stop a node and watch SUSPECT, then DEAD.
+3. Wait out the grace and watch each repair copy land.
+4. Start the node again; its copies count again, over-replicated and kept.
+5. Corrupt one replica, download anyway, see the replica marked BAD and the chunk repaired.
+6. `osctl stat`, reduced to a chunk × node map built from osctl's own output.
+
+How it stays deterministic:
+- **Preconditions:** a fresh cluster (no objects), 4 nodes ALIVE and `bin/osctl` built. Otherwise it stops as inconclusive, with the reset command.
+- **The node to stop:** one that holds some chunks and misses at least one, choosing the one that holds the most. The odds that none qualifies are (1/4)⁹ ≈ 4×10⁻⁶; then it stops as inconclusive.
+- **The chunk to corrupt:** one the returned node doesn't hold, so after the BAD mark exactly one node can take the repair. Corrupting before the node returns was rejected: the chunk would then have no free target, and it would look "repaired" only because the returned node's old copy started counting again.
+- **Every check is fatal**, and each step checks Postgres and the files on disk. It prints a sentence only after verifying it: SUSPECT is seen before DEAD; exactly one repair copy appears per chunk the node held, and each verifies; the download is identical; the BAD row comes from the node's confirmation; the final state has at least 3 healthy, verified replicas per chunk; `check_touched` passes after the restore.
+- **rm and GC are left out.** They add a read grace plus a pass, about 70 s, and `stage8-gc-check.sh` covers them. The demo mentions GC in one line.
+
+Its first run found a race in the demo itself: copies were listed before the count was read, so a copy landing between the two queries was missed. Now the count is read first.
+
+**Over:** a smaller object (a few chunks make a node that misses none likely); printing the happy path and checking at the end (the output could claim what didn't happen).
+**Because:** the demo is stage 9's acceptance test, and the stage 11 UI test watches it.
+**Breaks if:** placement stops spreading chunks over all 4 nodes, so a node can't miss a chunk.
+
+## DEMO_PAUSE: optional holds between steps, none by default (stage 9)
+**Chose:** `DEMO_PAUSE=SECONDS` sleeps after each step; the default is 0. It pauses only the script: the cluster keeps going (repair after a BAD mark starts within seconds whatever the script does). A viewer can still see the effect, because the BAD row persists next to the new copy.
+**Over:** "press Enter" prompts (they break unattended runs, CI and recording); fixed holds by default (every acceptance run would be slower).
+**Because:** the natural waits (SUSPECT for about 9 s, 30 s of grace) already give a viewer, or the stage 11 UI, time to see each change.
+**Breaks if:** stage 11's UI polls more slowly than a state lasts. Then it needs `DEMO_PAUSE`, or a faster poll.
+
+## The recording: asciinema 3 and agg, committed under docs/ (stage 9)
+**Chose:** `scripts/record-demo.sh` resets the stack, then runs `asciinema rec --return --output-format asciicast-v2 --idle-time-limit 2 --window-size 100x34 --command scripts/demo.sh`. `--return` makes asciinema exit with the demo's status, so a run that fails saves nothing. It then renders `docs/demo.gif` with `agg --idle-time-limit 2 --last-frame-duration 5`. Both files are committed: the cast is text and replays with `asciinema play`; the GIF shows inline on GitHub, which can't embed the asciinema player. It needs asciinema 3.x (the Rust CLI; 2.x's flags differ) and agg, which are dev tools and not in any image. You record on your machine, not in CI. Uploading to asciinema.org would publish the recording, so it's left as your choice.
+**Over:** VHS (it replays a scripted, typed session, which is a staged recording, and needs ffmpeg and ttyd); screen video (large binaries); terminalizer (unmaintained); asciicast v3 (older agg and players can't read it).
+**Because:** a text recording is reviewable and reproducible, and only a passing run should become the README's picture.
+**Breaks if:** the GIF grows past a few MB. Lower `--font-size`, or the window size.
+
+## arm64 verification: check-arm64.sh and the image inventory (stage 9)
+**Chose:** `scripts/check-arm64.sh` checks two things. Every image Compose runs must be `linux/arm64` locally (`docker image inspect`). Every third-party image must publish `linux/arm64` (`docker buildx imagetools inspect`): `postgres:18`, `eclipse-temurin:25-jdk` and `25-jre`, `golang:1.27`, `gcr.io/distroless/static-debian12:nonroot`, `alpine:3` (with `apk add strace` for the fsync trace), `docker:cli` and `testcontainers/ryuk:0.14.0`. The list is cross-checked against the sources (Dockerfile `FROM` lines, Compose `image:` lines, images the scripts run, and the `PostgreSQLContainer` in the tests). An image used there but missing from the list fails the check; this was tested by removing `alpine:3` from the list. Ryuk is listed by hand because the tests never name it.
+**Over:** checking only the built images (a helper image without arm64 would surface only when a script runs); a manual one-off check (it drifts).
+**Because:** invariant 10 covers every image we depend on, not just the ones we build.
+**Breaks if:** an image is pulled some other way (a new tool's container, an image in Java code under a different constructor). The cross-check only knows the patterns above.
+
+## No multi-arch builds; amd64 support comes from architecture-free Dockerfiles, and CI proves it (stage 9)
+**Chose:** no `docker buildx` multi-platform builds and no published images. Both Dockerfiles name no architecture (Go builds with `CGO_ENABLED=0` for the build platform; the jar is architecture-free). So `docker compose up --build` builds natively on an Intel machine too. CI's default runners are amd64, so every push builds and tests there; the weekly job also runs everything on arm64.
+**Over:** buildx for amd64 and arm64. Its costs: QEMU emulation for the foreign architecture (the Gradle build stage is slow under it, unless the Dockerfiles are restructured to cross-build); a registry or containerd image store to hold the manifest list; and an emulated test run to count the result as verified.
+**Because:** nobody pulls our images, so the only amd64 need is building from source, which already works.
+**Breaks if:** we publish images (a deploy from a registry), or a dependency is built for one architecture only.
+
+## CI: fast checks on every push, the slow ones weekly on both architectures (stage 9)
+**Chose:**
+- **`.github/workflows/ci.yml`, on every push and PR:**
+  - Go: `make vet` (gofmt and go vet), `go test`, `buf lint`.
+  - `buf breaking` against the PR's base commit, or on a push the commit before it (`.git#ref=<sha>`, with a full clone). `make proto-breaking` compares against the local `main`, which in CI is either missing or the pushed commit itself, so it would prove nothing.
+  - Coordinator: `./gradlew test` on Temurin 25 (Testcontainers uses the runner's Docker).
+- **`.github/workflows/acceptance.yml`, weekly (Mondays 05:00 UTC) and on demand:**
+  - on `ubuntu-24.04` and `ubuntu-24.04-arm` (arm64 runners are free for public repos, and this one is public);
+  - builds the images, runs `check-arm64.sh` (on arm64), the demo and every acceptance script on a fresh stack, then both mutation checks;
+  - uploads the logs.
+
+Both use `shell: bash`, so `-eo pipefail` stops a `| tee` from hiding a failure. Both pass actionlint 1.7.7.
+**Over:** the acceptance scripts on every push (about 45 minutes, and timing-sensitive on shared runners); no CI (nothing checks a push I didn't run by hand); gating merges on the weekly job (a flake would block work).
+**Because:** the fast checks catch most regressions within minutes; the slow ones catch drift (base images, timing) without slowing work.
+**Breaks if:** the repo goes private (the arm64 runners stop being free), or flakes in the weekly job are ignored instead of investigated.
+
+## stage2-overwrite-check uses sha256sum when present (stage 9)
+**Amends:** the stage 2 overwrite script's `shasum -a 256`.
+**Chose:** `sha256sum` (GNU coreutils, always on Linux) when present, else `shasum -a 256` (macOS).
+**Over:** `shasum` only (it is Perl, and missing on minimal Linux images); `openssl dgst` (another dependency).
+**Because:** the weekly CI job, and any Linux host, run this script.
+**Breaks if:** neither exists. The script then fails loudly at its first hash.
+
+## README.md: a reviewer's summary; DECISIONS.md stays the record (stage 9)
+**Chose:** a README covering stages 1–9:
+- what the system is, and the demo GIF;
+- a Mermaid architecture diagram, with "life of a put" and "life of a get";
+- how to run it, and the demo;
+- the 10 invariants, each with how it's enforced;
+- how it's tested: the layers, a table of scripts, mutation checks, CI;
+- links to seven DECISIONS entries;
+- "Before deploying", out of scope, and the repo layout.
+
+Stages 10 and 11 get added when built.
+**Over:** a README that repeats DECISIONS.md (two records drift apart); a minimal README (it's the first thing a reviewer sees).
+**Because:** the README tells a reader where to look, and DECISIONS.md says why.
+**Breaks if:** the README's claims (test counts, timings) go stale. They are written as of stage 9.
+
+## Mutation scripts extended for stage 9 (stage 9)
+**Extends:** "Mutation scripts extended for stage 8" (stage 8).
+**Chose:** Go mutations M1 (no write limit, caught by `TestWriteChunkConcurrencyLimit`) and M2 (no gRPC message limit, caught by `TestOversizedMessageRefusedByGRPC`): 34 Go mutations in all. The coordinator is unchanged in stage 9, so its 48 stay.
+**Because:** each new bound is shown to be load-bearing, except the flow-control windows, which can't be (entry above).
+**Breaks if:** code edits stop the patches from applying; the scripts refuse to start.

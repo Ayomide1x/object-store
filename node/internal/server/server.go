@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -35,12 +36,40 @@ type Server struct {
 	// readSlots bounds concurrent reads. Each read holds a whole chunk in
 	// memory (up to 4 MiB) while verifying it, so this caps read memory.
 	readSlots chan struct{}
+	// writeSlots bounds concurrent writes. With GRPCOptions, gRPC holds at
+	// most about 3 MiB per write, so this caps write memory.
+	writeSlots chan struct{}
 }
 
 // New returns a Server that stores chunks in store and serves at most
-// maxReads reads at once.
-func New(nodeID string, store *chunkstore.Store, log *slog.Logger, maxReads int) *Server {
-	return &Server{nodeID: nodeID, store: store, log: log, readSlots: make(chan struct{}, maxReads)}
+// maxReads reads and maxWrites writes at once.
+func New(nodeID string, store *chunkstore.Store, log *slog.Logger, maxReads, maxWrites int) *Server {
+	return &Server{nodeID: nodeID, store: store, log: log,
+		readSlots: make(chan struct{}, maxReads), writeSlots: make(chan struct{}, maxWrites)}
+}
+
+const (
+	// maxRecvMsgSize admits one data frame plus protobuf overhead. gRPC's
+	// default (4 MiB) would let one oversized frame be decoded in full
+	// before receiveData rejects it.
+	maxRecvMsgSize = MaxFrameSize + 16<<10
+	// streamWindow is how much unread data gRPC buffers per stream, and
+	// connWindow per connection. Static: gRPC's default estimates bandwidth
+	// and can grow both to 16 MiB, so a write's buffered data would have no
+	// useful bound.
+	streamWindow = 1 << 20
+	connWindow   = 16 << 20
+)
+
+// GRPCOptions are the options a node's gRPC server must use. With them, a
+// write holds at most about 3 MiB in gRPC: one stream window of unread data,
+// plus one message as received and as decoded.
+func GRPCOptions() []grpc.ServerOption {
+	return []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.StaticStreamWindowSize(streamWindow),
+		grpc.StaticConnWindowSize(connWindow),
+	}
 }
 
 // WriteChunk receives one header frame, data frames, then one trailer frame
@@ -65,6 +94,14 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 	}
 
 	log := s.log.With("node_id", s.nodeID, "object_id", header.GetObjectId(), "chunk_id", header.GetChunkId())
+
+	select {
+	case s.writeSlots <- struct{}{}:
+		defer func() { <-s.writeSlots }()
+	default:
+		log.Warn("write rejected: concurrent write limit reached", "limit", cap(s.writeSlots))
+		return status.Errorf(codes.ResourceExhausted, "node %s is serving %d writes; retry later", s.nodeID, cap(s.writeSlots))
+	}
 
 	// Fail fast before receiving the data. This is not the guarantee: the
 	// final link in Commit is what refuses to replace a chunk.
