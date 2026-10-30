@@ -51,7 +51,7 @@ jobs:
           status=0
           for s in demo stage2-roundtrip stage2-overwrite-check stage3-corrupt-check stage3-crash-check \
                    stage3-fsync-trace stage4-replication-check stage5-failover-check stage6-liveness-check \
-                   stage7-repair-check stage8-gc-check; do
+                   stage7-repair-check stage8-gc-check stage10-gateway-check; do
             if scripts/$s.sh > logs/$s.log 2>&1; then
               echo "$s: PASS"
             else

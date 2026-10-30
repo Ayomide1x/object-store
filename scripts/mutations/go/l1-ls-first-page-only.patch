@@ -1,0 +1,11 @@
+--- a/client/cmd/osctl/ls.go
++++ b/client/cmd/osctl/ls.go
+@@ -38,7 +38,7 @@
+ 		if resp.GetNextStartAfter() == "" {
+ 			break
+ 		}
+-		after = resp.GetNextStartAfter()
++		break
+ 	}
+ 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+ 	fmt.Fprintln(tw, "KEY\tSIZE\tCOMMITTED\tOBJECT")

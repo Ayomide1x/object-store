@@ -1,5 +1,5 @@
---- a/client/internal/download/download.go
-+++ b/client/internal/download/download.go
+--- a/internal/download/download.go
++++ b/internal/download/download.go
 @@ -129,7 +129,7 @@
  	if d.demoted[r.NodeID] {
  		return 3

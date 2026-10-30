@@ -1,0 +1,12 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -141,9 +141,6 @@
+ }
+ 
+ func (b bodySource) Chunk(offset, size int64) (io.ReaderAt, int64, error) {
+-	if err := b.rc.SetReadDeadline(time.Now().Add(b.stall)); err != nil {
+-		return nil, 0, fmt.Errorf("set read deadline: %w", err)
+-	}
+ 	return b.StreamSource.Chunk(offset, size)
+ }
+ 

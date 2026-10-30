@@ -683,9 +683,9 @@ class GcIT {
         commit("other");
         markBad(b.chunkId(), b.placed().get(0));
 
-        assertThat(metadata.listObjects("ls/")).extracting(MetadataRepository.ObjectSummary::key)
+        assertThat(metadata.listObjects("ls/", "", 0).objects()).extracting(MetadataRepository.ObjectSummary::key)
                 .containsExactly("ls/a", "ls/b");
-        assertThat(metadata.listObjects("")).hasSize(3);
+        assertThat(metadata.listObjects("", "", 0).objects()).hasSize(3);
 
         MetadataRepository.ObjectDetail d = metadata.statObject("ls/b").orElseThrow();
         assertThat(d.objectId()).isEqualTo(b.objectId());

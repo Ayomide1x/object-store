@@ -1,0 +1,10 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -230,6 +230,7 @@
+ 	}
+ 
+ 	d := download.New(s.cfg.ChunkReadTimeout, download.Shuffled, log, s.nodeDialOpts...)
++	out.start()
+ 	err = d.Stream(r.Context(), obj.Chunks, obj.Size, out)
+ 	// Reports go out whatever happened, on their own deadlines (stage 5).
+ 	download.SendReports(s.coord, log, d.Reports())

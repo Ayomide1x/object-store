@@ -1,5 +1,6 @@
 // Package download reads an object's chunks from their replicas, failing over
-// to the next replica on errors, and writes the verified bytes to a file.
+// to the next replica on errors, and writes only verified bytes: to a file
+// (osctl) or to any writer, chunk by chunk (the gateway).
 package download
 
 import (
@@ -76,11 +77,15 @@ type Downloader struct {
 	reports []Report
 	// buf holds one chunk's bytes until they are verified; reused per chunk.
 	buf []byte
+	// dialOpts are added to every node connection (the gateway bounds its
+	// receive windows with them).
+	dialOpts []grpc.DialOption
 }
 
-// New returns a Downloader. timeout bounds each replica read, connection included.
-func New(timeout time.Duration, order Order, log *slog.Logger) *Downloader {
-	return &Downloader{timeout: timeout, order: order, log: log, demoted: map[string]bool{}}
+// New returns a Downloader. timeout bounds each replica read, connection
+// included. dialOpts, if any, are added to each connection to a node.
+func New(timeout time.Duration, order Order, log *slog.Logger, dialOpts ...grpc.DialOption) *Downloader {
+	return &Downloader{timeout: timeout, order: order, log: log, demoted: map[string]bool{}, dialOpts: dialOpts}
 }
 
 // Reports returns the bad-replica hints collected so far.
@@ -185,7 +190,8 @@ func (d *Downloader) readReplica(ctx context.Context, r Replica, c Chunk) ([]byt
 	ctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 
-	conn, err := grpc.NewClient(r.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, d.dialOpts...)
+	conn, err := grpc.NewClient(r.Address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", r.Address, err)
 	}
@@ -224,6 +230,32 @@ func (d *Downloader) readReplica(ctx context.Context, r Replica, c Chunk) ([]byt
 	return d.buf, nil
 }
 
+// Stream reads every chunk in order and writes each to w once it is verified,
+// so w never receives a byte that failed its check. It writes nothing before
+// the chunk list is checked and the first chunk verified. An error from w is
+// returned wrapped in a WriteError.
+func (d *Downloader) Stream(ctx context.Context, chunks []Chunk, size int64, w io.Writer) error {
+	if err := checkChunkList(chunks, size); err != nil {
+		return err
+	}
+	for _, c := range chunks {
+		data, err := d.ReadChunk(ctx, c)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(data); err != nil {
+			return &WriteError{Err: err}
+		}
+	}
+	return nil
+}
+
+// WriteError is a failure of Stream's writer, not of any replica.
+type WriteError struct{ Err error }
+
+func (e *WriteError) Error() string { return "write output: " + e.Err.Error() }
+func (e *WriteError) Unwrap() error { return e.Err }
+
 // ToFile reads every chunk in order and writes the object to path. Only
 // verified chunks are written, to a temp file in the same directory that is
 // fsynced and renamed over path once the whole object is there. A failed read
@@ -240,14 +272,8 @@ func (d *Downloader) ToFile(ctx context.Context, chunks []Chunk, size int64, pat
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	for _, c := range chunks {
-		data, err := d.ReadChunk(ctx, c)
-		if err != nil {
-			return err
-		}
-		if _, err := tmp.Write(data); err != nil {
-			return fmt.Errorf("write output: %w", err)
-		}
+	if err := d.Stream(ctx, chunks, size, tmp); err != nil {
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("sync temp file: %w", err)

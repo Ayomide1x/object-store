@@ -1,0 +1,12 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -292,9 +292,6 @@
+ 	}
+ 	// Out now: a later failure must find these bytes on the wire, not in a
+ 	// buffer the abort would discard.
+-	if err := o.rc.Flush(); err != nil {
+-		return n, fmt.Errorf("flush: %w", err)
+-	}
+ 	return n, nil
+ }
+ 

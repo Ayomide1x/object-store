@@ -1,14 +1,13 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
-@@ -158,10 +158,10 @@
+@@ -183,7 +183,9 @@
              List<String> sources = new ArrayList<>();
              Set<String> withRow = new HashSet<>();
              for (ReplicaRow r : c.replicas()) {
 -                withRow.add(r.nodeId());
-                 if (!r.state().equals("HEALTHY")) {
-                     continue;
++                if (r.state().equals("HEALTHY")) {
++                    withRow.add(r.nodeId());
++                }
+                 if (r.state().equals("HEALTHY") && states.getOrDefault(r.nodeId(), State.UNKNOWN) == State.ALIVE) {
+                     sources.add(r.nodeId());
                  }
-+                withRow.add(r.nodeId());
-                 State s = states.getOrDefault(r.nodeId(), State.UNKNOWN);
-                 if (counts(s, liveness.deadForNanos(r.nodeId()), graceNanos)) {
-                     counted++;

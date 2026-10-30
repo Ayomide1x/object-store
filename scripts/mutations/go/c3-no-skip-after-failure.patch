@@ -1,5 +1,5 @@
---- a/client/internal/upload/upload.go
-+++ b/client/internal/upload/upload.go
+--- a/internal/upload/upload.go
++++ b/internal/upload/upload.go
 @@ -95,7 +95,6 @@
  				r.err = fmt.Errorf("no answer within %s: %w", u.timeout, r.err)
  			}

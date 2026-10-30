@@ -1,5 +1,5 @@
---- a/client/internal/upload/upload.go
-+++ b/client/internal/upload/upload.go
+--- a/internal/upload/upload.go
++++ b/internal/upload/upload.go
 @@ -75,7 +75,7 @@
  		}
  		launched++

@@ -37,6 +37,8 @@ public class MetadataService {
     static final int REPLICATION = 3;
     /** Verified replicas each chunk needs before its object can commit (invariant 2). */
     static final int MIN_REPLICAS = 2;
+    /** Most keys ListObjects returns in one page. */
+    static final int MAX_LIST_LIMIT = 1000;
 
     private static final Logger log = LoggerFactory.getLogger(MetadataService.class);
 
@@ -361,9 +363,29 @@ public class MetadataService {
         return objectId;
     }
 
+    /** One page of a listing; nextStartAfter is empty when it is the last. */
+    public record ListPage(List<MetadataRepository.ObjectSummary> objects, String nextStartAfter) {
+    }
+
+    /**
+     * Keyset pagination: keys after startAfter, at most limit of them (0 means
+     * MAX_LIST_LIMIT; larger values are clamped to it). One extra row is read to
+     * know whether another page follows, so the cursor is empty exactly when
+     * nothing more matched.
+     */
     @Transactional(readOnly = true)
-    public List<MetadataRepository.ObjectSummary> listObjects(String prefix) {
-        return repository.listKeys(prefix == null ? "" : prefix);
+    public ListPage listObjects(String prefix, String startAfter, int limit) {
+        if (limit < 0) {
+            throw RequestException.invalid("limit %d is negative".formatted(limit));
+        }
+        int pageSize = limit == 0 ? MAX_LIST_LIMIT : Math.min(limit, MAX_LIST_LIMIT);
+        List<MetadataRepository.ObjectSummary> rows = repository.listKeys(prefix == null ? "" : prefix,
+                startAfter == null ? "" : startAfter, pageSize + 1);
+        if (rows.size() <= pageSize) {
+            return new ListPage(rows, "");
+        }
+        List<MetadataRepository.ObjectSummary> page = rows.subList(0, pageSize);
+        return new ListPage(page, page.getLast().key());
     }
 
     @Transactional(readOnly = true)

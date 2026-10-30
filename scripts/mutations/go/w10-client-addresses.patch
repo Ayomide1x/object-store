@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -182,7 +182,7 @@
+ 	src := bodySource{StreamSource: upload.NewStreamSource(r.Body, r.ContentLength), rc: rc, stall: s.cfg.StallTimeout}
+ 	objectID, err := upload.Put(r.Context(), s.coord, log, key, r.ContentLength, src, upload.Options{
+ 		ChunkWriteTimeout: s.cfg.ChunkWriteTimeout,
+-		NodeAddresses:     objectstorev1.NodeAddressSet_NODE_ADDRESS_SET_INTERNAL,
++		NodeAddresses:     objectstorev1.NodeAddressSet_NODE_ADDRESS_SET_CLIENT,
+ 	})
+ 	if err != nil {
+ 		// Nothing was completed, so nothing committed: the upload stays

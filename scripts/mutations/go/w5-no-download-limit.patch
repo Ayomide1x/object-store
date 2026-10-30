@@ -1,0 +1,13 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -212,10 +212,6 @@
+ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
+ 	key := r.PathValue("key")
+ 	log := s.log.With("key", key)
+-	if !acquire(w, log, s.downloadSlots, "download") {
+-		return
+-	}
+-	defer func() { <-s.downloadSlots }()
+ 
+ 	obj, err := download.Fetch(r.Context(), s.coord, key, objectstorev1.NodeAddressSet_NODE_ADDRESS_SET_INTERNAL)
+ 	if err != nil {

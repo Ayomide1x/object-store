@@ -83,6 +83,7 @@ DECISIONS.md
 |---|---|
 | Coordinator gRPC | 9090 |
 | Nodes | 9101–9104 |
+| Gateways (HTTP) | 9081–9082 |
 | Postgres | 5432 |
 
 Fixed ports, so stale processes are easy to spot.

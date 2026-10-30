@@ -1,5 +1,5 @@
---- a/client/internal/download/download.go
-+++ b/client/internal/download/download.go
+--- a/internal/download/download.go
++++ b/internal/download/download.go
 @@ -183,7 +183,6 @@
  	}
  

@@ -28,6 +28,12 @@ import io.github.ayomide1x.objectstore.v1.NodeLiveness;
 import io.github.ayomide1x.objectstore.v1.NodeLocation;
 import io.github.ayomide1x.objectstore.v1.ReportBadReplicaRequest;
 import io.github.ayomide1x.objectstore.v1.ReportBadReplicaResponse;
+import io.github.ayomide1x.objectstore.v1.GcPass;
+import io.github.ayomide1x.objectstore.v1.GetClusterStatusRequest;
+import io.github.ayomide1x.objectstore.v1.GetClusterStatusResponse;
+import io.github.ayomide1x.objectstore.v1.NodeAddressSet;
+import io.github.ayomide1x.objectstore.v1.NodeStatus;
+import io.github.ayomide1x.objectstore.v1.RepairPass;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -47,12 +53,14 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
     private final MetadataService metadata;
     private final ReplicaHealthService replicaHealth;
     private final LivenessService liveness;
+    private final ClusterStatusService clusterStatus;
 
     public CoordinatorGrpcService(MetadataService metadata, ReplicaHealthService replicaHealth,
-            LivenessService liveness) {
+            LivenessService liveness, ClusterStatusService clusterStatus) {
         this.metadata = metadata;
         this.replicaHealth = replicaHealth;
         this.liveness = liveness;
+        this.clusterStatus = clusterStatus;
     }
 
     @Override
@@ -80,7 +88,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                         .setChunkId(c.chunkId().toString())
                         .setIndex(c.index())
                         .setSizeBytes(c.sizeBytes())
-                        .addAllNodes(c.nodes().stream().map(this::clientLocation).toList()));
+                        .addAllNodes(c.nodes().stream().map(n -> location(n, request.getNodeAddresses())).toList()));
             }
             return b.build();
         });
@@ -115,7 +123,7 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
                         .setIndex(c.index())
                         .setSizeBytes(c.sizeBytes())
                         .setSha256(ByteString.copyFrom(c.sha256()))
-                        .addAllReplicas(c.replicas().stream().map(this::clientLocation).toList()));
+                        .addAllReplicas(c.replicas().stream().map(n -> location(n, request.getNodeAddresses())).toList()));
             }
             return b.build();
         });
@@ -143,8 +151,10 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
     @Override
     public void listObjects(ListObjectsRequest request, StreamObserver<ListObjectsResponse> response) {
         respond(response, () -> {
-            ListObjectsResponse.Builder b = ListObjectsResponse.newBuilder();
-            for (MetadataRepository.ObjectSummary o : metadata.listObjects(request.getPrefix())) {
+            MetadataService.ListPage page = metadata.listObjects(request.getPrefix(), request.getStartAfter(),
+                    request.getLimit());
+            ListObjectsResponse.Builder b = ListObjectsResponse.newBuilder().setNextStartAfter(page.nextStartAfter());
+            for (MetadataRepository.ObjectSummary o : page.objects()) {
                 b.addObjects(ObjectSummary.newBuilder().setKey(o.key()).setObjectId(o.objectId().toString())
                         .setSizeBytes(o.sizeBytes()).setCommittedAtUnixMillis(millis(o.committedAt())));
             }
@@ -176,6 +186,44 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
         });
     }
 
+    @Override
+    public void getClusterStatus(GetClusterStatusRequest request, StreamObserver<GetClusterStatusResponse> response) {
+        respond(response, () -> {
+            ClusterStatusService.Status st = clusterStatus.status(request.getRecentPasses());
+            GetClusterStatusResponse.Builder b = GetClusterStatusResponse.newBuilder()
+                    .setUnderReplicatedChunks(st.underReplicatedChunks())
+                    .setPendingDeletions(st.pendingDeletions());
+            for (ClusterStatusService.NodeView n : st.nodes()) {
+                b.addNodes(NodeStatus.newBuilder().setNodeId(n.row().nodeId()).setLiveness(toProto(n.liveness()))
+                        .setLivenessSinceUnixMillis(millis(n.row().stateChangedAt()))
+                        .setLastHeartbeatUnixMillis(millis(n.row().lastHeartbeatAt())));
+            }
+            st.lastRepairPass().forEach(p -> b.setLastRepairPass(toProto(p)));
+            st.lastGcPass().forEach(p -> b.setLastGcPass(toProto(p)));
+            st.recentRepairPasses().forEach(p -> b.addRecentRepairPasses(toProto(p)));
+            st.recentGcPasses().forEach(p -> b.addRecentGcPasses(toProto(p)));
+            return b.build();
+        });
+    }
+
+    private static RepairPass toProto(MetadataRepository.RepairPassRow p) {
+        return RepairPass.newBuilder().setPassId(p.passId()).setStartedAtUnixMillis(millis(p.startedAt()))
+                .setFinishedAtUnixMillis(millis(p.finishedAt()))
+                .setSkippedReason(p.skippedReason() == null ? "" : p.skippedReason())
+                .setUnderReplicated(p.underReplicated()).setCopiesStarted(p.copiesStarted())
+                .setReplicasRecorded(p.replicasRecorded()).setFoundRecorded(p.foundRecorded())
+                .setBadFound(p.badFound()).setFailures(p.failures()).build();
+    }
+
+    private static GcPass toProto(MetadataRepository.GcPassRow p) {
+        return GcPass.newBuilder().setPassId(p.passId()).setStartedAtUnixMillis(millis(p.startedAt()))
+                .setFinishedAtUnixMillis(millis(p.finishedAt()))
+                .setSkippedReason(p.skippedReason() == null ? "" : p.skippedReason())
+                .setAbandoned(p.abandoned()).setSuperseded(p.superseded()).setTasksCreated(p.tasksCreated())
+                .setFilesDeleted(p.filesDeleted()).setAlreadyAbsent(p.alreadyAbsent()).setFailures(p.failures())
+                .setObjectsRemoved(p.objectsRemoved()).build();
+    }
+
     private static long millis(java.time.OffsetDateTime t) {
         return t == null ? 0 : t.toInstant().toEpochMilli();
     }
@@ -197,8 +245,14 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
         observer.onCompleted();
     }
 
-    private NodeLocation clientLocation(Node node) {
-        return NodeLocation.newBuilder().setNodeId(node.nodeId()).setAddress(node.clientAddr())
+    /**
+     * A node as the caller can reach it: its internal address when the caller
+     * asks for INTERNAL, otherwise (CLIENT, or unset by an older caller) its
+     * client-facing address.
+     */
+    private NodeLocation location(Node node, NodeAddressSet addresses) {
+        String address = addresses == NodeAddressSet.NODE_ADDRESS_SET_INTERNAL ? node.internalAddr() : node.clientAddr();
+        return NodeLocation.newBuilder().setNodeId(node.nodeId()).setAddress(address)
                 .setLiveness(toProto(liveness.stateOf(node.nodeId()))).build();
     }
 

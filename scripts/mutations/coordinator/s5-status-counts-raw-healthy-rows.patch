@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
+@@ -120,7 +120,7 @@
+     public long underReplicatedChunks() {
+         Map<String, State> states = liveness.snapshot();
+         return repository.repairCandidates().stream()
+-                .filter(c -> countedReplicas(c, states) < TARGET_REPLICAS)
++                .filter(c -> c.replicas().stream().filter(r -> r.state().equals("HEALTHY")).count() < TARGET_REPLICAS)
+                 .count();
+     }
+ 

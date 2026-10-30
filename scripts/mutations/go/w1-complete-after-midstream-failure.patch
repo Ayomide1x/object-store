@@ -1,0 +1,12 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -251,7 +251,8 @@
+ 		// the stream (HTTP/2), so the client sees a broken transfer.
+ 		log.Error("download failed mid-stream; aborting the connection",
+ 			"bytes_sent", out.written, "bytes_declared", obj.Size, "error", err)
+-		panic(http.ErrAbortHandler)
++		w.Write(make([]byte, obj.Size-out.written))
++		return
+ 	}
+ }
+ 

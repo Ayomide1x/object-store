@@ -1,5 +1,5 @@
---- a/client/internal/download/download.go
-+++ b/client/internal/download/download.go
+--- a/internal/download/download.go
++++ b/internal/download/download.go
 @@ -151,9 +151,6 @@
  		}
  		v := classify(err)

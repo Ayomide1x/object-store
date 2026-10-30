@@ -27,6 +27,7 @@ const (
 	CoordinatorService_DeleteObject_FullMethodName     = "/objectstore.v1.CoordinatorService/DeleteObject"
 	CoordinatorService_ListObjects_FullMethodName      = "/objectstore.v1.CoordinatorService/ListObjects"
 	CoordinatorService_StatObject_FullMethodName       = "/objectstore.v1.CoordinatorService/StatObject"
+	CoordinatorService_GetClusterStatus_FullMethodName = "/objectstore.v1.CoordinatorService/GetClusterStatus"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -69,11 +70,17 @@ type CoordinatorServiceClient interface {
 	// already holds the chunk list finishes. A key that does not resolve:
 	// NOT_FOUND.
 	DeleteObject(ctx context.Context, in *DeleteObjectRequest, opts ...grpc.CallOption) (*DeleteObjectResponse, error)
-	// ListObjects returns the keys that currently resolve, in key order.
+	// ListObjects returns the keys that currently resolve, in key order, one
+	// page at a time (keyset pagination: see ListObjectsRequest).
 	ListObjects(ctx context.Context, in *ListObjectsRequest, opts ...grpc.CallOption) (*ListObjectsResponse, error)
 	// StatObject describes the object a key resolves to, with every recorded
 	// replica of every chunk in any state. For inspection: readers use GetObject.
 	StatObject(ctx context.Context, in *StatObjectRequest, opts ...grpc.CallOption) (*StatObjectResponse, error)
+	// GetClusterStatus describes the cluster for observers: node liveness, the
+	// number of chunks below the replication target (counted exactly as the
+	// reconciler counts), pending chunk deletions, and recent repair and garbage
+	// collection passes. It is read-only: it writes nothing and triggers nothing.
+	GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -164,6 +171,16 @@ func (c *coordinatorServiceClient) StatObject(ctx context.Context, in *StatObjec
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetClusterStatusResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_GetClusterStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -204,11 +221,17 @@ type CoordinatorServiceServer interface {
 	// already holds the chunk list finishes. A key that does not resolve:
 	// NOT_FOUND.
 	DeleteObject(context.Context, *DeleteObjectRequest) (*DeleteObjectResponse, error)
-	// ListObjects returns the keys that currently resolve, in key order.
+	// ListObjects returns the keys that currently resolve, in key order, one
+	// page at a time (keyset pagination: see ListObjectsRequest).
 	ListObjects(context.Context, *ListObjectsRequest) (*ListObjectsResponse, error)
 	// StatObject describes the object a key resolves to, with every recorded
 	// replica of every chunk in any state. For inspection: readers use GetObject.
 	StatObject(context.Context, *StatObjectRequest) (*StatObjectResponse, error)
+	// GetClusterStatus describes the cluster for observers: node liveness, the
+	// number of chunks below the replication target (counted exactly as the
+	// reconciler counts), pending chunk deletions, and recent repair and garbage
+	// collection passes. It is read-only: it writes nothing and triggers nothing.
+	GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -242,6 +265,9 @@ func (UnimplementedCoordinatorServiceServer) ListObjects(context.Context, *ListO
 }
 func (UnimplementedCoordinatorServiceServer) StatObject(context.Context, *StatObjectRequest) (*StatObjectResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StatObject not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetClusterStatus not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -408,6 +434,24 @@ func _CoordinatorService_StatObject_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_GetClusterStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetClusterStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).GetClusterStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_GetClusterStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).GetClusterStatus(ctx, req.(*GetClusterStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -446,6 +490,10 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StatObject",
 			Handler:    _CoordinatorService_StatObject_Handler,
+		},
+		{
+			MethodName: "GetClusterStatus",
+			Handler:    _CoordinatorService_GetClusterStatus_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

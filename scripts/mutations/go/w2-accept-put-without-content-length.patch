@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -161,7 +161,7 @@
+ 	// Go reports ContentLength 0 both for "Content-Length: 0" and for no
+ 	// header at all, and -1 for chunked bodies; only the header says the
+ 	// client declared a size.
+-	if r.ContentLength < 0 || len(r.Header.Values("Content-Length")) == 0 {
++	if r.ContentLength < 0 {
+ 		refuse(http.StatusLengthRequired, "LENGTH_REQUIRED",
+ 			"Content-Length is required (chunked uploads are not supported)")
+ 		return

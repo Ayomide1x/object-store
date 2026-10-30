@@ -1,15 +1,44 @@
-# One Postgres, one coordinator, four storage nodes. Each chunk is placed on
-# three of the four nodes. Every port is bound to 127.0.0.1 only: there is no
-# authentication.
+# One Postgres, one coordinator, four storage nodes, two HTTP gateways. Each
+# chunk is placed on three of the four nodes. Every port is bound to 127.0.0.1
+# only: there is no authentication.
 #
 # Memory: every service has a hard limit (mem_limit, with memswap_limit equal
 # so it can't spill into swap). The limits come from worst-case bounds, not
 # measured averages; DECISIONS.md "Memory limits from worst-case bounds"
-# (stage 9) has the arithmetic. About 2.5 GiB in total.
+# (stage 9), its amendment for the nodes and "Gateway memory limit from
+# worst-case bounds" (stage 10) have the arithmetic. About 4.25 GiB in total.
 #
 # OBJECTSTORE_DB_PASSWORD sets the Postgres password for both Postgres and the
 # coordinator. Unset, it is "objectstore", for local development only: set it
 # (for example in a gitignored .env; see .env.example) for anything else.
+
+# Settings shared by both gateways.
+x-gateway: &gateway
+  build:
+    context: .
+    dockerfile: gateway/Dockerfile
+  # 8 uploads x ~10 MiB + 16 downloads x ~6 MiB + ~16 MiB baseline = ~192 MiB
+  # live at most (151 MiB measured with both caps full). GOMEMLIMIT (224MiB,
+  # below) makes Go's GC work harder before the heap passes that; it is a soft
+  # limit, and at full load the heap overshoots it while a collection runs
+  # (to ~270 MiB measured, plus ~16 MiB of socket and kernel memory). The
+  # container limit leaves room for that: DECISIONS.md, "Gateway memory limit
+  # from worst-case bounds".
+  mem_limit: 384m
+  memswap_limit: 384m
+  # Healthy once the gateway answers /healthz: the process is serving HTTP.
+  # It does not check the coordinator, so a coordinator outage doesn't get
+  # healthy gateways restarted; scripts wait on GET /cluster for that.
+  healthcheck:
+    test: ["CMD", "/gateway", "health"]
+    start_period: 10s
+    start_interval: 1s
+    interval: 10s
+    timeout: 3s
+    retries: 3
+  depends_on:
+    coordinator:
+      condition: service_healthy
 
 # Settings shared by every storage node.
 x-node: &node
@@ -17,11 +46,14 @@ x-node: &node
     context: .
     dockerfile: node/Dockerfile
   # 32 reads x ~5.1 MiB + 16 writes x ~3.1 MiB + ~16 MiB baseline = ~230 MiB
-  # live at most. GOMEMLIMIT (288MiB, per node below) makes Go's GC work
-  # harder before the heap reaches the limit, instead of letting it grow to
-  # twice the live data.
-  mem_limit: 320m
-  memswap_limit: 320m
+  # live at most (222 MiB measured with both caps full). GOMEMLIMIT (288MiB,
+  # per node below) makes Go's GC work harder before the heap passes that; it
+  # is a soft limit, and at full load the heap overshoots it while a
+  # collection runs (to ~381 MiB measured, plus ~56 MiB of kernel and socket
+  # memory). The container limit leaves room for that: DECISIONS.md, "Node
+  # memory limit amended: GOMEMLIMIT is not a ceiling" (stage 10).
+  mem_limit: 576m
+  memswap_limit: 576m
   # Healthy once the node's gRPC health service reports SERVING, which it does
   # only after stray temp files are cleaned and the listener is open. The image
   # is distroless (no shell), so the node binary probes itself. `docker compose
@@ -208,6 +240,47 @@ services:
       - "127.0.0.1:9104:9104"
     volumes:
       - node4-data:/data
+
+  # The HTTP API (stage 10). Stateless: two instances serve the same objects,
+  # and restarting one loses nothing. GATEWAY_LISTEN_ADDR is the same port
+  # inside the container and on the host. GATEWAY_COORDINATOR is where
+  # metadata calls go, each with a GATEWAY_COORDINATOR_TIMEOUT deadline; the
+  # gateway asks the coordinator for nodes' internal addresses (node1:9101),
+  # which it can reach inside this network. GATEWAY_MAX_CONCURRENT_UPLOADS and
+  # _DOWNLOADS: more get 503 with Retry-After at once. GATEWAY_STALL_TIMEOUT:
+  # a transfer that moves no chunk for this long is cut off (there is no
+  # whole-request timeout). GATEWAY_CHUNK_WRITE_TIMEOUT and _READ_TIMEOUT
+  # bound each replica write and read, as osctl's do. GOMEMLIMIT: Go's soft
+  # memory limit, under mem_limit above.
+  gateway1:
+    <<: *gateway
+    environment:
+      GATEWAY_LISTEN_ADDR: ":9081"
+      GATEWAY_COORDINATOR: coordinator:9090
+      GATEWAY_COORDINATOR_TIMEOUT: 10s
+      GATEWAY_MAX_CONCURRENT_UPLOADS: "8"
+      GATEWAY_MAX_CONCURRENT_DOWNLOADS: "16"
+      GATEWAY_STALL_TIMEOUT: 30s
+      GATEWAY_CHUNK_WRITE_TIMEOUT: 10s
+      GATEWAY_CHUNK_READ_TIMEOUT: 10s
+      GOMEMLIMIT: 224MiB
+    ports:
+      - "127.0.0.1:9081:9081"
+
+  gateway2:
+    <<: *gateway
+    environment:
+      GATEWAY_LISTEN_ADDR: ":9082"
+      GATEWAY_COORDINATOR: coordinator:9090
+      GATEWAY_COORDINATOR_TIMEOUT: 10s
+      GATEWAY_MAX_CONCURRENT_UPLOADS: "8"
+      GATEWAY_MAX_CONCURRENT_DOWNLOADS: "16"
+      GATEWAY_STALL_TIMEOUT: 30s
+      GATEWAY_CHUNK_WRITE_TIMEOUT: 10s
+      GATEWAY_CHUNK_READ_TIMEOUT: 10s
+      GOMEMLIMIT: 224MiB
+    ports:
+      - "127.0.0.1:9082:9082"
 
 volumes:
   pgdata:

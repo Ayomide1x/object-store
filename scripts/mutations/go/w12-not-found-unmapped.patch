@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/errors.go
++++ b/gateway/internal/httpapi/errors.go
+@@ -55,8 +55,6 @@
+ 	switch st.Code() {
+ 	case codes.InvalidArgument:
+ 		return http.StatusBadRequest, false, "INVALID_ARGUMENT"
+-	case codes.NotFound:
+-		return http.StatusNotFound, false, "NOT_FOUND"
+ 	case codes.FailedPrecondition:
+ 		return http.StatusServiceUnavailable, true, "FAILED_PRECONDITION"
+ 	case codes.Unavailable:

@@ -1,0 +1,16 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -381,9 +381,12 @@
+         int pageSize = limit == 0 ? MAX_LIST_LIMIT : Math.min(limit, MAX_LIST_LIMIT);
+         List<MetadataRepository.ObjectSummary> rows = repository.listKeys(prefix == null ? "" : prefix,
+                 startAfter == null ? "" : startAfter, pageSize + 1);
+-        if (rows.size() <= pageSize) {
++        if (rows.size() < pageSize) {
+             return new ListPage(rows, "");
+         }
++        if (rows.size() == pageSize) {
++            return new ListPage(rows, rows.getLast().key());
++        }
+         List<MetadataRepository.ObjectSummary> page = rows.subList(0, pageSize);
+         return new ListPage(page, page.getLast().key());
+     }

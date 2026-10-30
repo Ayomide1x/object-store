@@ -71,6 +71,12 @@ expected_test() {
     g14-task-kept-after-confirmation) echo "GcIT|aSecondPassIsANoOp()" ;;
     g15-supersede-ignores-keys) echo "GcIT|theCurrentVersionIsNeverDeleted()" ;;
     g16-no-progress-check) echo "GcIT|anUnclearOutcomeIsAFailureAndThePassEnds()" ;;
+    s1-list-cursor-is-first-key) echo "GatewayRpcIT|moreKeysThanTheLimitPageWithNoGapsOrDuplicates()" ;;
+    s2-list-no-lookahead) echo "GatewayRpcIT|anExactMultipleOfTheLimitEndsWithoutAnEmptyPage()" ;;
+    s3-address-set-ignored) echo "GatewayRpcIT|theCallerChoosesClientOrInternalAddresses()" ;;
+    s4-unspecified-is-internal) echo "GatewayRpcIT|theCallerChoosesClientOrInternalAddresses()" ;;
+    s5-status-counts-raw-healthy-rows) echo "GatewayRpcIT|underReplicatedIsCountedExactlyAsTheReconcilerCounts()" ;;
+    s6-status-prunes-passes) echo "GatewayRpcIT|theStatusIsReadOnly()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

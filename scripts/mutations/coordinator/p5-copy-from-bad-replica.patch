@@ -1,12 +1,11 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/RepairService.java
-@@ -135,6 +135,9 @@
+@@ -184,7 +184,7 @@
              Set<String> withRow = new HashSet<>();
              for (ReplicaRow r : c.replicas()) {
                  withRow.add(r.nodeId());
-+                if (states.get(r.nodeId()) == State.ALIVE && !r.state().equals("HEALTHY")) {
-+                    sources.add(r.nodeId());
-+                }
-                 if (!r.state().equals("HEALTHY")) {
-                     continue;
+-                if (r.state().equals("HEALTHY") && states.getOrDefault(r.nodeId(), State.UNKNOWN) == State.ALIVE) {
++                if (states.getOrDefault(r.nodeId(), State.UNKNOWN) == State.ALIVE) {
+                     sources.add(r.nodeId());
                  }
+             }

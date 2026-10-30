@@ -381,15 +381,21 @@ public class MetadataRepository {
     public record ObjectSummary(String key, UUID objectId, long sizeBytes, OffsetDateTime committedAt) {
     }
 
-    /** Keys that currently resolve, starting with prefix, in key order. */
-    public List<ObjectSummary> listKeys(String prefix) {
+    /**
+     * Up to limit keys that currently resolve, starting with prefix and sorting
+     * after startAfter (exclusive), in key order. The comparison and the order
+     * use the same (the column's) collation, which is deterministic, so every
+     * key sorts strictly before or after the cursor: no gaps, no repeats.
+     */
+    public List<ObjectSummary> listKeys(String prefix, String startAfter, int limit) {
         return jdbc.sql("""
                 SELECT k.key, o.object_id, o.size_bytes, o.committed_at
                 FROM keys k JOIN objects o ON o.object_id = k.object_id
-                WHERE starts_with(k.key, :prefix)
+                WHERE starts_with(k.key, :prefix) AND k.key > :after
                 ORDER BY k.key
+                LIMIT :limit
                 """)
-                .param("prefix", prefix)
+                .param("prefix", prefix).param("after", startAfter).param("limit", limit)
                 .query((rs, i) -> new ObjectSummary(rs.getString("key"), rs.getObject("object_id", UUID.class),
                         rs.getLong("size_bytes"), rs.getObject("committed_at", OffsetDateTime.class)))
                 .list();
@@ -631,6 +637,71 @@ public class MetadataRepository {
     public void removeObjectMetadata(UUID objectId) {
         jdbc.sql("DELETE FROM chunks WHERE object_id = :id").param("id", objectId).update();
         jdbc.sql("DELETE FROM objects WHERE object_id = :id").param("id", objectId).update();
+    }
+
+    /** A nodes row as GetClusterStatus reports it. */
+    public record NodeRow(String nodeId, OffsetDateTime stateChangedAt, OffsetDateTime lastHeartbeatAt) {
+    }
+
+    public List<NodeRow> listNodeRows() {
+        return jdbc.sql("SELECT node_id, state_changed_at, last_heartbeat_at FROM nodes ORDER BY node_id")
+                .query((rs, i) -> new NodeRow(rs.getString("node_id"),
+                        rs.getObject("state_changed_at", OffsetDateTime.class),
+                        rs.getObject("last_heartbeat_at", OffsetDateTime.class)))
+                .list();
+    }
+
+    public long countPendingDeletions() {
+        return jdbc.sql("SELECT count(*) FROM pending_deletions").query(Long.class).single();
+    }
+
+    /** A repair_passes row. */
+    public record RepairPassRow(long passId, OffsetDateTime startedAt, OffsetDateTime finishedAt, String skippedReason,
+            int underReplicated, int copiesStarted, int replicasRecorded, int foundRecorded, int badFound, int failures) {
+    }
+
+    /**
+     * The newest repair passes, newest first: with onlyEventful, only those that
+     * were skipped or have any non-zero counter.
+     */
+    public List<RepairPassRow> recentRepairPasses(int limit, boolean onlyEventful) {
+        return jdbc.sql("""
+                SELECT * FROM repair_passes
+                WHERE NOT :eventful OR skipped_reason IS NOT NULL
+                   OR under_replicated + copies_started + replicas_recorded + found_recorded + bad_found + failures > 0
+                ORDER BY pass_id DESC LIMIT :limit
+                """)
+                .param("eventful", onlyEventful).param("limit", limit)
+                .query((rs, i) -> new RepairPassRow(rs.getLong("pass_id"),
+                        rs.getObject("started_at", OffsetDateTime.class), rs.getObject("finished_at", OffsetDateTime.class),
+                        rs.getString("skipped_reason"), rs.getInt("under_replicated"), rs.getInt("copies_started"),
+                        rs.getInt("replicas_recorded"), rs.getInt("found_recorded"), rs.getInt("bad_found"),
+                        rs.getInt("failures")))
+                .list();
+    }
+
+    /** A gc_passes row. */
+    public record GcPassRow(long passId, OffsetDateTime startedAt, OffsetDateTime finishedAt, String skippedReason,
+            int abandoned, int superseded, int tasksCreated, int filesDeleted, int alreadyAbsent, int failures,
+            int objectsRemoved) {
+    }
+
+    /** As {@link #recentRepairPasses}, for garbage collection. */
+    public List<GcPassRow> recentGcPasses(int limit, boolean onlyEventful) {
+        return jdbc.sql("""
+                SELECT * FROM gc_passes
+                WHERE NOT :eventful OR skipped_reason IS NOT NULL
+                   OR abandoned + superseded + tasks_created + files_deleted + already_absent + failures
+                      + objects_removed > 0
+                ORDER BY pass_id DESC LIMIT :limit
+                """)
+                .param("eventful", onlyEventful).param("limit", limit)
+                .query((rs, i) -> new GcPassRow(rs.getLong("pass_id"),
+                        rs.getObject("started_at", OffsetDateTime.class), rs.getObject("finished_at", OffsetDateTime.class),
+                        rs.getString("skipped_reason"), rs.getInt("abandoned"), rs.getInt("superseded"),
+                        rs.getInt("tasks_created"), rs.getInt("files_deleted"), rs.getInt("already_absent"),
+                        rs.getInt("failures"), rs.getInt("objects_removed")))
+                .list();
     }
 
     public long startGcPass() {

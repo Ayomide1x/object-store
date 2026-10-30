@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mutation check for the Go tests (node, client and shared packages).
+# Mutation check for the Go tests (node, client, gateway and shared packages).
 #
 # For each patch in scripts/mutations/go/: apply it, run the Go tests,
 # report which tests failed, and revert. Each mutation names the test that must
@@ -52,6 +52,20 @@ expected_test() {
     t6-delete-ignores-addressed-node) echo "TestDeleteChunks/addressed_to_another_node:_nothing_deleted" ;;
     m1-no-write-limit) echo "TestWriteChunkConcurrencyLimit" ;;
     m2-no-recv-message-limit) echo "TestOversizedMessageRefusedByGRPC" ;;
+    w1-complete-after-midstream-failure) echo "TestGetAbortsMidStream" ;;
+    w2-accept-put-without-content-length) echo "TestPutRequiresContentLength/no_header" ;;
+    w3-buffer-whole-object) echo "TestPutStreamsChunkByChunk" ;;
+    w4-no-upload-limit) echo "TestUploadConcurrencyLimit" ;;
+    w5-no-download-limit) echo "TestDownloadConcurrencyLimit" ;;
+    w6-headers-before-first-chunk) echo "TestFirstChunkFailureIs502" ;;
+    w7-no-flush-per-chunk) echo "TestGetAbortsMidStream" ;;
+    w8-no-stall-deadline) echo "TestStalledBodyAborted" ;;
+    w9-no-reports-after-failure) echo "TestGetAbortsMidStream" ;;
+    w10-client-addresses) echo "TestGatewayAsksForInternalAddresses" ;;
+    w11-stream-source-ignores-short-read) echo "TestStreamSourceFailsOnShortRead" ;;
+    w12-not-found-unmapped) echo "TestErrorMapping" ;;
+    w13-busy-response-drains-body) echo "TestRefusedUploadDoesNotWaitForItsBody" ;;
+    l1-ls-first-page-only) echo "TestLsFollowsEveryPage" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

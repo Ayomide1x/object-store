@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/MetadataService.java
+@@ -385,7 +385,7 @@
+             return new ListPage(rows, "");
+         }
+         List<MetadataRepository.ObjectSummary> page = rows.subList(0, pageSize);
+-        return new ListPage(page, page.getLast().key());
++        return new ListPage(page, page.getFirst().key());
+     }
+ 
+     @Transactional(readOnly = true)

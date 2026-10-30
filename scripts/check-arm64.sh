@@ -39,8 +39,8 @@ third_party=(
   postgres:18                                # Compose, coordinator tests (Testcontainers)
   eclipse-temurin:25-jdk                     # coordinator build stage
   eclipse-temurin:25-jre                     # coordinator runtime
-  golang:1.27                                # node build stage
-  gcr.io/distroless/static-debian12:nonroot  # node runtime
+  golang:1.27                                # node and gateway build stage
+  gcr.io/distroless/static-debian12:nonroot  # node and gateway runtime
   alpine:3                                   # scripts: volume helpers, fsync trace (apk strace)
   docker:cli                                 # stage 3 crash watcher
   testcontainers/ryuk:0.14.0                 # Testcontainers' cleanup container

@@ -98,6 +98,32 @@ public class RepairService implements InitializingBean, DisposableBean {
         };
     }
 
+    /** The replicas of c that count: HEALTHY rows whose node passes {@link #counts}, given states. */
+    private int countedReplicas(RepairChunk c, Map<String, State> states) {
+        long graceNanos = properties.repairGrace().toNanos();
+        int counted = 0;
+        for (ReplicaRow r : c.replicas()) {
+            if (r.state().equals("HEALTHY")
+                    && counts(states.getOrDefault(r.nodeId(), State.UNKNOWN), liveness.deadForNanos(r.nodeId()), graceNanos)) {
+                counted++;
+            }
+        }
+        return counted;
+    }
+
+    /**
+     * Chunks of current objects with fewer than TARGET_REPLICAS counted
+     * replicas, now: what a pass would find to repair. Read-only, and not
+     * synchronized with passes; for GetClusterStatus. Unlike a pass it still
+     * counts while a node is UNKNOWN (such a node's rows count as replicas).
+     */
+    public long underReplicatedChunks() {
+        Map<String, State> states = liveness.snapshot();
+        return repository.repairCandidates().stream()
+                .filter(c -> countedReplicas(c, states) < TARGET_REPLICAS)
+                .count();
+    }
+
     @Override
     public void afterPropertiesSet() {
         if (properties.repairInterval().isZero()) {
@@ -147,26 +173,18 @@ public class RepairService implements InitializingBean, DisposableBean {
 
         Map<String, Node> nodes = new LinkedHashMap<>();
         repository.listNodes().forEach(n -> nodes.put(n.nodeId(), n));
-        long graceNanos = properties.repairGrace().toNanos();
 
         // Find what needs work, most at risk first.
         record Need(RepairChunk chunk, int counted, List<String> sources, Set<String> withRow) {
         }
         List<Need> needs = new ArrayList<>();
         for (RepairChunk c : repository.repairCandidates()) {
-            int counted = 0;
+            int counted = countedReplicas(c, states);
             List<String> sources = new ArrayList<>();
             Set<String> withRow = new HashSet<>();
             for (ReplicaRow r : c.replicas()) {
                 withRow.add(r.nodeId());
-                if (!r.state().equals("HEALTHY")) {
-                    continue;
-                }
-                State s = states.getOrDefault(r.nodeId(), State.UNKNOWN);
-                if (counts(s, liveness.deadForNanos(r.nodeId()), graceNanos)) {
-                    counted++;
-                }
-                if (s == State.ALIVE) {
+                if (r.state().equals("HEALTHY") && states.getOrDefault(r.nodeId(), State.UNKNOWN) == State.ALIVE) {
                     sources.add(r.nodeId());
                 }
             }

@@ -1,0 +1,11 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/CoordinatorGrpcService.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/CoordinatorGrpcService.java
+@@ -251,7 +251,7 @@
+      * client-facing address.
+      */
+     private NodeLocation location(Node node, NodeAddressSet addresses) {
+-        String address = addresses == NodeAddressSet.NODE_ADDRESS_SET_INTERNAL ? node.internalAddr() : node.clientAddr();
++        String address = addresses != NodeAddressSet.NODE_ADDRESS_SET_CLIENT ? node.internalAddr() : node.clientAddr();
+         return NodeLocation.newBuilder().setNodeId(node.nodeId()).setAddress(address)
+                 .setLiveness(toProto(liveness.stateOf(node.nodeId()))).build();
+     }

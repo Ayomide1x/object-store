@@ -16,21 +16,33 @@ import (
 )
 
 // ls prints the keys that currently resolve, optionally only those starting
-// with prefix: key, size in bytes, commit time (UTC) and object ID.
+// with prefix: key, size in bytes, commit time (UTC) and object ID. It follows
+// the coordinator's pages to the end, so every matching key is printed under
+// one header, whatever the page size.
 func ls(ctx context.Context, out io.Writer, coordAddr, prefix string) error {
 	conn, err := dial(coordAddr)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	coord := objectstorev1.NewCoordinatorServiceClient(conn)
 
-	resp, err := objectstorev1.NewCoordinatorServiceClient(conn).ListObjects(ctx, &objectstorev1.ListObjectsRequest{Prefix: prefix})
-	if err != nil {
-		return fmt.Errorf("ls %q: %w", prefix, err)
+	var objects []*objectstorev1.ObjectSummary
+	after := ""
+	for {
+		resp, err := coord.ListObjects(ctx, &objectstorev1.ListObjectsRequest{Prefix: prefix, StartAfter: after})
+		if err != nil {
+			return fmt.Errorf("ls %q: %w", prefix, err)
+		}
+		objects = append(objects, resp.GetObjects()...)
+		if resp.GetNextStartAfter() == "" {
+			break
+		}
+		after = resp.GetNextStartAfter()
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "KEY\tSIZE\tCOMMITTED\tOBJECT")
-	for _, o := range resp.GetObjects() {
+	for _, o := range objects {
 		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\n", o.GetKey(), o.GetSizeBytes(), formatMillis(o.GetCommittedAtUnixMillis()), o.GetObjectId())
 	}
 	return tw.Flush()

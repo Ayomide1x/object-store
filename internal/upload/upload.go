@@ -1,10 +1,12 @@
 // Package upload writes each chunk of an object to all of its placed nodes in
-// parallel (client fan-out) and enforces the write quorum.
+// parallel (client fan-out) and enforces the write quorum. Put runs a whole
+// upload: initiate, every chunk, complete. osctl and the gateway share it.
 package upload
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +22,16 @@ import (
 // Quorum is the number of replicas that must acknowledge a chunk for the
 // upload to continue. The coordinator enforces the same rule at commit.
 const Quorum = 2
+
+// ErrQuorum matches (errors.Is) the error WriteChunk returns when fewer than
+// Quorum replicas acknowledged: the cluster could not take the chunk now.
+var ErrQuorum = errors.New("write quorum not reached")
+
+// quorumError carries WriteChunk's message unchanged and matches ErrQuorum.
+type quorumError struct{ msg string }
+
+func (e quorumError) Error() string        { return e.msg }
+func (e quorumError) Is(target error) bool { return target == ErrQuorum }
 
 // Target is one node a chunk is placed on.
 type Target struct {
@@ -110,8 +122,8 @@ func (u *Uploader) WriteChunk(ctx context.Context, c Chunk, src io.ReaderAt) ([]
 	}
 
 	if len(acked) < Quorum {
-		return nil, nil, fmt.Errorf("chunk %d (%s): %d of %d replicas acknowledged, need %d: %s",
-			c.Index, c.ID, len(acked), len(c.Targets), Quorum, strings.Join(failures, "; "))
+		return nil, nil, quorumError{fmt.Sprintf("chunk %d (%s): %d of %d replicas acknowledged, need %d: %s",
+			c.Index, c.ID, len(acked), len(c.Targets), Quorum, strings.Join(failures, "; "))}
 	}
 	return sum, acked, nil
 }

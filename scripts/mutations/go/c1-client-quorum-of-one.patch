@@ -1,11 +1,11 @@
---- a/client/internal/upload/upload.go
-+++ b/client/internal/upload/upload.go
-@@ -19,7 +19,7 @@
+--- a/internal/upload/upload.go
++++ b/internal/upload/upload.go
+@@ -21,7 +21,7 @@
  
  // Quorum is the number of replicas that must acknowledge a chunk for the
  // upload to continue. The coordinator enforces the same rule at commit.
 -const Quorum = 2
 +const Quorum = 1
  
- // Target is one node a chunk is placed on.
- type Target struct {
+ // ErrQuorum matches (errors.Is) the error WriteChunk returns when fewer than
+ // Quorum replicas acknowledged: the cluster could not take the chunk now.

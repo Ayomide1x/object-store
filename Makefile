@@ -16,6 +16,7 @@ proto-breaking:
 build:
 	go build -o bin/osctl ./client/cmd/osctl
 	go build -o bin/node ./node/cmd/node
+	go build -o bin/gateway ./gateway/cmd/gateway
 
 vet:
 	gofmt -l . | (! grep .)

@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -179,7 +179,7 @@
+ 	defer func() { <-s.uploadSlots }()
+ 
+ 	rc := http.NewResponseController(w)
+-	src := bodySource{StreamSource: upload.NewStreamSource(r.Body, r.ContentLength), rc: rc, stall: s.cfg.StallTimeout}
++	src := bodySource{StreamSource: upload.NewStreamSource(func() io.Reader { b, _ := io.ReadAll(r.Body); return strings.NewReader(string(b)) }(), r.ContentLength), rc: rc, stall: s.cfg.StallTimeout}
+ 	objectID, err := upload.Put(r.Context(), s.coord, log, key, r.ContentLength, src, upload.Options{
+ 		ChunkWriteTimeout: s.cfg.ChunkWriteTimeout,
+ 		NodeAddresses:     objectstorev1.NodeAddressSet_NODE_ADDRESS_SET_INTERNAL,

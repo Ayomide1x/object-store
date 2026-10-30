@@ -42,11 +42,30 @@ service CoordinatorService {
   // already holds the chunk list finishes. A key that does not resolve:
   // NOT_FOUND.
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
-  // ListObjects returns the keys that currently resolve, in key order.
+  // ListObjects returns the keys that currently resolve, in key order, one
+  // page at a time (keyset pagination: see ListObjectsRequest).
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   // StatObject describes the object a key resolves to, with every recorded
   // replica of every chunk in any state. For inspection: readers use GetObject.
   rpc StatObject(StatObjectRequest) returns (StatObjectResponse);
+  // GetClusterStatus describes the cluster for observers: node liveness, the
+  // number of chunks below the replication target (counted exactly as the
+  // reconciler counts), pending chunk deletions, and recent repair and garbage
+  // collection passes. It is read-only: it writes nothing and triggers nothing.
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+}
+
+// NodeAddressSet says which of a node's addresses a caller can reach.
+enum NodeAddressSet {
+  // Treated as NODE_ADDRESS_SET_CLIENT, so callers that predate the field
+  // keep getting the addresses they always got.
+  NODE_ADDRESS_SET_UNSPECIFIED = 0;
+  // Client-facing addresses, for callers outside the cluster network (osctl
+  // on the host).
+  NODE_ADDRESS_SET_CLIENT = 1;
+  // Addresses inside the cluster network, as the coordinator and nodes use
+  // them (a gateway running next to the nodes).
+  NODE_ADDRESS_SET_INTERNAL = 2;
 }
 
 message DeleteObjectRequest {
@@ -61,10 +80,21 @@ message DeleteObjectResponse {
 message ListObjectsRequest {
   // Only keys starting with this prefix; empty lists every key.
   string prefix = 1;
+  // Only keys after this one (exclusive), in key order. Empty starts at the
+  // beginning. To page, pass the previous response's next_start_after.
+  string start_after = 2;
+  // Keys per page. 0 means the maximum, 1000; larger values are clamped to
+  // 1000; negative values are INVALID_ARGUMENT.
+  int32 limit = 3;
 }
 
 message ListObjectsResponse {
   repeated ObjectSummary objects = 1;
+  // The last key of this page when at least one more key follows; empty when
+  // this page is the last. Keys committed after the first page may or may not
+  // appear in later pages, but no key is listed twice and no key that resolves
+  // throughout the listing is skipped.
+  string next_start_after = 2;
 }
 
 message ObjectSummary {
@@ -128,6 +158,72 @@ enum NodeLiveness {
   NODE_LIVENESS_UNKNOWN = 4;
 }
 
+message GetClusterStatusRequest {
+  // How many recent passes of each kind to return. 0 means 10; larger values
+  // are clamped to 100; negative values are INVALID_ARGUMENT.
+  int32 recent_passes = 1;
+}
+
+message GetClusterStatusResponse {
+  // Every registered node, by node ID.
+  repeated NodeStatus nodes = 1;
+  // Chunks of current objects with fewer than 3 replicas that count: HEALTHY
+  // rows on nodes that are ALIVE, SUSPECT, or DEAD for less than the repair
+  // grace. The reconciler's own rule.
+  int64 under_replicated_chunks = 2;
+  // Chunk files waiting to be deleted by garbage collection.
+  int64 pending_deletions = 3;
+  // The most recent pass of each kind, whatever it did; unset if none ran.
+  RepairPass last_repair_pass = 4;
+  GcPass last_gc_pass = 5;
+  // The most recent passes that did any work or were skipped, newest first.
+  repeated RepairPass recent_repair_passes = 6;
+  repeated GcPass recent_gc_passes = 7;
+}
+
+message NodeStatus {
+  string node_id = 1;
+  // As the coordinator sees it now, from heartbeats.
+  NodeLiveness liveness = 2;
+  // When the node entered its persisted state, in milliseconds since the Unix
+  // epoch; 0 if never recorded. Wall clock, informational only.
+  int64 liveness_since_unix_millis = 3;
+  // The last persisted heartbeat (persisted at most every 10 s); 0 if none.
+  int64 last_heartbeat_unix_millis = 4;
+}
+
+// A reconciler pass, as recorded in repair_passes.
+message RepairPass {
+  int64 pass_id = 1;
+  int64 started_at_unix_millis = 2;
+  // 0 while the pass is running.
+  int64 finished_at_unix_millis = 3;
+  // Set when the pass did nothing on purpose (for example a node UNKNOWN).
+  string skipped_reason = 4;
+  int32 under_replicated = 5;
+  int32 copies_started = 6;
+  int32 replicas_recorded = 7;
+  int32 found_recorded = 8;
+  int32 bad_found = 9;
+  int32 failures = 10;
+}
+
+// A garbage collection pass, as recorded in gc_passes.
+message GcPass {
+  int64 pass_id = 1;
+  int64 started_at_unix_millis = 2;
+  // 0 while the pass is running.
+  int64 finished_at_unix_millis = 3;
+  string skipped_reason = 4;
+  int32 abandoned = 5;
+  int32 superseded = 6;
+  int32 tasks_created = 7;
+  int32 files_deleted = 8;
+  int32 already_absent = 9;
+  int32 failures = 10;
+  int32 objects_removed = 11;
+}
+
 message HeartbeatRequest {
   string node_id = 1;
   // Random per node process; tells a restart apart from two processes
@@ -143,6 +239,8 @@ message HeartbeatResponse {
 message InitiateUploadRequest {
   string key = 1;
   int64 size_bytes = 2;
+  // Which node addresses to return in the plan.
+  NodeAddressSet node_addresses = 3;
 }
 
 message InitiateUploadResponse {
@@ -194,6 +292,8 @@ message CompleteUploadResponse {}
 
 message GetObjectRequest {
   string key = 1;
+  // Which node addresses to return for the replicas.
+  NodeAddressSet node_addresses = 2;
 }
 
 message GetObjectResponse {

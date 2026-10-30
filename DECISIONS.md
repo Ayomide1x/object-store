@@ -1303,3 +1303,298 @@ Stages 10 and 11 get added when built.
 **Chose:** Go mutations M1 (no write limit, caught by `TestWriteChunkConcurrencyLimit`) and M2 (no gRPC message limit, caught by `TestOversizedMessageRefusedByGRPC`): 34 Go mutations in all. The coordinator is unchanged in stage 9, so its 48 stay.
 **Because:** each new bound is shown to be load-bearing, except the flow-control windows, which can't be (entry above).
 **Breaks if:** code edits stop the patches from applying; the scripts refuse to start.
+
+## The caller names the node address set it can reach (stage 10)
+**Chose:** a `NodeAddressSet` enum (`UNSPECIFIED`, `CLIENT`, `INTERNAL`) as a new field on `InitiateUploadRequest` (3) and `GetObjectRequest` (2). The coordinator fills `NodeLocation.address` from the node's `internal_addr` for `INTERNAL`, and from `client_addr` otherwise. Unset (`UNSPECIFIED`) means `CLIENT`, so osctl and every older caller get exactly what they got before. The gateway, which runs inside the Compose network, asks for `INTERNAL`.
+**Over:**
+- Returning both addresses in `NodeLocation`: every client would need to know which one it can reach, which puts deployment topology into every client.
+- A node-address map in the gateway's own config: it duplicates `COORDINATOR_NODES`, and the two drift.
+- Host networking so a container can reach `127.0.0.1:910x`: not supported properly on Docker Desktop for macOS, and brittle.
+- Guessing from the caller's peer IP: magic, and it breaks behind NAT.
+**Because:** `NodeLocation.address` keeps its documented meaning ("reachable by the caller"), the change is additive (`buf breaking` passes), and invariant 11 holds. The field is part of the public RPC, so osctl run inside the cluster network could set it too, and an internal address grants nothing new: it reaches the same RPCs on the same nodes.
+**Breaks if:** a third kind of network appears (say, a gateway in another cluster). That needs another address per node and another enum value.
+
+## ListObjects pages by key: start_after, limit 1000, look-ahead cursor (stage 10)
+**Chose:** keyset pagination.
+- **Request:** `start_after` (exclusive) and `limit`. Both are new fields (2 and 3).
+- **Response:** `next_start_after` (field 2).
+- **Limits:** `limit` 0 means 1000. Larger values are **clamped** to 1000, not rejected, the way S3's `max-keys` behaves, so a client asking for "everything" still gets a correct first page and a cursor. A negative limit is `INVALID_ARGUMENT`.
+- **Look-ahead:** the query reads `limit + 1` rows. `next_start_after` is the last key returned only when that extra row exists, so the cursor is empty exactly when nothing more matched, and an exact multiple of the limit never costs an extra empty page.
+- **Collation:** the comparison and the `ORDER BY` both use the column's own collation, which is deterministic (a total order). The order `osctl ls` prints is unchanged, and the primary-key index still serves the scan.
+
+osctl's `ls` follows the cursor to the end, so its output is unchanged.
+**Over:**
+- Offset pagination: a key removed between pages shifts every later row, so a key is skipped.
+- An opaque, encoded cursor: nothing to hide here. A key is a fine cursor, and readable cursors make scripts easier.
+- `COLLATE "C"` for byte order: it changes the existing order and defeats the index.
+- Rejecting limits over 1000: it makes every caller learn the maximum before its first call.
+**Because:** stage 11 lists objects, and an unpaged listing eventually exceeds gRPC's 4 MiB message limit (about 40,000 keys). Keyset pagination costs one index range scan per page, however deep.
+**Breaks if:** keys are listed under a non-deterministic collation (comparison and order could then disagree); or callers need a consistent snapshot across pages. Keys committed during a listing may or may not appear, though none is listed twice, and none that resolves throughout the listing is skipped.
+
+## GetClusterStatus: read-only, counted with the reconciler's own rule (stage 10)
+**Chose:** a new RPC returning:
+- every node's liveness (from the tracker), plus its persisted `state_changed_at` and `last_heartbeat_at`;
+- `under_replicated_chunks`;
+- the `pending_deletions` row count;
+- the most recent repair and GC pass, whatever it did;
+- the newest N passes of each kind that did any work or were skipped (N 0 → 10, clamped to 100, negative rejected).
+
+The under-replicated count goes through the same `countedReplicas` method a reconciler pass uses, now extracted in `RepairService`: HEALTHY rows on nodes that are ALIVE, SUSPECT, or DEAD for less than the repair grace, over chunks of current objects. It is computed live. One difference: it still counts while a node is UNKNOWN, a state in which a pass is skipped. The call is one `readOnly` transaction. It writes nothing, prunes nothing, publishes no repair hint, and returns no node addresses.
+**Over:**
+- Copying the last pass's `under_replicated`: up to a repair interval stale, and a skipped pass records 0.
+- The newest N passes of any kind: at a 10 s interval, that's 100 s of mostly-zero rows, and the stage 11 activity feed would miss a repair from two minutes ago.
+- The gateway reading Postgres itself: breaks invariant 11 and splits the metadata surface.
+**Because:** the gateway's `GET /cluster` and the stage 11 UI need one honest picture. "Under-replicated" must mean what repair means, or the UI shows chunks as healthy that repair is about to copy (or the reverse). A test checks the count equals `runPass().underReplicated()` in each state the rule distinguishes. Being read-only means observers polling it can't change the cluster.
+**Breaks if:** the cluster grows large. The count scans every current chunk's replica rows on each call, and two gateways polled every second for a UI would make that scan the coordinator's main load. It would then need a cached count, refreshed by the reconciler.
+
+## Node memory limit amended: GOMEMLIMIT is not a ceiling (stage 10)
+**Amends:** "Memory limits from worst-case bounds" (stage 9), for the storage nodes only. The coordinator's and Postgres's limits are unchanged.
+**Chose:** each node's `mem_limit` goes from 320m to **576m** (`memswap_limit` equal). `GOMEMLIMIT` stays 288MiB and the caps stay 32 reads and 16 writes. The stage 9 sizing was live memory plus `GOMEMLIMIT` just under the limit; it had no term for what the gateway's stress run showed (entry above). The limit is now sized by the gateway's method: `GOMEMLIMIT` + the measured overshoot + kernel and socket memory + margin.
+
+**How it was measured.** The load ran osctl directly, so no gateway cap interfered:
+- 40 workers overwrote a 40 MiB key in a loop;
+- 64, then 96, workers looped `osctl get` of a 100 MiB object with `OSCTL_READ_ORDER=listed`, so node1 is read first for every chunk it holds.
+
+Node1's own log proves both caps were reached: "write rejected: concurrent write limit reached" 90–126 times per run, and "read rejected: concurrent read limit reached" 6–51 times (except one 64-reader run with 0, which isn't used for sizing). Node1's cgroup `memory.stat` was sampled every 0.2 s from a privileged container, and the live heap read with `GODEBUG=gctrace=1`. For the measurement runs, node1's limit was raised to 2 GiB through a scratch Compose override, so the memory could grow where it would.
+
+| Run (node1 limit) | live after GC | `anon` / `active_anon` peak | kernel | sock | both caps hit |
+|---|---|---|---|---|---|
+| 40 s, 64 readers (2 GiB) | 206 MiB | 286 / 364 MiB | 37 MiB | 4.5 MiB | yes |
+| 60 s, 64 readers (2 GiB) | 149 MiB | 280 / 334 MiB | 38 MiB | 3.4 MiB | reads no |
+| 60 s, 96 readers (2 GiB) | 222 MiB | 287 / 381 MiB | 48 MiB | 7.9 MiB | yes |
+| 40 s, 64 readers (shipped 320 MiB) | (not traced) | 282 / 291 MiB | 6 MiB | 5.4 MiB | reads no |
+| 60 s, 96 readers (576 MiB), twice | (not traced) | 289 / 368 MiB | 12 MiB | 7.2 MiB | yes, both |
+
+Readings:
+- **The live heap stays within stage 9's 230 MiB estimate** (222 MiB worst), so `GOMEMLIMIT` 288MiB and the caps are right.
+- **The heap overshoots `GOMEMLIMIT` under full load,** to `active_anon` 381 MiB (about 93 MiB over). As for the gateway, `active_anon` is the figure that agrees with `memory.current`; `anon` lags.
+- **Page cache is charged too, but it isn't sized for.** The written chunk files' page cache (`file`, up to 1.6 GiB unconstrained) counts against the container. It is clean, because every chunk is fsynced before it is acknowledged, so the kernel evicts it under the limit instead of OOM-killing. `memory.current` therefore reads at the limit whenever the node has written more than the limit, as it did in every limited run.
+- **Kernel memory is mostly slab** (inodes and dentries). It shrank from 48 to about 10 MiB under a limit, so it is largely reclaimable too. It is counted in full anyway.
+- **At the shipped 320 MiB the node survived, but only just.** It ran pinned at its limit for the whole run, kept alive by evicting page cache and slab, with `anon` at 282 of 320 MiB, and that run never even saturated the read cap.
+
+**The sizing.** 288 (`GOMEMLIMIT`) + 93 (overshoot) + 8 (sock) + 48 (kernel) = 437 MiB, plus about a third for margin (run-to-run variance was about 50 MiB) = **576 MiB**. At 576 MiB, two saturating runs were not OOM-killed, and unreclaimable memory peaked at about 386 MiB, leaving about 190 MiB for page cache. The stack's total limit goes from about 3.25 to about **4.25 GiB**.
+**Over:**
+- Leaving 320m: survives today's load only by reclaim, with no margin for the overshoot.
+- Lowering `GOMEMLIMIT` to fit 320m (to about 200 MiB, under the 222 MiB measured live peak): the GC would run continuously and still not hold the line.
+- Halving the caps: halves throughput to save 256 MiB per node.
+**Because:** a hard limit sized as if the soft one were a ceiling turns a busy node into an OOM-killed one. A killed node is a liveness event for the whole cluster: SUSPECT, DEAD, repair copies.
+**Breaks if:** the host has less than about 4.25 GiB for the stack (lower the caps and remeasure); or the caps, chunk size or frame size change without a new saturating run. A future kernel or Go release could also change how much the heap overshoots its soft limit.
+
+## Upload and download move to internal/upload and internal/download, orchestration included (stage 10)
+**Chose:** `git mv client/internal/{upload,download} internal/`. The per-upload and per-get orchestration that lived in osctl's `put.go` and `get.go` moves into those packages as well:
+- `upload.Put`: initiate, check the plan, write each chunk, complete;
+- `download.Fetch` builds the chunk list; `Downloader.Stream` writes each chunk once verified;
+- `download.SendReports`.
+
+osctl and the gateway call the same functions. Error messages and log lines are moved verbatim, so osctl's output is unchanged and the stage 2–9 scripts that grep it still pass. Two kinds of `upload.Source`:
+- `FileSource`: osctl. Each replica reads its own range of the file, as before; nothing is buffered.
+- `StreamSource`: the gateway (next entry).
+
+`Put`'s errors keep the coordinator's gRPC status wrapped, and match `upload.ErrQuorum` or `upload.ErrSource` (`errors.Is`) without changing their text, so the gateway can map them to HTTP statuses. One check is new: a planned chunk larger than 4 MiB is rejected, because the stream buffer is one chunk. The coordinator never plans one. The 10 Go mutation patches that pointed at the old paths are repointed, and two (C1, D3) regenerated where context lines moved.
+**Over:**
+- Keeping the orchestration in osctl and repeating it in the gateway: two copies of the commit protocol.
+- A `pkg/` tree: the repo already keeps shared code in root `internal/` (`chunkwrite`).
+- Switching osctl to the stream source too: one path, but +4 MiB per put and a change to osctl's behaviour.
+**Because:** CLAUDE.md says the gateway reuses the client's logic, and Go's `internal` rule stops `gateway/` from importing `client/internal/`. Invariant 11 is easiest to keep when the gateway and osctl run literally the same code.
+**Breaks if:** osctl and the gateway need different upload semantics. They would then share only the per-chunk pieces.
+
+## PUT buffers one chunk and fans out from it (stage 10)
+**Chose:** for each chunk of the plan, in order, `StreamSource` reads exactly that chunk's bytes from the body (`io.ReadFull`) into one buffer, sized `min(object size, 4 MiB)` and reused for every chunk. The three replica writes then read the same buffer, each through its own `bytes.Reader`, through the unchanged `Uploader.WriteChunk` (quorum, skip-after-failure, deadlines). The next chunk is read from the body only after this one reached quorum, so a fast client is slowed by TCP back-pressure, not by gateway memory. Worst-case memory per upload is about 10 MiB: the 4 MiB buffer, plus about 2 MiB per replica (the 1 MiB frame `chunkwrite` allocates, and the ~1 MiB encoded message gRPC holds until the transport has written it; `Send` blocks on a 64 KiB write quota, so no more than one queues per stream).
+**Over:**
+- Teeing the body into three replica streams frame by frame: saves the 4 MiB, but the slowest (or a hung) replica stalls the other two unless each gets its own bounded buffer, which is more code than one chunk buffer.
+- Spooling the body to a temp file and reusing osctl's file path: up to 5 GiB of disk per upload, double I/O, and crash cleanup in a component meant to hold no state.
+- Buffering the whole object: up to 5 GiB of memory. This is mutation W3.
+**Because:** an HTTP body is one pass, and each replica needs the chunk's bytes. One chunk is the smallest unit that can be hashed, verified and acknowledged by its replicas, and 4 MiB per upload fits the memory budget.
+**Breaks if:** the chunk size grows a lot (the buffer grows with it), or uploads in flight grow far past the cap. A frame-level tee with per-replica buffers would then pay off.
+
+## Content-Length is required, judged by the header; checks come before the body (stage 10)
+**Chose:** a PUT gets 411 when it has no `Content-Length` header, or a chunked body (`Transfer-Encoding: chunked`, with or without a Content-Length). It gets 413 when the length exceeds 5 GiB (`upload.MaxObjectSize`, which the coordinator also enforces). Both happen before anything else, the upload-slot check included, and before the body is read. A client that sent `Expect: 100-continue` (curl does, for large bodies) therefore never transfers a body that is refused, because net/http sends `100 Continue` only when the handler first reads. The test is the header, not `r.ContentLength`: probed on Go 1.27, `ContentLength` is 0 both for `Content-Length: 0` and for no header at all, and -1 for chunked. A 0-byte upload must send `Content-Length: 0`, which `curl -T empty-file` does.
+**Over:**
+- Testing `r.ContentLength < 0` only: a header-less PUT would silently store a 0-byte object. This is mutation W2.
+- Accepting chunked uploads and counting bytes: the coordinator needs the size at initiate to plan chunks.
+- Leaving the 5 GiB check to the coordinator: it would answer 400 (INVALID_ARGUMENT), after the client may have started sending.
+**Because:** CLAUDE.md's stage 10 requires `Content-Length` and 411. A size known up front is what lets the plan, and the one-chunk buffer, exist.
+**Breaks if:** clients that can't know the size up front (streaming producers) must be supported. That needs chunked uploads and an upload whose size is fixed at complete, which is a protocol change.
+
+## A refused or failed PUT closes the connection (stage 10)
+**Chose:** every PUT error response sets `Connection: close`: 411, 413, 503 busy, a body that ended early or stalled, and an upstream failure. The body read deadline is cleared only after a fully read, successful upload.
+**Over:** letting net/http keep the connection alive.
+**Because:** found while testing the stall timeout. When a handler returns with part of the body unread and the connection can be reused, net/http first drains up to 256 KiB of that body, with no deadline, before sending the response headers. Two consequences:
+- A client that sent headers and then nothing never got its 503 (or 408), and the handler goroutine stayed until the client gave up.
+- With the read deadline cleared first, even the stalled-body 408 hung.
+
+Closing tells net/http not to drain. Mutation W13 removes it from the busy response, and `TestRefusedUploadDoesNotWaitForItsBody` catches that.
+**Breaks if:** the connection churn matters (clients doing many small failing PUTs on keep-alive). That's unlikely: these are failures.
+
+## A disconnected or stalled PUT is just abandoned; stage 8 GC cleans up (stage 10)
+**Chose:** if the body ends before `Content-Length` bytes, or makes no progress for `GATEWAY_STALL_TIMEOUT`, the chunk read fails and `upload.Put` returns before CompleteUpload. The answer is 400 (`BODY_INCOMPLETE`) or 408 (`BODY_STALLED`), though for a vanished client nobody reads it. In-flight replica writes are cancelled (net/http cancels the request context on any body read error), and each node discards its temp file (stage 3). Chunks that already landed stay as files of a `PENDING` object, which stage 8's GC abandons after `COORDINATOR_GC_PENDING_TIMEOUT`, deleting them from every placement.
+**Over:**
+- Telling the coordinator to abort the upload: a new RPC for what GC already does, and it can't be relied on anyway (the gateway may die mid-upload too).
+- Buffering until the end before writing anything: see "PUT buffers one chunk".
+**Because:** CompleteUpload needs every chunk's hash, so an incomplete body can't commit (invariants 1 and 2). Two independent guards make sure Put stops: the cancelled context, and `StreamSource` refusing a short read. Mutation W11 removes the second, and `TestStreamSourceFailsOnShortRead` catches it.
+**Breaks if:** `COORDINATOR_GC_PENDING_TIMEOUT` is shorter than a legitimate upload through the gateway (120 s on the demo settings). The complete then fails (FAILED_PRECONDITION, 503) and the upload is lost. It is also the effective ceiling on how long one gateway upload may take.
+
+## GET sends headers with the first verified chunk, flushes per chunk, aborts mid-stream (stage 10)
+**Chose:**
+- **Before the first byte.** GetObject (internal addresses), then the chunk-list check, then chunk 0 read and verified. Only then do the status line, `Content-Length` (the object's size), `Content-Type` and `X-Object-Id` go out, together with chunk 0. Any failure up to that point gets a proper status: a failure of chunk 0 on every replica is a 502 with a JSON error. A 0-byte object gets its headers after an empty, successful stream.
+- **Flushing.** Each verified chunk is written, with a write deadline of `GATEWAY_STALL_TIMEOUT`, then flushed (`http.ResponseController.Flush`).
+- **Mid-stream failure.** If a later chunk fails on every replica, the handler sends the bad-replica reports, logs, and calls `panic(http.ErrAbortHandler)`. That is net/http's documented abort: it closes the connection on HTTP/1.1 and resets the stream on HTTP/2, without logging a stack trace. The client sees exactly the verified prefix and then a broken transfer: curl exits 18, "transfer closed with N bytes remaining".
+- **HEAD** matches the GET route (probed) and returns the headers without reading chunks.
+
+Two probe results shaped this:
+- Without the per-chunk flush, the abort discarded what was still in net/http's 4 KiB write buffer. With small writes the client saw no response at all ("Empty reply", curl 52), not a short body. Mutation W7 removes the flush, and `TestGetAbortsMidStream` uses 1000-byte chunks to catch it.
+- On HTTP/1.1, simply returning after a short write already makes curl report 18, because Go closes a connection whose body is shorter than declared. That is implicit behaviour; the explicit abort is the documented API. So the mutation that matters is the one that *completes* the declared length: W1, zero-filling.
+**Over:**
+- Headers before chunk 0: a failure of chunk 0 could then only be an abort, not a status. This is mutation W6.
+- Chunked encoding with an error trailer: the body ends with a valid terminator, which looks complete, and most clients ignore trailers.
+- Hijacking the connection to close it: doesn't work on HTTP/2.
+- Buffering the object first: unbounded memory.
+**Because:** CLAUDE.md requires that a failed download never completes as if it succeeded, and never sends unverified bytes (invariant 5). `Stream` hands the writer only verified chunks, and the abort makes the shortfall visible.
+**Breaks if:** a client ignores a short body against `Content-Length`. HTTP leaves no stronger signal than a broken connection.
+
+## Bad-replica reports after the transfer, detached from the request (stage 10)
+**Chose:** the gateway collects reports in the shared `Downloader`, as osctl does, and sends them through `download.SendReports` once the stream ends: after the last byte on success, before the abort on failure, and also when the client stopped reading. Each report has its own 5 s deadline and no parent context.
+**Over:** sending each report as it happens (up to a 5 s stall per report in the middle of the stream); tying reports to the request context (a client that hangs up would drop them).
+**Because:** stage 5's rule holds: a report is a hint, never part of the read. The coordinator confirms with the node before marking anything. Mutation W9 sends reports only on success, and `TestGetAbortsMidStream` catches it.
+**Breaks if:** many replicas fail at once. Reports go one at a time, so a large burst holds the handler (and its download slot) for up to 5 s each.
+
+## A key is one percent-encoded URL path segment (stage 10)
+**Chose:** routes use a single-segment `{key}`: `PUT|GET|HEAD|DELETE /objects/{key}` and `GET /objects/{key}/stat`. A `/` in a key is sent as `%2F` (`url.PathEscape`, or JavaScript's `encodeURIComponent`). A key that is exactly `.` or `..` is sent as `%2E` / `%2E%2E`, because clients resolve literal dot segments before sending. Probed on Go 1.27: ServeMux splits only on raw slashes and hands the handler the unescaped segment:
+- `/objects/demo%2Fphoto.bin` → `demo/photo.bin`;
+- `/objects/demo%2Fphoto.bin/stat` → the stat route;
+- `a%2F..%2Fb` stays `a/../b`, with no path cleaning or redirect.
+
+A request with a raw slash in the key (`/objects/demo/photo.bin`) falls to a catch-all, which answers 400 with the encoding rule. An unsupported method on a one-segment path gets 405 with `Allow`.
+**Over:**
+- `{key...}` (the rest of the path), with a trailing `/stat` meaning stat: every key ending in `/stat` becomes unreachable, and Go forbids anything after a `...` wildcard anyway.
+- Moving stat to `/stat/{key...}`: it changes CLAUDE.md's endpoint list.
+- A query parameter for the key: unusual for a resource URL.
+**Because:** it keeps CLAUDE.md's routes exactly and has no ambiguous case. You approved it at the start of the stage.
+**Breaks if:** the gateway goes behind a proxy that decodes `%2F` in paths (some do by default). That proxy must be configured to pass encoded slashes through.
+
+## gRPC codes map to HTTP statuses by what the caller can do (stage 10)
+**Chose:**
+- `INVALID_ARGUMENT` → 400.
+- `NOT_FOUND` → 404.
+- `FAILED_PRECONDITION` → 503 + `Retry-After` (at commit: fewer than 2 verified replicas, or the upload was abandoned; a cluster condition, and a fresh PUT can succeed).
+- `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, and a chunk that missed the write quorum → 503 + `Retry-After`.
+- `DATA_LOSS` → 500 (a chunk has no healthy replica).
+- `DEADLINE_EXCEEDED` → 504.
+- Anything else → 502. That includes INTERNAL, UNKNOWN, a malformed plan, and every replica of chunk 0 failing a read.
+
+Gateway-side failures:
+- 411 / 413: missing length / too large.
+- 400: bad key encoding, incomplete body, bad `limit`.
+- 408: stalled body.
+- 503 + `Retry-After: 1`: a full slot cap.
+
+Errors are JSON, `{"error": ..., "code": ...}`, where `code` is the gRPC code or the gateway's reason.
+**Over:**
+- 412 for FAILED_PRECONDITION: in HTTP it means a failed `If-*` header, which no client sent.
+- 500 for everything upstream: hides the difference between "retry" and "don't".
+- 502 for DATA_LOSS: the upstream answered correctly; the data is gone.
+**Because:** a client acts on the status: fix the request, retry later, or give up. `TestErrorMapping` checks every row on every route.
+**Breaks if:** the coordinator starts using a code for a new meaning (say, FAILED_PRECONDITION for a client mistake). The table must change with it.
+
+## Gateway concurrency caps refuse at once with 503 (stage 10)
+**Chose:** `GATEWAY_MAX_CONCURRENT_UPLOADS` (8) and `GATEWAY_MAX_CONCURRENT_DOWNLOADS` (16), each a buffered channel taken with a non-blocking `select`, like the node's caps. When full, the request gets 503 with `Retry-After: 1` at once. For an upload this happens before its body is read. Metadata routes (list, stat, rm, cluster) aren't capped: they're small, and the coordinator bounds its own work.
+**Over:** waiting for a slot (hides overload, holds connections and memory while queued); 429 (it means a per-client rate limit, not server capacity).
+**Because:** the caps are what make the memory bound in the next entry true. Mutations W4 and W5 remove them.
+**Breaks if:** traffic is dominated by metadata calls (each uncapped), or the caps are raised without raising the memory limit.
+
+## Gateway memory limit from worst-case bounds (stage 10)
+**Extends:** "Memory limits from worst-case bounds" (stage 9).
+**Chose:** per gateway, `mem_limit: 384m` with `memswap_limit` equal, and `GOMEMLIMIT=224MiB`. Three terms:
+1. **Live memory, worst case.**
+   - 8 uploads × ~10 MiB (the 4 MiB chunk buffer + ~2 MiB per replica write in flight) = 80 MiB;
+   - 16 downloads × ~6 MiB (the 4 MiB verify buffer + a 1 MiB receive window + one decoded 1 MiB frame) = 96 MiB;
+   - about 16 MiB baseline.
+
+   About 192 MiB. Measured with both caps full (24 concurrent 100 MiB uploads and 32 downloads against one gateway): 151 MiB live after GC (`GODEBUG=gctrace=1`).
+2. **`GOMEMLIMIT` above the live peak.** Go's runtime doesn't read the container limit; without it, GOGC=100 lets the heap reach twice the live data (303 MiB measured). 224 MiB is about 1.2× the worst-case live estimate.
+3. **Room above `GOMEMLIMIT`.** It is a soft limit. At this load the gateway allocates fresh 1 MiB gRPC frames at gigabytes per second, and the heap overshoots the limit while a collection runs: about 270 MiB of anonymous memory measured, plus about 16 MiB of socket and kernel memory, which the container is also charged for. Measured peaks were 286–293 MiB, so 384 MiB leaves about 90 MiB of margin.
+
+The download bound depends on the gateway's node connections using a static 1 MiB stream and connection window (`httpapi.NodeDialOptions`, passed to the shared `Downloader`; osctl passes none and keeps grpc-go's defaults). Without it, BDP estimation can grow each window to 16 MiB. The stack's total limit goes from about 2.5 to about 3.25 GiB.
+
+**How the number was found:** the first limit, 256 MiB, was the live estimate plus a margin. The stress run had gateway1 OOM-killed (exit 137) within a second of full load. Rerunning with the limit raised (a scratch Compose override) and reading the container's cgroup `memory.stat` showed the overshoot above: the arithmetic had no term for it. At 384 MiB, three runs of the same load: no OOM, no failed transfer, peaks 286–288 MiB.
+**Over:**
+- No limit: a gateway could take the host's memory.
+- A limit from measured averages: fine until the bad day.
+- Lowering the caps to fit 256 MiB: halves throughput to save 128 MiB.
+**Because:** the same discipline as stage 9 (every buffer bounded by a cap times a known size), plus the term stage 9 lacked: a soft GC limit is not a ceiling.
+**Breaks if:** the caps, the chunk size or the frame size change without this arithmetic and a new stress run; or uncapped metadata requests (a stat of a 5 GiB object is about 1,300 chunks) add up. The stage 9 node limits had the same missing term; "Node memory limit amended: GOMEMLIMIT is not a ceiling" (this stage) remeasures and fixes them.
+
+## HTTP timeouts: a header timeout and per-chunk progress deadlines, no whole-request timeout (stage 10)
+**Chose:**
+- On the `http.Server`: `ReadHeaderTimeout` 10 s (against slow-header clients), `IdleTimeout` 60 s, `MaxHeaderBytes` 64 KiB. `ReadTimeout` and `WriteTimeout` are left at 0.
+- Progress deadlines instead, through `http.ResponseController`: before reading each chunk of a PUT body, the read deadline is set to now + `GATEWAY_STALL_TIMEOUT` (30 s); before writing each chunk of a GET, the write deadline likewise.
+- Node calls keep their per-replica deadlines (`GATEWAY_CHUNK_WRITE_TIMEOUT`, `_READ_TIMEOUT`, 10 s, as osctl's).
+- Every coordinator call gets `GATEWAY_COORDINATOR_TIMEOUT` (10 s) from a unary interceptor.
+- On SIGTERM, `Shutdown` gives in-flight requests 8 s, under Docker's 10 s stop timeout.
+**Over:** `ReadTimeout` / `WriteTimeout`. They bound the whole request: a 5 GiB transfer at 20 MB/s takes over 4 minutes, so any fixed value either kills legitimate large transfers or is set so high it bounds nothing.
+**Because:** what must be bounded is a *stuck* transfer, not a long one. A 4 MiB chunk per 30 s is a floor of about 140 KB/s. Mutation W8 removes the body deadline, and `TestStalledBodyAborted` catches it.
+**Breaks if:** legitimate clients are slower than about 140 KB/s (raise the stall timeout); or a client trickles one byte per 29 s within a chunk. The deadline is per chunk, so that client could hold a slot for up to 30 s × 4 MiB. The cap bounds how many can.
+
+## Two gateway instances; /healthz is the process, scripts wait on /cluster (stage 10)
+**Chose:** two Compose services, `gateway1` on 127.0.0.1:9081 and `gateway2` on 127.0.0.1:9082, from one image and one YAML anchor. The CLAUDE.md ports table gained the 9081–9082 row, with your approval. The healthcheck runs `/gateway health`, which GETs `/healthz`; that answers 200 whenever the process serves HTTP, and does not check the coordinator. Scripts call `wait_gateway URL` (`scripts/lib/gateway.sh`), which polls `GET /cluster` until it answers and shows 4 nodes ALIVE, and fails with the last answer seen, like `wait_alive`.
+**Over:**
+- A healthcheck that checks the coordinator: a coordinator outage would mark both gateways unhealthy and get them restarted, which fixes nothing.
+- One gateway: the acceptance needs two, to show they share nothing.
+- Ports 8081/8082: 8080-range ports are often taken by other dev servers, and 908x sits next to the coordinator's 9090.
+**Because:** `up --wait` should mean "the process is up"; readiness to serve is a separate question, answered through the gateway itself.
+**Breaks if:** something routes traffic on the healthcheck alone (a load balancer). It would send requests to a gateway whose coordinator is unreachable, and they would get 503.
+
+## The gateway image (stage 10)
+**Chose:** `gateway/Dockerfile`, the node's pattern: build with `golang:1.27` (copying only `gen`, `internal` and `gateway`), run on `gcr.io/distroless/static-debian12:nonroot`. No volume: nothing is written to disk. No new base image, so `check-arm64.sh`'s registry list is unchanged. It finds the gateway image through `docker compose config --images`, and the source cross-check covers `gateway/Dockerfile`.
+**Over:** an Alpine runtime (a shell isn't needed: the binary probes itself); building into the node image (two programs in one image, two reasons to rebuild).
+**Because:** a small, shell-less, non-root image is what the node already uses, and its arm64 story is already verified.
+**Breaks if:** the gateway ever needs a CA bundle or timezone data (TLS, which is out of scope). Static distroless has CA certificates; anything beyond that does not.
+
+## Stage 10 acceptance: curl only, one script, checks what each response really was (stage 10)
+**Chose:** `scripts/stage10-gateway-check.sh`, against the running stack, with curl as the client. Its checks:
+- **Round trips:** 0 B, 1 B, 4 MiB and 100 MiB, compared with `cmp`.
+- **411 and 413:** the header-less PUT is sent through a raw socket, because curl always declares a length for a body. The 413 is a headers-only request with `Expect: 100-continue`. The `objects` row count must not change, which proves the coordinator was never asked.
+- **The broken transfer:** a 12 MiB object, byte flips on all three replicas of chunk 1. It must give curl exit 18, a body of exactly 4 MiB equal to the original's first 4 MiB, three BAD rows, and then a 500 DATA_LOSS.
+- **Two gateways:** both directions; `docker compose restart gateway1`, then `wait_gateway`, then every object identical with the same object ID; listings equal through both gateways (pages of 2 and of 3) and `osctl ls`.
+- **Parity with osctl:**
+  - objects crossing in both directions;
+  - overwrites through either tool, with `X-Object-Id` equal to `osctl stat`;
+  - GETs during eight gateway overwrites (each must be one version, and at least 3 must overlap, or the step is inconclusive);
+  - rm through either tool;
+  - a missing key: 404 vs "key not found";
+  - stat's replica set.
+- **`/cluster`:** 4 ALIVE and nothing under-replicated.
+
+Flipped bytes are restored and `check_touched` checks every touched file, as stages 3, 5 and 7 do.
+**Over:** testing through osctl only (the gateway is the thing under test); a separate script per criterion (they share setup and the stack's state).
+**Because:** each CLAUDE.md criterion for stage 10 maps to a check that fails on the wrong behaviour, not just on an error.
+**Breaks if:** the client used to see the broken transfer stops checking `Content-Length` (curl's exit 18 is that check); or the overwrite race gets too fast to overlap three GETs. The step then fails as inconclusive, not as a pass.
+
+## Mutation scripts extended for stage 10 (stage 10)
+**Extends:** "Mutation scripts extended for stage 9" (stage 9).
+**Chose:** 14 new Go mutations, each caught by its named test:
+- **W1** completes the response after a mid-stream failure (zero fill): `TestGetAbortsMidStream`.
+- **W2** accepts a PUT without Content-Length: `TestPutRequiresContentLength/no_header`.
+- **W3** buffers the whole object: `TestPutStreamsChunkByChunk`.
+- **W4** and **W5** remove the upload and download caps: `TestUploadConcurrencyLimit`, `TestDownloadConcurrencyLimit`.
+- **W6** sends headers before chunk 0 is verified: `TestFirstChunkFailureIs502`.
+- **W7** drops the per-chunk flush: `TestGetAbortsMidStream`.
+- **W8** drops the body stall deadline: `TestStalledBodyAborted`.
+- **W9** skips reports after a failure: `TestGetAbortsMidStream`.
+- **W10** asks for client addresses: `TestGatewayAsksForInternalAddresses`.
+- **W11** has the stream source ignore a short read: `TestStreamSourceFailsOnShortRead`.
+- **W12** leaves NOT_FOUND unmapped: `TestErrorMapping`.
+- **W13** lets a busy response drain the body: `TestRefusedUploadDoesNotWaitForItsBody`.
+- **L1** has osctl ls print only the first page: `TestLsFollowsEveryPage`.
+
+That makes 48 Go mutations. 6 new coordinator mutations, all caught by `GatewayRpcIT`:
+- **S1** makes the cursor the first key of the page.
+- **S2** drops the look-ahead row.
+- **S3** ignores the address set.
+- **S4** treats UNSPECIFIED as INTERNAL.
+- **S5** has the status count raw HEALTHY rows.
+- **S6** has the status prune passes.
+
+That makes 54. The 10 patches against the moved packages are repointed, and C1 and D3 regenerated. Coordinator patches 6, P3 and P5 are regenerated with the same intent: 6's context moved (`MAX_LIST_LIMIT` follows `MIN_REPLICAS`), and P3 and P5 patch the reconciler loop that `countedReplicas` was extracted from. Each is still caught by its named test.
+**Because:** each new rule is shown to be load-bearing. Writing W11 first showed `TestClientDisconnectNeverCommits` could not catch it, because net/http's context cancellation already stops the upload. So the short-read guard got its own unit test.
+**Breaks if:** code edits stop the patches from applying; the scripts refuse to start.

@@ -1,5 +1,5 @@
---- a/client/internal/download/download.go
-+++ b/client/internal/download/download.go
+--- a/internal/download/download.go
++++ b/internal/download/download.go
 @@ -110,7 +110,7 @@
  		return verdict{failOver: true, report: objectstorev1.ReportBadReplicaRequest_REASON_DATA_LOSS}
  	case codes.InvalidArgument:

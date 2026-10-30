@@ -1,0 +1,11 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -120,8 +120,6 @@
+ 	default:
+ 		log.Warn(what+" rejected: concurrency limit reached", "limit", cap(slots))
+ 		w.Header().Set("Retry-After", "1")
+-		// An upload's body is not read: close rather than drain it (see put).
+-		w.Header().Set("Connection", "close")
+ 		writeError(w, http.StatusServiceUnavailable, "BUSY",
+ 			fmt.Sprintf("gateway is serving %d %ss; retry later", cap(slots), what))
+ 		return false
