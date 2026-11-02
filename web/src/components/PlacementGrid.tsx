@@ -5,7 +5,7 @@
 import { useState } from "react";
 import type { Liveness, NodeStatus } from "../api";
 import { formatBytes, formatDuration } from "../format";
-import { cellWords, LIVENESS_WORD, TARGET_REPLICAS, landedRepairs, type Cell, type Grid } from "../grid";
+import { cellWords, LIVENESS_WORD, TARGET_REPLICAS, landedRepairs, reachabilityNote, type Cell, type Grid } from "../grid";
 import { Glyph, type GlyphKind } from "./Glyph";
 
 const LIVENESS_GLYPH: Record<Liveness, GlyphKind> = {
@@ -98,14 +98,29 @@ export function PlacementGrid({ nodes, grid, empty, now, stale }: Props) {
 function NodeBay({ id, node, now }: { id: string; node: NodeStatus | undefined; now: number }) {
   const liveness: Liveness = node?.liveness ?? "UNKNOWN";
   const since = node && node.liveness_since_unix_millis > 0 ? now - node.liveness_since_unix_millis : null;
+  const unreachable = node === undefined ? null : reachabilityNote(node);
   return (
-    <th scope="col" className="bay-head" data-testid="node-card" data-node={id} data-state={liveness}>
+    <th
+      scope="col"
+      className="bay-head"
+      data-testid="node-card"
+      data-node={id}
+      data-state={liveness}
+      data-call-failures={node?.recent_call_failures ?? 0}
+      data-channel-replacements={node?.channel_replacements ?? 0}
+    >
       <span className="bay-name">{id}</span>
       <span className="bay-liveness">
         <Glyph kind={LIVENESS_GLYPH[liveness]} />
         <span>{LIVENESS_WORD[liveness]}</span>
       </span>
       <span className="bay-since">{since === null ? " " : `for ${formatDuration(since)}`}</span>
+      {unreachable !== null ? (
+        <span className="bay-unreachable">
+          <Glyph kind="warn" />
+          <span>{unreachable}</span>
+        </span>
+      ) : null}
     </th>
   );
 }

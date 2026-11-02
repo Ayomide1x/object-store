@@ -8,6 +8,10 @@ export interface NodeStatus {
   liveness: Liveness;
   liveness_since_unix_millis: number;
   last_heartbeat_unix_millis: number;
+  /** Times the coordinator replaced its channel to the node since it started. */
+  channel_replacements: number;
+  /** The coordinator's calls to the node that failed in the last minute. */
+  recent_call_failures: number;
 }
 
 export interface RepairPass {

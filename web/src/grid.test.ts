@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { NodeStatus, Replica, Stat } from "./api";
-import { deriveGrid, landedRepairs } from "./grid";
+import { deriveGrid, landedRepairs, reachabilityNote } from "./grid";
 
 const node = (node_id: string, liveness: NodeStatus["liveness"] = "ALIVE"): NodeStatus => ({
   node_id,
   liveness,
   liveness_since_unix_millis: 1,
   last_heartbeat_unix_millis: 1,
+  channel_replacements: 0,
+  recent_call_failures: 0,
 });
 
 const replica = (node_id: string, more: Partial<Replica> = {}): Replica => ({
@@ -113,5 +115,21 @@ describe("landedRepairs", () => {
     expect([...landedRepairs(before, after)]).toEqual(["c0/node4"]);
     expect(landedRepairs(after, after).size).toBe(0);
     expect(landedRepairs(null, after).size).toBe(0);
+  });
+});
+
+describe("reachabilityNote", () => {
+  // Mutation u13: an Alive node's failed calls are not shown.
+  it("says when an Alive node is unreachable from the coordinator", () => {
+    expect(reachabilityNote({ liveness: "ALIVE", recent_call_failures: 0, channel_replacements: 3 })).toBeNull();
+    expect(reachabilityNote({ liveness: "ALIVE", recent_call_failures: 1, channel_replacements: 0 })).toBe(
+      "Alive, but unreachable: 1 failed call from the coordinator in the last minute",
+    );
+    expect(reachabilityNote({ liveness: "ALIVE", recent_call_failures: 12, channel_replacements: 2 })).toBe(
+      "Alive, but unreachable: 12 failed calls from the coordinator in the last minute; reconnected 2 times",
+    );
+    expect(reachabilityNote({ liveness: "DEAD", recent_call_failures: 4, channel_replacements: 1 })).toBe(
+      "4 failed calls from the coordinator in the last minute; reconnected 1 time",
+    );
   });
 });

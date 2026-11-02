@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
+@@ -295,6 +295,9 @@
+      */
+     private ManagedChannel ready(Node node, NodeChannel nc, Deadline deadline) {
+         ManagedChannel ch = nc.channel;
++        if (ch != null) {
++            return ch;
++        }
+         long start = System.nanoTime();
+         long budget = deadline.timeRemaining(TimeUnit.NANOSECONDS) / 2;
+         ConnectivityState state = ch.getState(true); // true: an IDLE channel starts connecting

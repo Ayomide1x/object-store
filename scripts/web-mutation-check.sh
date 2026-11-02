@@ -44,6 +44,7 @@ expected_test() {
     u10-download-through-a-blob) echo "lint: no-restricted-syntax" ;;
     u11-poller-overlaps-requests) echo "src/poller.test.ts > startPoller > never starts a request while one is in flight" ;;
     u12-polls-while-hidden) echo "src/poller.test.ts > startPoller > stops while the tab is hidden and polls at once when it is shown" ;;
+    u13-alive-hides-call-failures) echo "src/grid.test.ts > reachabilityNote > says when an Alive node is unreachable from the coordinator" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

@@ -126,3 +126,19 @@ export function landedRepairs(prev: Grid | null, next: Grid): Set<string> {
   }
   return out;
 }
+
+/**
+ * What the node card says about the coordinator's own calls to a node, or
+ * null when they are going fine. Heartbeats come from the node, calls go to
+ * it: a node can be Alive and still unreachable from the coordinator, and
+ * that must not hide behind "Alive".
+ */
+export function reachabilityNote(node: Pick<NodeStatus, "liveness" | "recent_call_failures" | "channel_replacements">): string | null {
+  const f = node.recent_call_failures;
+  if (f === 0) {
+    return null;
+  }
+  const calls = `${f} failed ${f === 1 ? "call" : "calls"} from the coordinator in the last minute`;
+  const replaced = node.channel_replacements > 0 ? `; reconnected ${node.channel_replacements} ${node.channel_replacements === 1 ? "time" : "times"}` : "";
+  return node.liveness === "ALIVE" ? `Alive, but unreachable: ${calls}${replaced}` : `${calls}${replaced}`;
+}

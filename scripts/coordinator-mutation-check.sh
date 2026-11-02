@@ -82,6 +82,10 @@ expected_test() {
     s9-stat-counts-raw-healthy-rows) echo "GatewayRpcIT|countedReplicasPerChunkFollowTheReconcilersRule()" ;;
     s10-event-record-blocks) echo "LivenessEventIT|aBlockedEventWriteNeverBlocksLiveness()" ;;
     s11-event-written-synchronously) echo "LivenessEventIT|aFailingEventWriteChangesNoStateAndDelaysNoTransition()" ;;
+    s12-no-readiness-check) echo "NodeAddressChangeTest|aChannelThatNeverBecomesReadyIsReplaced()" ;;
+    s13-replacement-not-single-flight) echo "NodeAddressChangeTest|concurrentCallsOnAStuckChannelReplaceItOnce()" ;;
+    s14-no-replacement-rate-limit) echo "NodeAddressChangeTest|replacementIsRateLimitedPerNode()" ;;
+    s15-unavailable-retry-rate-limited) echo "NodeAddressChangeTest|theFirstCallAfterANodeReturnsOnANewAddressSucceedsWithinTheWindow()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

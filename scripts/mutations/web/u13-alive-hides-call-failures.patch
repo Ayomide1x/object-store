@@ -1,0 +1,11 @@
+--- a/web/src/grid.ts
++++ b/web/src/grid.ts
+@@ -135,7 +135,7 @@
+  */
+ export function reachabilityNote(node: Pick<NodeStatus, "liveness" | "recent_call_failures" | "channel_replacements">): string | null {
+   const f = node.recent_call_failures;
+-  if (f === 0) {
++  if (f === 0 || String(node.liveness) === "ALIVE") {
+     return null;
+   }
+   const calls = `${f} failed ${f === 1 ? "call" : "calls"} from the coordinator in the last minute`;

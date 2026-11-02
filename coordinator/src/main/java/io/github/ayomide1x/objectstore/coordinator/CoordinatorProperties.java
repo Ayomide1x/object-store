@@ -55,6 +55,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                       liveness_events rows are kept
  * @param livenessEventWriter {@code COORDINATOR_LIVENESS_EVENT_WRITER}: whether the thread
  *                       that writes liveness events runs; false only in tests, which flush by hand
+ * @param nodeChannelReplaceInterval {@code COORDINATOR_NODE_CHANNEL_REPLACE_INTERVAL}: the
+ *                       least time between two replacements of one node's channel
  */
 @ConfigurationProperties("coordinator")
 public record CoordinatorProperties(
@@ -79,7 +81,8 @@ public record CoordinatorProperties(
         @DefaultValue("24h") Duration gcPassRetention,
         @DefaultValue("1s") Duration statusCacheTtl,
         @DefaultValue("24h") Duration livenessEventRetention,
-        @DefaultValue("true") boolean livenessEventWriter) {
+        @DefaultValue("true") boolean livenessEventWriter,
+        @DefaultValue("5s") Duration nodeChannelReplaceInterval) {
 
     public CoordinatorProperties {
         if (suspectAfter.isNegative() || suspectAfter.isZero() || deadAfter.compareTo(suspectAfter) <= 0) {
@@ -94,6 +97,9 @@ public record CoordinatorProperties(
         }
         if (gcBatch < 1 || gcMaxInflight < 1 || gcMaxPerNode < 1) {
             throw new IllegalStateException("COORDINATOR_GC_BATCH, _MAX_INFLIGHT and _MAX_PER_NODE must be >= 1");
+        }
+        if (nodeChannelReplaceInterval.isNegative()) {
+            throw new IllegalStateException("COORDINATOR_NODE_CHANNEL_REPLACE_INTERVAL must be >= 0");
         }
         if (statusCacheTtl.isNegative()) {
             throw new IllegalStateException("COORDINATOR_STATUS_CACHE_TTL must be >= 0, got " + statusCacheTtl);

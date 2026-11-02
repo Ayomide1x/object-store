@@ -659,6 +659,9 @@ func TestClusterJSON(t *testing.T) {
 		cl.PendingDeletions != 5 || cl.LastRepairPass == nil || cl.LastRepairPass.CopiesStarted != 1 || cl.LastGcPass != nil {
 		t.Fatalf("cluster %+v", cl)
 	}
+	if cl.Nodes[2].ChannelReplacements != 2 || cl.Nodes[2].RecentCallFailures != 4 {
+		t.Fatalf("node channel stats %+v", cl.Nodes[2])
+	}
 	if cl.CountsAsOfUnixMillis != 1234 || cl.LivenessEventsDropped != 3 || len(cl.RecentLivenessEvents) != 2 ||
 		cl.RecentLivenessEvents[0] != (livenessEventJSON{EventID: 2, NodeID: "node2", From: "ALIVE", To: "SUSPECT", AtUnixMillis: 99}) ||
 		cl.RecentLivenessEvents[1].From != "" || cl.RecentLivenessEvents[1].To != "UNKNOWN" {

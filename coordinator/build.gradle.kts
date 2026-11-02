@@ -35,6 +35,12 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // Successful DNS lookups are never cached in tests, by the JVM
+    // (sun.net.inetaddr.ttl) or by grpc-java's DNS resolver
+    // (networkaddress.cache.ttl, read as a system property), so a test can
+    // change what a name resolves to (TestDns) and see the next lookup follow.
+    systemProperty("sun.net.inetaddr.ttl", "0")
+    systemProperty("networkaddress.cache.ttl", "0")
 }
 
 // The .proto files live at the repo root and are shared with the Go code.

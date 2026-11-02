@@ -35,13 +35,23 @@
 #   5. Three stopped and DEAD: initiate fails with UNAVAILABLE. Nothing new
 #      is created; the overwritten key still resolves to its previous version,
 #      and a new key to nothing.
-#   6. Regression smoke test: stop three nodes, bring everything back with
-#      `up -d --wait`, wait for 4 ALIVE, then put at once. It must succeed.
-#      Restarting can reassign the nodes' IPs; before the stage 4 fix, the
-#      coordinator kept calling the old addresses and refused commits. The swap
-#      doesn't happen every run, so this is a smoke test; the deterministic
-#      proof is the coordinator tests for wrong-node responses and UNAVAILABLE
-#      retry.
+#   6. Node addresses change.
+#      a. Smoke test: stop three nodes, bring everything back with
+#         `up -d --wait`, wait for 4 ALIVE, then put at once. It must succeed.
+#         Restarting can reassign the nodes' IPs (not every run).
+#      b. A forced swap (scripts/lib/ipswap.sh): node1 and node3 are stopped,
+#         given each other's IP addresses, and started. Then every node must
+#         be reachable from the coordinator for every kind of call:
+#         - an upload records replicas on every placed node (StatChunks);
+#         - for each node, a chunk that node lacks is made under-replicated
+#           (one replica corrupted and read, so it is marked BAD) and repaired
+#           onto it (VerifyChunk, PushChunk, StatChunks);
+#         - those objects are removed, and garbage collection deletes their
+#           files on every node (DeleteChunks; a row goes only when the node
+#           confirms).
+#      The coordinator once kept a channel stuck after an address change: not
+#      ready, never failing, every call timing out. The deterministic proof of
+#      the fix is NodeAddressChangeTest; this step checks the whole path.
 #
 # Node volumes are read from a throwaway alpine container with --volumes-from,
 # because the node image is distroless.
@@ -55,17 +65,24 @@ osctl="$root/bin/osctl"
 source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
 source "$root/scripts/lib/liveness.sh"
-source "$root/scripts/lib/volume.sh" # check_chunk_files, for step 3
+source "$root/scripts/lib/volume.sh" # check_chunk_files, corrupt_byte
+source "$root/scripts/lib/ipswap.sh"
 # up --wait means the coordinator is serving; uploads need ALIVE nodes.
 wait_alive 4
 work="$(mktemp -d)"
 run="$$"
+flipped="$work/flipped"
+: > "$flipped"
+# Compose demo values: a repair pass and a GC pass every 10 s, read grace 60 s.
+interval=10 read_grace=60 margin=20
 deadline=10
 export OSCTL_CHUNK_WRITE_TIMEOUT="${deadline}s"
 
 restore() {
   "${compose[@]}" unpause node1 node2 node3 node4 >/dev/null 2>&1 || true
+  if [[ "${swapped:-}" == yes ]]; then unpin_ips node1 node3 >/dev/null 2>&1 || true; fi
   "${compose[@]}" up -d --wait >/dev/null 2>&1 || true
+  restore_flipped "$flipped" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap restore EXIT
@@ -76,6 +93,14 @@ source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -F'|' -c "$1"; }
 now() { python3 -c 'import time; print(time.time())'; }
+# wait_until TIMEOUT WANT QUERY: polls QUERY until it returns WANT.
+wait_until() {
+  local timeout="$1" want="$2" q="$3" start=$SECONDS
+  until [[ "$(sql "$q")" == "$want" ]]; do
+    ((SECONDS - start >= timeout)) && return 1
+    sleep 1
+  done
+}
 latest_object() { sql "SELECT object_id FROM objects WHERE key = '$1' ORDER BY created_at DESC LIMIT 1"; }
 
 # check_replicas OBJECT_ID DEAD: each chunk's replicas recorded at upload must
@@ -395,30 +420,106 @@ else
 fi
 
 echo
-echo "6. stop three nodes, up --wait, wait for ALIVE, put at once (IP-change regression)"
-ips() {
-  local n
-  for n in node1 node2 node3 node4; do
-    printf '%s=%s ' "$n" "$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-      "$("${compose[@]}" ps -aq "$n")")"
-  done
-}
+echo "6a. stop three nodes, up --wait, wait for ALIVE, put at once (restart smoke test)"
 "${compose[@]}" up -d --wait >/dev/null 2>&1
 wait_alive 4 || fail "not all nodes ALIVE before the restart"
-before="$(ips)"
 "${compose[@]}" stop node1 node2 node3 >/dev/null 2>&1
 "${compose[@]}" up -d --wait >/dev/null 2>&1
 wait_alive 4 || fail "not all nodes ALIVE after the restart"
-after="$(ips)"
-echo "   IPs before: $before"
-echo "   IPs after:  $after"
-[[ "$before" == "$after" ]] && echo "   (no IP change this run: the smoke test cannot hit the bug)" \
-  || echo "   (IPs changed: the coordinator must re-resolve)"
 mkfile_mib v6 10
 if osctl_run put "$work/v6" "replication/after-restart-$run"; then
   ok "put right after wait_alive succeeded"
 else
   fail "put right after wait_alive failed"
 fi
+
+echo
+echo "6b. node1 and node3 swap IP addresses; every node stays reachable for every call"
+swapped=yes
+echo "   swap: $(swap_ips node1 node3)"
+wait_alive 4 || fail "not all nodes ALIVE after the swap"
+[[ "$(node_ip node1)" != "$(node_ip node3)" ]] || fail "the swap left two nodes on one address"
+
+# Uploads: StatChunks to every placed node.
+mkfile_mib v6b 10
+if osctl_run put "$work/v6b" "replication/after-swap-$run"; then
+  obj6="$(latest_object "replication/after-swap-$run")"
+  check_replicas "$obj6" '{}' && ok "after the swap, every chunk recorded on every placed node" \
+    || fail "after the swap, a placed node's replica was not recorded"
+else
+  fail "the upload after the swap failed"
+fi
+
+# Repair onto each node in turn: a 1-chunk object leaves one node out (a
+# random one of 4); put until one leaves out the node, then corrupt its
+# first-listed replica and read it, so it is marked BAD and the reconciler
+# copies the chunk to the only node without a row: that node.
+mkfile_mib one6 1
+repaired_keys=()
+for n in node1 node2 node3 node4; do
+  key="" cid=""
+  for try in $(seq 1 40); do
+    k="replication/swap-repair-$n-$try-$run"
+    osctl_run put "$work/one6" "$k" >/dev/null || continue
+    c="$(sql "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = '$k'")"
+    if [[ "$(sql "SELECT count(*) FROM chunk_replicas WHERE chunk_id = '$c' AND node_id = '$n'")" == 0 && \
+          "$(sql "SELECT count(*) FROM chunk_replicas WHERE chunk_id = '$c' AND state = 'HEALTHY'")" == 3 ]]; then
+      key="$k" cid="$c"
+      break
+    fi
+    repaired_keys+=("$k") # not this node's object: removed with the others below
+  done
+  if [[ -z "$key" ]]; then
+    # A random start leaves out each node 1 time in 4: 40 tries miss with
+    # probability (3/4)^40, under 1 in 99,000.
+    inconclusive "no 1-chunk object without a replica on $n in 40 puts"
+    continue
+  fi
+  repaired_keys+=("$key")
+  victim="$(sql "SELECT min(node_id) FROM chunk_replicas WHERE chunk_id = '$cid'")"
+  corrupt_byte "$victim" "$cid" $((56 + 1000)) "$flipped" >/dev/null
+  OSCTL_READ_ORDER=listed "$osctl" get "$key" "$work/one6.out" 2>/dev/null || true
+  if wait_until $((2 * interval + margin)) "HEALTHY repair" \
+       "SELECT state || ' ' || origin FROM chunk_replicas WHERE chunk_id = '$cid' AND node_id = '$n'"; then
+    [[ "$(check_chunk_files "$n" "$cid")" == "OK $cid" ]] && ok "$n: a repair copy landed and verifies" \
+      || fail "$n: the repair copy fails verification"
+  else
+    fail "$n: no repair copy landed ($victim's replica: $(sql "SELECT state FROM chunk_replicas WHERE chunk_id = '$cid' AND node_id = '$victim'"))"
+  fi
+done
+
+# GC on every node: remove the objects; after the read grace their files are
+# deleted, and a chunk's rows go only when every node holding it confirms.
+keys_sql="$(printf "'%s'," "replication/after-swap-$run" "${repaired_keys[@]}")"
+keys_sql="${keys_sql%,}"
+sql "SELECT r.node_id || ' ' || r.chunk_id FROM keys k JOIN chunks c USING (object_id) JOIN chunk_replicas r USING (chunk_id)
+     WHERE k.key IN ($keys_sql)" | tr '|' ' ' > "$work/gc6"
+chunks_sql="$(awk '{printf "%s'\''%s'\''", (NR > 1 ? "," : ""), $2}' "$work/gc6")"
+holders="$(awk '{print $1}' "$work/gc6" | sort -u | paste -sd, -)"
+echo "   removing $(wc -l < "$work/gc6" | tr -d ' ') replica files on: $holders"
+[[ "$holders" == "node1,node2,node3,node4" ]] || fail "the removed objects' files are not on all four nodes: $holders"
+for k in "replication/after-swap-$run" "${repaired_keys[@]}"; do
+  "$osctl" rm "$k" >/dev/null 2>&1 || true
+done
+echo "   waiting for the read grace (${read_grace}s) and garbage collection"
+if wait_until $((read_grace + 3 * interval + margin)) 0 "SELECT count(*) FROM chunks WHERE chunk_id IN ($chunks_sql)"; then
+  left=""
+  for n in node1 node2 node3 node4; do
+    ids="$(awk -v n="$n" '$1 == n {print $2}' "$work/gc6")"
+    [[ -z "$ids" ]] && continue
+    # grep finds nothing when every file is gone: not an error.
+    left+="$(check_chunk_files "$n" $ids | { grep -v '^MISSING ' || true; } | sed "s/^/$n: /")"
+  done
+  [[ -z "$left" ]] && ok "garbage collection deleted the files on all four nodes, each confirmed by its node" \
+    || fail "files left after GC: $left"
+else
+  fail "chunk rows still present: deletions on $(sql "SELECT coalesce(string_agg(DISTINCT node_id, ','), 'no node') FROM pending_deletions WHERE chunk_id IN ($chunks_sql)") not confirmed"
+fi
+
+# Give node1 and node3 dynamic addresses again, or a later restart can find
+# its fixed address taken.
+unpin_ips node1 node3
+swapped=no
+wait_alive 4 || fail "not all nodes ALIVE after unpinning their addresses"
 
 finish

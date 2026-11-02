@@ -572,6 +572,23 @@ button.object-row:hover {
   min-height: 1.2em;
 }
 
+.bay-unreachable {
+  display: flex !important;
+  gap: 4px;
+  align-items: flex-start;
+  margin-top: 6px;
+  max-width: 18ch;
+  color: var(--suspect);
+  font-size: var(--t-small);
+  white-space: normal;
+}
+
+.bay-unreachable .glyph {
+  flex: none;
+  margin-top: 2px;
+  color: var(--suspect) !important;
+}
+
 .bay-head[data-state="ALIVE"] .glyph {
   color: var(--healthy);
 }

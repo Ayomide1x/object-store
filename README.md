@@ -105,7 +105,7 @@ Open <http://127.0.0.1:9081/> (or 9082) once the stack is up.
 *Above: during `scripts/demo.sh`, the stopped node is Dead (its bay hatched from card to last slot), and the chunks it held have been copied into the other bays as ◆ repair copies. The feed shows it going Suspect, then Dead, and the repair pass that found its chunks under-replicated. Also: [the same moment in the dark theme](docs/ui-demo-repair-dark.png), and [after the demo's corrupt step](docs/ui-demo-repaired.png), with a Bad copy whose chunk has been repaired, and the node back with its old copies (4, target 3).*
 
 - **Placement:** pick an object and every chunk is a row and every node a column (a bay). Each copy shows as ■ Healthy, ◆ Repair copy, ✕ Bad, or a dotted No copy, with the word next to the glyph, and each row says how many copies count toward the 3-replica target, by the reconciler's own rule.
-- **Cluster:** node cards with their liveness (● Alive, ◐ Suspect, ○ Dead, for how long), a sentence with the under-replicated and pending-deletion counts, and an activity feed of liveness transitions and repair and cleanup passes. It polls every 2 s while the tab is visible.
+- **Cluster:** node cards with their liveness (● Alive, ◐ Suspect, ○ Dead, for how long, and "Alive, but unreachable" when the coordinator's own calls to a node are failing), a sentence with the under-replicated and pending-deletion counts, and an activity feed of liveness transitions and repair and cleanup passes. It polls every 2 s while the tab is visible.
 - **Objects:** upload (button or drag and drop, with progress), download, list by prefix with paging, stat, and delete with a confirmation.
 - **Observe-only:** nothing in the UI stops a node, starts a pass or changes the cluster.
 - **Accessible:** every state is a glyph and a word (never colour alone), everything works from the keyboard with a visible focus ring, light and dark themes, and reduced motion respected.
@@ -150,7 +150,7 @@ These hold at every stage after the one that introduced them; code that would br
 | Layer | What | Run |
 |---|---|---|
 | Go unit tests | node chunk store (durability order, tombstones, crash recovery), node RPCs, heartbeats, client upload and failover; gateway handlers against a fake coordinator and fake nodes (411/413, key encoding, the error mapping, the caps, streaming both ways, the mid-stream abort, disconnects and stalls, the Host and cross-origin checks, Content-Disposition, the embedded UI's headers, the health probe) | `go test ./...` |
-| Coordinator integration tests | 118 tests against a real Postgres (Testcontainers) and in-process fake nodes: the commit protocol, bad-replica reports, liveness, repair, GC, listing pagination, the node address set, cluster status and its cache, per-chunk counted replicas, the liveness event log (including a failing and a hanging event store) | `cd coordinator && ./gradlew test` |
+| Coordinator integration tests | 126 tests against a real Postgres (Testcontainers) and in-process fake nodes: the commit protocol, bad-replica reports, liveness, repair, GC, listing pagination, the node address set, cluster status and its cache, per-chunk counted replicas, the liveness event log (including a failing and a hanging event store), and node channels that get stuck after an address change (real gRPC servers, a DNS the test controls) | `cd coordinator && ./gradlew test` |
 | Web unit tests | Vitest: key encoding, the grid derivation, upload messages, the poller (no overlap, paused when hidden, backoff), the feed, keys rendered as text; plus lint rules that keep keys out of markup and object bytes out of JavaScript | `cd web && npm test && npm run lint` |
 | Browser tests | Playwright against the real stack: the UI follows `demo.sh` (Suspect, Dead, repair, Bad, repaired), browser and `osctl` round trips both ways, paging and delete, a corrupted replica, a broken download | `scripts/stage11-ui-check.sh` |
 | Acceptance scripts | one per stage, against the real Compose stack; each checks what actually happened on disk and in Postgres, and fails as inconclusive rather than passing on a run that didn't test anything | below |
@@ -160,7 +160,7 @@ These hold at every stage after the one that introduced them; code that would br
 |---|---|
 | `stage2-roundtrip.sh`, `stage2-overwrite-check.sh` | 0 B / 1 B / 4 MiB / 100 MiB round trips; a get during overwrites sees the old or the new object, never a mix |
 | `stage3-corrupt-check.sh`, `stage3-crash-check.sh`, `stage3-fsync-trace.sh` | a flipped byte fails the get loudly; a node killed mid-write leaves no partial file; the fsync order, traced |
-| `stage4-replication-check.sh` | 3 replicas per chunk; uploads with a node stopped or hung; clean failure with too few nodes |
+| `stage4-replication-check.sh` | 3 replicas per chunk; uploads with a node stopped or hung; clean failure with too few nodes; after a forced IP swap between two nodes, uploads, repair and GC reach every node |
 | `stage5-failover-check.sh` | reads fail over and the bad replica is marked, only on its node's word |
 | `stage6-liveness-check.sh` | ALIVE → SUSPECT → DEAD → ALIVE within the configured windows |
 | `stage7-repair-check.sh` | every chunk of a stopped node gets back to 3 replicas; a target killed mid-copy leaves nothing partial |

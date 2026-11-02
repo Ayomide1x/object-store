@@ -1,11 +1,11 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
-@@ -150,7 +150,7 @@
-         try {
-             return call.apply(stub(node, deadline));
+@@ -274,7 +274,7 @@
+             return call.apply(StorageNodeServiceGrpc.newBlockingStub(ch).withDeadline(deadline));
          } catch (StatusRuntimeException e) {
--            if (e.getStatus().getCode() != Status.Code.UNAVAILABLE || deadline.isExpired()) {
+             boolean unavailable = e.getStatus().getCode() == Status.Code.UNAVAILABLE;
+-            if (!retryUnavailable || !unavailable || deadline.isExpired()) {
 +            if (true) {
-                 throw e;
-             }
-             // The cached channel may hold a stale address or a dead connection.
+                 failed(nc);
+                 if (unavailable) {
+                     // No retry here, but the next call gets a fresh channel.

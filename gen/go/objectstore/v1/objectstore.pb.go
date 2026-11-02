@@ -1357,8 +1357,15 @@ type NodeStatus struct {
 	LivenessSinceUnixMillis int64 `protobuf:"varint,3,opt,name=liveness_since_unix_millis,json=livenessSinceUnixMillis,proto3" json:"liveness_since_unix_millis,omitempty"`
 	// The last persisted heartbeat (persisted at most every 10 s); 0 if none.
 	LastHeartbeatUnixMillis int64 `protobuf:"varint,4,opt,name=last_heartbeat_unix_millis,json=lastHeartbeatUnixMillis,proto3" json:"last_heartbeat_unix_millis,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Times the coordinator replaced its channel to this node since it started
+	// (the channel was not ready, or calls failed UNAVAILABLE).
+	ChannelReplacements int64 `protobuf:"varint,5,opt,name=channel_replacements,json=channelReplacements,proto3" json:"channel_replacements,omitempty"`
+	// The coordinator's calls to this node that failed in the last minute. A
+	// node can be ALIVE (its heartbeats arrive) yet unreachable from the
+	// coordinator; this is where that shows.
+	RecentCallFailures int32 `protobuf:"varint,6,opt,name=recent_call_failures,json=recentCallFailures,proto3" json:"recent_call_failures,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NodeStatus) Reset() {
@@ -1415,6 +1422,20 @@ func (x *NodeStatus) GetLivenessSinceUnixMillis() int64 {
 func (x *NodeStatus) GetLastHeartbeatUnixMillis() int64 {
 	if x != nil {
 		return x.LastHeartbeatUnixMillis
+	}
+	return 0
+}
+
+func (x *NodeStatus) GetChannelReplacements() int64 {
+	if x != nil {
+		return x.ChannelReplacements
+	}
+	return 0
+}
+
+func (x *NodeStatus) GetRecentCallFailures() int32 {
+	if x != nil {
+		return x.RecentCallFailures
 	}
 	return 0
 }
@@ -3569,13 +3590,15 @@ const file_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x120\n" +
 	"\x04from\x18\x03 \x01(\x0e2\x1c.objectstore.v1.NodeLivenessR\x04from\x12,\n" +
 	"\x02to\x18\x04 \x01(\x0e2\x1c.objectstore.v1.NodeLivenessR\x02to\x12$\n" +
-	"\x0eat_unix_millis\x18\x05 \x01(\x03R\fatUnixMillis\"\xd9\x01\n" +
+	"\x0eat_unix_millis\x18\x05 \x01(\x03R\fatUnixMillis\"\xbe\x02\n" +
 	"\n" +
 	"NodeStatus\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x128\n" +
 	"\bliveness\x18\x02 \x01(\x0e2\x1c.objectstore.v1.NodeLivenessR\bliveness\x12;\n" +
 	"\x1aliveness_since_unix_millis\x18\x03 \x01(\x03R\x17livenessSinceUnixMillis\x12;\n" +
-	"\x1alast_heartbeat_unix_millis\x18\x04 \x01(\x03R\x17lastHeartbeatUnixMillis\"\x97\x03\n" +
+	"\x1alast_heartbeat_unix_millis\x18\x04 \x01(\x03R\x17lastHeartbeatUnixMillis\x121\n" +
+	"\x14channel_replacements\x18\x05 \x01(\x03R\x13channelReplacements\x120\n" +
+	"\x14recent_call_failures\x18\x06 \x01(\x05R\x12recentCallFailures\"\x97\x03\n" +
 	"\n" +
 	"RepairPass\x12\x17\n" +
 	"\apass_id\x18\x01 \x01(\x03R\x06passId\x123\n" +

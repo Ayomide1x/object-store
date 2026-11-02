@@ -95,6 +95,10 @@ type nodeJSON struct {
 	Liveness                string `json:"liveness"`
 	LivenessSinceUnixMillis int64  `json:"liveness_since_unix_millis"`
 	LastHeartbeatUnixMillis int64  `json:"last_heartbeat_unix_millis"`
+	// How the coordinator's own calls to the node are going: a node can be
+	// ALIVE (heartbeats arrive) yet unreachable from the coordinator.
+	ChannelReplacements int64 `json:"channel_replacements"`
+	RecentCallFailures  int32 `json:"recent_call_failures"`
 }
 
 type repairPassJSON struct {
@@ -170,7 +174,8 @@ func toClusterResponse(r *objectstorev1.GetClusterStatusResponse) clusterRespons
 		RecentLivenessEvents: []livenessEventJSON{}, LivenessEventsDropped: r.GetLivenessEventsDropped()}
 	for _, n := range r.GetNodes() {
 		out.Nodes = append(out.Nodes, nodeJSON{NodeID: n.GetNodeId(), Liveness: liveness(n.GetLiveness()),
-			LivenessSinceUnixMillis: n.GetLivenessSinceUnixMillis(), LastHeartbeatUnixMillis: n.GetLastHeartbeatUnixMillis()})
+			LivenessSinceUnixMillis: n.GetLivenessSinceUnixMillis(), LastHeartbeatUnixMillis: n.GetLastHeartbeatUnixMillis(),
+			ChannelReplacements: n.GetChannelReplacements(), RecentCallFailures: n.GetRecentCallFailures()})
 	}
 	if r.GetLastRepairPass() != nil {
 		p := toRepairPass(r.GetLastRepairPass())

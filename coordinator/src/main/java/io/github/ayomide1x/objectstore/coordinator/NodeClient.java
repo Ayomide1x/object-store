@@ -7,7 +7,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -28,6 +33,7 @@ import io.github.ayomide1x.objectstore.v1.StatChunksResponse;
 import io.github.ayomide1x.objectstore.v1.StorageNodeServiceGrpc;
 import io.github.ayomide1x.objectstore.v1.VerifyChunkRequest;
 import io.github.ayomide1x.objectstore.v1.VerifyChunkResponse;
+import io.grpc.ConnectivityState;
 import io.grpc.Deadline;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -41,6 +47,23 @@ import org.springframework.stereotype.Component;
 /**
  * Calls storage nodes on their internal addresses. Channels are cached per
  * address; they are only connections, rebuilt on demand (invariant 7).
+ *
+ * <p>A channel can get stuck: not READY, yet never failing, so calls wait out
+ * their deadline (DEADLINE_EXCEEDED, never UNAVAILABLE) on a connection that
+ * will never come. grpc-java's pick_first can do this when a node's address
+ * changes during a reconnect (grpc-java issue 12395), and a peer that accepts
+ * TCP but never speaks gRPC does it too. So before every call the channel
+ * gets half the call's deadline to be READY; if it isn't, it is replaced (a
+ * new channel resolves the address afresh) and the call runs on the new one
+ * with the rest of its deadline. That replacement is rate-limited per node
+ * ({@code COORDINATOR_NODE_CHANNEL_REPLACE_INTERVAL}). A call that fails
+ * UNAVAILABLE, a definite and cheap signal, always gets its replacement (and
+ * one retry), as since stage 4: a refusing node's churn is bounded by DEAD
+ * detection, since calls to DEAD nodes stop, and a node that restarted on a
+ * new address is reached by the first call after it returns. Every
+ * replacement is single-flight per node (concurrent calls that find the same
+ * stale channel replace it once and all use the new one), logged at WARN and
+ * counted; the old channel is shut down, then forced down after a grace.
  *
  * <p>Two rules apply to every node response the coordinator records facts
  * from:
@@ -59,13 +82,43 @@ public class NodeClient implements DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(NodeClient.class);
 
+    /** How long failed calls count toward a node's recent_call_failures. */
+    static final Duration FAILURE_WINDOW = Duration.ofMinutes(1);
+
     private final Duration timeout;
     private final Duration copyTimeout;
-    private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+    private final long replaceIntervalNanos;
+    private final Map<String, NodeChannel> channels = new ConcurrentHashMap<>();
+    /** Every channel created and not yet terminated, replaced ones included. */
+    private final Set<ManagedChannel> live = ConcurrentHashMap.newKeySet();
+    /** Channels ever created. For tests. */
+    private final java.util.concurrent.atomic.AtomicLong created = new java.util.concurrent.atomic.AtomicLong();
+    private final ScheduledExecutorService reaper = Executors.newSingleThreadScheduledExecutor(
+            r -> Thread.ofPlatform().daemon().name("node-channel-reaper").unstarted(r));
+
+    /** Per-node channel statistics, for GetClusterStatus. */
+    public record ChannelStats(long replacements, int recentFailures) {
+    }
+
+    /** One node address's channel, and what has happened to it. */
+    private final class NodeChannel {
+        final String addr;
+        volatile ManagedChannel channel;
+        // Guarded by this.
+        long lastNotReadyReplacementNanos = Long.MIN_VALUE;
+        long replacements;
+        final Deque<Long> failures = new ArrayDeque<>();
+
+        NodeChannel(String addr) {
+            this.addr = addr;
+            this.channel = newChannel(addr);
+        }
+    }
 
     public NodeClient(CoordinatorProperties properties) {
         this.timeout = properties.nodeRpcTimeout();
         this.copyTimeout = properties.copyTimeout();
+        this.replaceIntervalNanos = properties.nodeChannelReplaceInterval().toNanos();
     }
 
     /**
@@ -82,7 +135,7 @@ public class NodeClient implements DisposableBean {
                 .setTargetNodeId(target.nodeId())
                 .setTargetAddress(target.internalAddr())
                 .build();
-        return StorageNodeServiceGrpc.newBlockingStub(channel(source)).withDeadline(deadline).pushChunk(req);
+        return call(source, deadline, "PushChunk", stub -> stub.pushChunk(req), false);
     }
 
     /**
@@ -204,10 +257,29 @@ public class NodeClient implements DisposableBean {
 
     private <T> T callWithRetry(Node node, Deadline deadline, String rpc,
             Function<StorageNodeServiceGrpc.StorageNodeServiceBlockingStub, T> call) {
+        return call(node, deadline, rpc, call, true);
+    }
+
+    /**
+     * Runs one call to node. First the channel gets half the remaining
+     * deadline to be READY, and is replaced if it isn't. Then the call runs;
+     * on UNAVAILABLE (with retry), the channel is replaced and the call
+     * retried once, within the same deadline. Failures are counted.
+     */
+    private <T> T call(Node node, Deadline deadline, String rpc,
+            Function<StorageNodeServiceGrpc.StorageNodeServiceBlockingStub, T> call, boolean retryUnavailable) {
+        NodeChannel nc = channels.computeIfAbsent(node.internalAddr(), NodeChannel::new);
+        ManagedChannel ch = ready(node, nc, deadline);
         try {
-            return call.apply(stub(node, deadline));
+            return call.apply(StorageNodeServiceGrpc.newBlockingStub(ch).withDeadline(deadline));
         } catch (StatusRuntimeException e) {
-            if (e.getStatus().getCode() != Status.Code.UNAVAILABLE || deadline.isExpired()) {
+            boolean unavailable = e.getStatus().getCode() == Status.Code.UNAVAILABLE;
+            if (!retryUnavailable || !unavailable || deadline.isExpired()) {
+                failed(nc);
+                if (unavailable) {
+                    // No retry here, but the next call gets a fresh channel.
+                    replace(node, nc, ch, ConnectivityState.TRANSIENT_FAILURE, 0, false);
+                }
                 throw e;
             }
             // The cached channel may hold a stale address or a dead connection.
@@ -216,29 +288,150 @@ public class NodeClient implements DisposableBean {
                     .addKeyValue("node_id", node.nodeId())
                     .addKeyValue("addr", node.internalAddr())
                     .log("{} UNAVAILABLE; resetting channel and retrying once: {}", rpc, e.getStatus());
-            resetChannel(node);
-            return call.apply(stub(node, deadline));
+            ManagedChannel fresh = replace(node, nc, ch, ConnectivityState.TRANSIENT_FAILURE, 0, false);
+            try {
+                return call.apply(StorageNodeServiceGrpc.newBlockingStub(fresh).withDeadline(deadline));
+            } catch (StatusRuntimeException retryFailure) {
+                failed(nc);
+                throw retryFailure;
+            }
         }
     }
 
-    private StorageNodeServiceGrpc.StorageNodeServiceBlockingStub stub(Node node, Deadline deadline) {
-        return StorageNodeServiceGrpc.newBlockingStub(channel(node)).withDeadline(deadline);
+    /**
+     * The channel to call node on: the cached one if it is READY, or becomes
+     * READY within half the remaining deadline; otherwise a replacement
+     * (rate-limited). A channel in TRANSIENT_FAILURE is returned as it is: the
+     * call fails fast on it with UNAVAILABLE, which replaces it without limit.
+     */
+    private ManagedChannel ready(Node node, NodeChannel nc, Deadline deadline) {
+        ManagedChannel ch = nc.channel;
+        long start = System.nanoTime();
+        long budget = deadline.timeRemaining(TimeUnit.NANOSECONDS) / 2;
+        ConnectivityState state = ch.getState(true); // true: an IDLE channel starts connecting
+        while (state != ConnectivityState.READY && state != ConnectivityState.TRANSIENT_FAILURE
+                && state != ConnectivityState.SHUTDOWN) {
+            long left = budget - (System.nanoTime() - start);
+            if (left <= 0) {
+                break;
+            }
+            CountDownLatch changed = new CountDownLatch(1);
+            ch.notifyWhenStateChanged(state, changed::countDown);
+            try {
+                changed.await(left, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            state = ch.getState(false);
+        }
+        if (state == ConnectivityState.READY || state == ConnectivityState.TRANSIENT_FAILURE) {
+            return ch;
+        }
+        return replace(node, nc, ch, state, System.nanoTime() - start, true);
     }
 
-    private ManagedChannel channel(Node node) {
-        return channels.computeIfAbsent(node.internalAddr(),
-                addr -> ManagedChannelBuilder.forTarget(addr).usePlaintext().build());
+    /**
+     * Replaces nc's channel if it is still stale, and returns the channel to
+     * use. Single-flight: callers that found the same stale channel get the
+     * one replacement. rateLimited (a channel not ready in time): at most one
+     * such replacement per replace interval per node; UNAVAILABLE replacements
+     * are never limited.
+     */
+    private ManagedChannel replace(Node node, NodeChannel nc, ManagedChannel stale, ConnectivityState state,
+            long notReadyNanos, boolean rateLimited) {
+        ManagedChannel fresh;
+        long replacements;
+        synchronized (nc) {
+            if (nc.channel != stale) {
+                return nc.channel; // another call already replaced it
+            }
+            long now = System.nanoTime();
+            if (rateLimited && nc.lastNotReadyReplacementNanos != Long.MIN_VALUE
+                    && now - nc.lastNotReadyReplacementNanos < replaceIntervalNanos) {
+                return stale; // replaced recently for the same reason: a node that never connects isn't churned
+            }
+            fresh = newChannel(nc.addr);
+            nc.channel = fresh;
+            if (rateLimited) {
+                nc.lastNotReadyReplacementNanos = now;
+            }
+            replacements = ++nc.replacements;
+        }
+        log.atWarn()
+                .addKeyValue("node_id", node.nodeId())
+                .addKeyValue("addr", nc.addr)
+                .addKeyValue("channel_state", state)
+                .addKeyValue("not_ready_ms", TimeUnit.NANOSECONDS.toMillis(notReadyNanos))
+                .addKeyValue("replacements", replacements)
+                .addKeyValue("reason", rateLimited ? "not ready in time" : "UNAVAILABLE")
+                .log("node channel replaced: it was {} for {} ms", state, TimeUnit.NANOSECONDS.toMillis(notReadyNanos));
+        retire(stale);
+        return fresh;
     }
 
-    private void resetChannel(Node node) {
-        ManagedChannel old = channels.remove(node.internalAddr());
-        if (old != null) {
+    /** Shuts a replaced channel down: in-flight calls get a grace (one node RPC deadline), then it is forced. */
+    private void retire(ManagedChannel old) {
+        old.shutdown();
+        reaper.schedule(() -> {
             old.shutdownNow();
+            try {
+                old.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (old.isTerminated()) {
+                live.remove(old);
+            }
+        }, timeout.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    private ManagedChannel newChannel(String addr) {
+        ManagedChannel ch = ManagedChannelBuilder.forTarget(addr).usePlaintext().build();
+        live.add(ch);
+        created.incrementAndGet();
+        return ch;
+    }
+
+    private void failed(NodeChannel nc) {
+        long now = System.nanoTime();
+        synchronized (nc) {
+            nc.failures.addLast(now);
+            prune(nc, now);
         }
+    }
+
+    private static void prune(NodeChannel nc, long now) {
+        while (!nc.failures.isEmpty() && now - nc.failures.peekFirst() > FAILURE_WINDOW.toNanos()) {
+            nc.failures.removeFirst();
+        }
+    }
+
+    /** Channel replacements since this coordinator started, and failed calls in the last minute, for node. */
+    public ChannelStats stats(Node node) {
+        NodeChannel nc = channels.get(node.internalAddr());
+        if (nc == null) {
+            return new ChannelStats(0, 0);
+        }
+        synchronized (nc) {
+            prune(nc, System.nanoTime());
+            return new ChannelStats(nc.replacements, nc.failures.size());
+        }
+    }
+
+    /** Channels created and not yet terminated, replaced ones included. For tests. */
+    int liveChannels() {
+        return live.size();
+    }
+
+    /** Channels ever created. For tests. */
+    long createdChannels() {
+        return created.get();
     }
 
     @Override
     public void destroy() {
-        channels.values().forEach(ManagedChannel::shutdownNow);
+        reaper.shutdownNow();
+        live.forEach(ManagedChannel::shutdownNow);
     }
 }

@@ -116,11 +116,12 @@ class GatewayRpcIT {
     private final LivenessEventLog eventLog;
     private final MetadataRepository repository;
     private final LivenessTracker tracker;
+    private final NodeClient nodeClient;
 
     @Autowired
     GatewayRpcIT(CoordinatorGrpcService grpc, MetadataService metadata, LivenessService liveness, RepairService repair,
             CoordinatorProperties properties, JdbcClient jdbc, LivenessEventLog eventLog, MetadataRepository repository,
-            LivenessTracker tracker) {
+            LivenessTracker tracker, NodeClient nodeClient) {
         this.grpc = grpc;
         this.metadata = metadata;
         this.liveness = liveness;
@@ -130,6 +131,7 @@ class GatewayRpcIT {
         this.eventLog = eventLog;
         this.repository = repository;
         this.tracker = tracker;
+        this.nodeClient = nodeClient;
     }
 
     @BeforeEach
@@ -561,12 +563,12 @@ class GatewayRpcIT {
     /** This test's own ClusterStatusService, with the given cache TTL and the fake clock. */
     private ClusterStatusService withCacheTtl(Duration ttl) {
         CoordinatorProperties p = properties;
-        return new ClusterStatusService(repository, repair, tracker, eventLog, clock, new CoordinatorProperties(
+        return new ClusterStatusService(repository, repair, tracker, eventLog, clock, nodeClient, new CoordinatorProperties(
                 p.nodes(), p.nodeRpcTimeout(), p.suspectAfter(), p.deadAfter(), p.recoveryBeats(), p.livenessSweep(),
                 p.repairGrace(), p.repairInterval(), p.repairMaxInflight(), p.repairMaxPerNode(), p.copyTimeout(),
                 p.repairPassRetention(), p.gcInterval(), p.gcReadGrace(), p.gcPendingTimeout(), p.gcBatch(),
                 p.gcMaxInflight(), p.gcMaxPerNode(), p.gcPassRetention(), ttl, p.livenessEventRetention(),
-                p.livenessEventWriter()));
+                p.livenessEventWriter(), p.nodeChannelReplaceInterval()));
     }
 
     /**
@@ -596,5 +598,33 @@ class GatewayRpcIT {
         assertThat(uncached.status(0, 0).counts().underReplicatedChunks()).isZero();
         markBad(one.chunkId(), one.placed().get(0));
         assertThat(uncached.status(0, 0).counts().underReplicatedChunks()).isEqualTo(1);
+    }
+
+    /**
+     * A node whose heartbeats arrive (ALIVE) but which fails the coordinator's
+     * calls shows it in GetClusterStatus: its recent call failures, and the
+     * channel replacements those failures caused.
+     */
+    @Test
+    void aliveButUnreachableNodesShowTheirCallFailures() {
+        One one = commitOneChunk("unreachable");
+        String sick = one.placed().get(0);
+        Node sickNode = properties.parseNodes().stream().filter(n -> n.nodeId().equals(sick)).findFirst().orElseThrow();
+        NodeStatus before = nodeStatus(sick);
+        nodes.get(sick).mode = FakeNodes.Mode.FAIL; // UNAVAILABLE on every call, heartbeats still arrive
+
+        Map<String, ?> answered = nodeClient.statChunks(UUID.randomUUID(), Map.of(sickNode, List.of(one.chunkId())));
+
+        assertThat(answered).isEmpty();
+        NodeStatus after = nodeStatus(sick);
+        assertThat(after.getLiveness()).isEqualTo(NodeLiveness.NODE_LIVENESS_ALIVE);
+        assertThat(after.getRecentCallFailures() - before.getRecentCallFailures()).as("the failed call is counted")
+                .isEqualTo(1);
+        assertThat(after.getChannelReplacements())
+                .as("UNAVAILABLE replaced the channel (now, or within the last replace interval)").isPositive();
+    }
+
+    private NodeStatus nodeStatus(String node) {
+        return status().getNodesList().stream().filter(n -> n.getNodeId().equals(node)).findFirst().orElseThrow();
     }
 }

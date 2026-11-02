@@ -327,7 +327,8 @@ func (c *fakeCoordinator) GetClusterStatus(context.Context, *objectstorev1.GetCl
 			{EventId: 1, NodeId: "node2", To: objectstorev1.NodeLiveness_NODE_LIVENESS_UNKNOWN, AtUnixMillis: 98},
 		}}
 	for _, n := range c.nodes {
-		resp.Nodes = append(resp.Nodes, &objectstorev1.NodeStatus{NodeId: n.id, Liveness: objectstorev1.NodeLiveness_NODE_LIVENESS_ALIVE})
+		resp.Nodes = append(resp.Nodes, &objectstorev1.NodeStatus{NodeId: n.id, Liveness: objectstorev1.NodeLiveness_NODE_LIVENESS_ALIVE,
+			ChannelReplacements: int64(len(resp.Nodes)), RecentCallFailures: int32(len(resp.Nodes) * 2)})
 	}
 	return resp, nil
 }

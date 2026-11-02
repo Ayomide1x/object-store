@@ -1962,3 +1962,84 @@ Measured after the change, 10 stage 4 runs in a row on a fresh stack:
 - **Step 3** failed once: the repair copy described above. That is what led to the step 3 change.
 - **An earlier batch of 10 was discarded:** at 20:10:10Z a `docker compose down -v && up --build`, started by hand in another terminal while the runs were going, stopped and recreated the whole stack mid-run. Runs 4 and 5 of that batch failed on operations the script never issued.
 **Breaks if:** placement stops being uniform over starts (say, weighted by load), so the coin is no longer fair and 2^(1−N) no longer holds; or a script's tool starts using exit 75.
+
+## A node channel that isn't ready within half the call's deadline is replaced; only that replacement is rate-limited (stage 11)
+**Amends:** "Coordinator DNS cache of about 1 s, plus channel reset and one retry on UNAVAILABLE" (stage 4).
+
+**Found:** in a run of the stage 4 script, after step 6 restarted the nodes and Docker reshuffled their IPs, the coordinator stopped recording node3's replicas, for good. Evidence taken from the stuck process before any reset:
+- **Logs:** every StatChunks and DeleteChunks call to node3 ended in DEADLINE_EXCEEDED, with `connecting_and_lb_delay … was_still_waiting` and no remote address.
+- **The JVM's own resolver** (read with a read-only agent loaded through `jcmd`) returned node3's current address. Its DNS cache lifetime is 1 s.
+- **gRPC's channelz:** the node3 channel was CONNECTING, while its only subchannel, already at the right address, was IDLE with 0 calls.
+- **Sockets:** a 26 s sample across two calls showed no connection to the node at all, not even an attempt.
+
+The channel's load balancer (pick_first) believed it was connecting, and nothing ever asked the subchannel to connect. This matches grpc-java issue 12395: pick_first stuck after a backend's address changes mid-reconnect. Its proposed fix, PR 12403, is still open and unmerged. Releases 1.84.2 through 1.85.1 contain nothing for it (1.85.0's #12832 is an xDS-only IDLE fix), so grpc-java stays at 1.84.1.
+
+**Why the stage 4 fix didn't recover:**
+- It replaces the channel only on UNAVAILABLE. A stuck channel never fails: calls wait for a ready connection until their deadline, so they end in DEADLINE_EXCEEDED.
+- DNS was already right, so re-resolution was not the problem.
+- The only built-in way out is the channel's 30-minute idle timeout, and GC calls every node every 10 s, so the channel was never idle.
+
+**Chose:** before every node call (StatChunks, VerifyChunk, DeleteChunks and, newly, PushChunk), `NodeClient` gives the channel half the call's remaining deadline to be READY. That is 1 s of the 2 s node deadline and 15 s of the 30 s copy deadline.
+- **READY channel:** the call goes straight through with its full deadline, so a slow but healthy node keeps its 2 s and no request is ever sent twice.
+- **Not READY in time:** the channel is replaced. The new channel resolves the address afresh and starts with fresh load-balancer state, and the call runs on it with the rest of its deadline.
+- **Already in TRANSIENT_FAILURE:** no waiting and no replacement up front. The call fails fast with UNAVAILABLE and takes the UNAVAILABLE path.
+- **UNAVAILABLE replaces the channel and retries once, never rate-limited,** exactly as since stage 4. UNAVAILABLE is a definite, cheap signal. A refusing node's churn is bounded by DEAD detection, because calls to DEAD nodes stop. PushChunk has no retry; on UNAVAILABLE it still replaces the channel, so the next copy gets a fresh one.
+- **Single-flight per node, for every replacement:** under a per-node lock, a caller replaces the channel only if it is still the one it found stale. Concurrent callers get the one replacement and all use it.
+- **Rate-limited per node, only when the channel wasn't ready in time:** at most one such replacement per `COORDINATOR_NODE_CHANNEL_REPLACE_INTERVAL` (5 s), so a node that accepts connections but never answers isn't churned. Why 5 s:
+  - longer than one node deadline (2 s), so one slow call can't cause two replacements;
+  - shorter than SUSPECT_AFTER (6 s), so a stuck channel to a healthy node heals before the node could even look suspect.
+- **The first version applied the rate limit to every replacement. It broke stage 4.** In the first stage 4 run against it, uploads right after step 6a's restart (and after 6b's swap) failed with "node1: no answer; node3: no answer". The sequence:
+  1. While node1 and node3 were stopped, the coordinator called them, and their failing channels were replaced, at 21:39:17.6.
+  2. The nodes returned on new addresses about 2 s later.
+  3. The next upload's call got UNAVAILABLE, but its replace-and-retry was refused because the last replacement was under 5 s old. It retried on the stale channel and failed.
+
+  A down node and a node just restarted on a new address look the same until a call succeeds, so a time window on the UNAVAILABLE path blocks one of them. Resetting the window when a node's first heartbeat arrives was rejected: it would fail the first call to a node that restarted before its first heartbeat, a case the stage 4 code handled.
+- **Shut down properly:** a replaced channel gets `shutdown()`, then `shutdownNow()` one node deadline (2 s) later, so calls in flight on it get their grace. On a channel that wasn't ready, they had no connection to wait for anyway.
+- **Visible:**
+  - each replacement is logged at WARN with the node, the channel's state and how long it wasn't ready;
+  - `GetClusterStatus` gains, per node, `channel_replacements` since start (field 5) and `recent_call_failures` in the last minute (field 6), both additive;
+  - `/cluster` passes them on;
+  - the UI's node card says "Alive, but unreachable: N failed calls from the coordinator in the last minute; reconnected M times", with the counts in `data-call-failures` and `data-channel-replacements`.
+
+**Reproduction.** A forced IP swap (`scripts/lib/ipswap.sh`: stop two nodes, give each the other's address, start them) is deterministic, but ten such swaps did not get the old code stuck, five of them with calls made while the nodes were down. The stuck state needs a race inside grpc-java: the new address must arrive while a reconnect is in flight. So the deterministic proof lives in `NodeAddressChangeTest`, against real gRPC servers and a DNS the test controls (`TestDns`, installed through the JDK's resolver plug-in interface):
+- **The regression gate,** `aChannelThatNeverBecomesReadyIsReplaced`, is deterministic. The node moves, and something that accepts TCP but never speaks HTTP/2 takes its old address while DNS still points there, so the channel connects to it and stays CONNECTING. Then DNS points to the node. The old code failed this 3 runs out of 3, with the live stack's exact signature, and never reached the node again. The fix recovers within one replace interval plus one call.
+- **Issue 12395's own sequence** (`callsReachTheNodeAfterItsAddressChangesMidReconnect`) stuck the old code in 4 runs out of 10. That depends on gRPC's internal thread timing, so it is kept as a second scenario, not as the gate.
+- **Further tests:**
+  - **Run 1's sequence, deterministic:** a not-ready replacement starts the window; the node goes down, refusing connections at its old address, and is called; then it returns on a new address inside a 5-minute window. The first call after it returns must reach it. The first version fails this.
+  - **A refusing node:** 5 calls create at most 5 new channels, count 5 failures, and leave exactly 1 channel open once the grace has passed.
+  - **Single-flight:** 8 concurrent calls on a stuck channel cause exactly 1 replacement, with the rate limit off, so single-flight alone holds it.
+  - **Rate limit:** 3 calls to a never-ready node over about 6 s cause 1 or 2 replacements, never 3.
+  - **No leak:** repeated replacements leave exactly 1 channel open once the grace has passed.
+  - **Visibility:** an ALIVE node failing calls shows its failures and replacements in `GetClusterStatus`.
+- **Mutations, each caught by its named test:**
+
+  | Mutation | Change | Caught by |
+  |---|---|---|
+  | S12 | the readiness check is removed | `aChannelThatNeverBecomesReadyIsReplaced` |
+  | S13 | replacement is not single-flight | `concurrentCallsOnAStuckChannelReplaceItOnce` |
+  | S14 | no rate limit | `replacementIsRateLimitedPerNode` |
+  | S15 | the rate limit applies to the UNAVAILABLE path again: the first version | `theFirstCallAfterANodeReturnsOnANewAddressSucceedsWithinTheWindow` |
+
+  U13 (an Alive node's failed calls hidden on the card) is caught by the `reachabilityNote` unit test.
+
+**Stage 4 step 6** now forces a node1↔node3 swap. Then every node must be reachable for every kind of call:
+- an upload records replicas on every placed node;
+- for each node in turn, a chunk it lacks is made under-replicated (one replica corrupted and read, so it is marked BAD) and repaired onto it;
+- the objects are removed, and garbage collection deletes their files on all four nodes, each deletion confirmed by its node.
+
+The restart smoke test stays as step 6a.
+
+**The Go side, checked, not changed.** Six forced swaps with uploads and downloads through gateway1, three of them with PUTs while the nodes were down, all recovered: PUT 200 with every placed replica recorded, GET byte-identical. The Go code opens a fresh connection for every replica write and every replica read, so it holds no long-lived channel to a node that could get stuck. Its only long-lived channel is each node's heartbeat connection to the coordinator, whose address doesn't change here.
+
+**Over:**
+- **Replacing on every DEADLINE_EXCEEDED:** a slow but healthy node would lose its connection each time, and the call that hit the problem would still fail.
+- **A new channel for every call:** no stale state ever, but a TCP and HTTP/2 handshake per call. It's the fallback if this proves fragile.
+- **Upgrading grpc-java and waiting for the upstream fix:** it hasn't shipped, and the fix would defend only against that one bug.
+- **`enterIdle()`:** experimental API, doing the same job as replacing the channel.
+- **A short idle timeout:** calls arrive every 10 s, so the channel would never go idle.
+- **Another load-balancing policy, or the flag that disables the new pick_first:** depends on internal switches.
+- **gRPC keepalive:** it would catch half-open connections (a node host lost without closing its sockets, which a network disconnect of a running container produces), but Go nodes refuse pings more often than every 5 minutes. That needs a node change, so it's left as a separate decision.
+
+**Because:** "ALIVE" comes from the node's heartbeats, but writes, repair and GC need the coordinator to reach the node. A channel that silently stops connecting turns a healthy node into a permanent hole in replica accounting. Metadata never overstates, but the coordinator under-counts forever, and repair keeps copying chunks the node already has.
+
+**Breaks if:** a call legitimately needs more than half its deadline just to connect, a slow path across regions rather than this LAN, so healthy channels get replaced. Or the half-open case starts happening in practice, which this doesn't cover without keepalive.

@@ -24,8 +24,13 @@ public class ClusterStatusService {
     static final int DEFAULT_RECENT_EVENTS = 20;
     static final int MAX_RECENT_EVENTS = 100;
 
-    /** One node: its liveness now, from the tracker, and its persisted times. */
-    public record NodeView(MetadataRepository.NodeRow row, LivenessTracker.State liveness) {
+    /**
+     * One node: its liveness now, from the tracker, its persisted times, and
+     * how the coordinator's own calls to it are going (a node can be ALIVE,
+     * its heartbeats arriving, yet unreachable from the coordinator).
+     */
+    public record NodeView(MetadataRepository.NodeRow row, LivenessTracker.State liveness,
+            NodeClient.ChannelStats channel) {
     }
 
     /** The cached counts, and when (wall clock) they were computed. */
@@ -44,6 +49,7 @@ public class ClusterStatusService {
     private final LivenessTracker liveness;
     private final LivenessEventLog eventLog;
     private final Ticker ticker;
+    private final NodeClient nodeClient;
     private final long cacheTtlNanos;
 
     // Guarded by this.
@@ -51,12 +57,13 @@ public class ClusterStatusService {
     private long cachedAtNanos;
 
     public ClusterStatusService(MetadataRepository repository, RepairService repair, LivenessTracker liveness,
-            LivenessEventLog eventLog, Ticker ticker, CoordinatorProperties properties) {
+            LivenessEventLog eventLog, Ticker ticker, NodeClient nodeClient, CoordinatorProperties properties) {
         this.repository = repository;
         this.repair = repair;
         this.liveness = liveness;
         this.eventLog = eventLog;
         this.ticker = ticker;
+        this.nodeClient = nodeClient;
         this.cacheTtlNanos = properties.statusCacheTtl().toNanos();
     }
 
@@ -70,8 +77,12 @@ public class ClusterStatusService {
     public Status status(int recentPasses, int recentEvents) {
         int passes = clamp("recent_passes", recentPasses, DEFAULT_RECENT_PASSES, MAX_RECENT_PASSES);
         int events = clamp("recent_events", recentEvents, DEFAULT_RECENT_EVENTS, MAX_RECENT_EVENTS);
+        java.util.Map<String, Node> registered = new java.util.HashMap<>();
+        repository.listNodes().forEach(n -> registered.put(n.nodeId(), n));
         List<NodeView> nodes = repository.listNodeRows().stream()
-                .map(r -> new NodeView(r, liveness.stateOf(r.nodeId())))
+                .map(r -> new NodeView(r, liveness.stateOf(r.nodeId()),
+                        registered.containsKey(r.nodeId()) ? nodeClient.stats(registered.get(r.nodeId()))
+                                : new NodeClient.ChannelStats(0, 0)))
                 .toList();
         return new Status(nodes, counts(),
                 repository.recentRepairPasses(1, false), repository.recentGcPasses(1, false),

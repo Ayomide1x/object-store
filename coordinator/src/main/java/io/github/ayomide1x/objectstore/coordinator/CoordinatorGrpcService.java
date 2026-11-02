@@ -203,7 +203,9 @@ public class CoordinatorGrpcService extends CoordinatorServiceGrpc.CoordinatorSe
             for (ClusterStatusService.NodeView n : st.nodes()) {
                 b.addNodes(NodeStatus.newBuilder().setNodeId(n.row().nodeId()).setLiveness(toProto(n.liveness()))
                         .setLivenessSinceUnixMillis(millis(n.row().stateChangedAt()))
-                        .setLastHeartbeatUnixMillis(millis(n.row().lastHeartbeatAt())));
+                        .setLastHeartbeatUnixMillis(millis(n.row().lastHeartbeatAt()))
+                        .setChannelReplacements(n.channel().replacements())
+                        .setRecentCallFailures(n.channel().recentFailures()));
             }
             st.lastRepairPass().forEach(p -> b.setLastRepairPass(toProto(p)));
             st.lastGcPass().forEach(p -> b.setLastGcPass(toProto(p)));

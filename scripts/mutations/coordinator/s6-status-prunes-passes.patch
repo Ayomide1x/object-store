@@ -1,6 +1,6 @@
 --- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ClusterStatusService.java
 +++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/ClusterStatusService.java
-@@ -66,8 +66,10 @@
+@@ -73,8 +73,10 @@
       * (liveness comes from memory, as everywhere); the counts may be up to the
       * cache TTL older, and say when they were computed.
       */
@@ -11,4 +11,4 @@
 +        repository.pruneGcPasses(java.time.Duration.ofDays(1));
          int passes = clamp("recent_passes", recentPasses, DEFAULT_RECENT_PASSES, MAX_RECENT_PASSES);
          int events = clamp("recent_events", recentEvents, DEFAULT_RECENT_EVENTS, MAX_RECENT_EVENTS);
-         List<NodeView> nodes = repository.listNodeRows().stream()
+         java.util.Map<String, Node> registered = new java.util.HashMap<>();

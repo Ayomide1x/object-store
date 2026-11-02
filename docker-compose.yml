@@ -160,6 +160,13 @@ services:
       # are written off the liveness path: a failed write drops the event,
       # never delays a transition. Pruned at the start of each repair pass:
       COORDINATOR_LIVENESS_EVENT_RETENTION: 24h
+      # Before each call to a node, the coordinator's channel to it gets half
+      # the call's deadline to be ready; if it isn't (a channel can get stuck
+      # after a node's address changes), it is replaced, at most once per this
+      # interval per node, so a node that is really down doesn't get a new
+      # channel on every call. Replacements and failed calls per node show in
+      # GET /cluster and on the UI's node cards:
+      COORDINATOR_NODE_CHANNEL_REPLACE_INTERVAL: 5s
     mem_limit: 768m
     memswap_limit: 768m
     ports:

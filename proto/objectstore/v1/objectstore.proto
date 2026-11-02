@@ -218,6 +218,13 @@ message NodeStatus {
   int64 liveness_since_unix_millis = 3;
   // The last persisted heartbeat (persisted at most every 10 s); 0 if none.
   int64 last_heartbeat_unix_millis = 4;
+  // Times the coordinator replaced its channel to this node since it started
+  // (the channel was not ready, or calls failed UNAVAILABLE).
+  int64 channel_replacements = 5;
+  // The coordinator's calls to this node that failed in the last minute. A
+  // node can be ALIVE (its heartbeats arrive) yet unreachable from the
+  // coordinator; this is where that shows.
+  int32 recent_call_failures = 6;
 }
 
 // A reconciler pass, as recorded in repair_passes.
