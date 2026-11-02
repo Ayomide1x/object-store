@@ -28,8 +28,13 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 # --return: asciinema exits with the demo's status, so a FAIL saves nothing.
 # asciicast v2: the format every agg and player version reads.
-if ! asciinema rec --return --overwrite --output-format asciicast-v2 --idle-time-limit 2 \
-  --window-size 100x34 --title "object store demo" --command "scripts/demo.sh" "$tmp/demo.cast"; then
+rc=0
+asciinema rec --return --overwrite --output-format asciicast-v2 --idle-time-limit 2 \
+  --window-size 100x34 --title "object store demo" --command "scripts/demo.sh" "$tmp/demo.cast" || rc=$?
+if ((rc == 75)); then
+  echo "record-demo: the demo was INCONCLUSIVE (a precondition didn't hold); nothing saved: rerun" >&2
+  exit 75
+elif ((rc != 0)); then
   echo "record-demo: the demo did not PASS; nothing saved" >&2
   exit 1
 fi

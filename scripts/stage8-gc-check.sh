@@ -58,6 +58,7 @@ trap restore EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -F' ' -c "$1"; }
 mkfile_mib() { head -c $(($2 << 20)) /dev/urandom > "$work/$1"; }
@@ -130,7 +131,7 @@ echo "   object $obj1: $st1; $(count_state "$work/f1" OK) of $(wc -l < "$work/p1
 if [[ "$st1" == PENDING && "$(count_state "$work/f1" OK)" -gt 0 && "$(count_state "$work/f1" MISSING)" -gt 0 ]]; then
   ok "precondition: killed mid-upload (PENDING, some chunk files written, others not)"
 else
-  fail "precondition: not killed mid-upload (status $st1); inconclusive, rerun"
+  inconclusive "precondition: not killed mid-upload (status $st1)"
 fi
 echo "   waiting for the pending timeout (${pending_timeout}s) and a GC pass"
 wait_sql $((pending_timeout + interval + margin)) 0 "SELECT count(*) FROM objects WHERE object_id = '$obj1'" \
@@ -200,7 +201,7 @@ new3="$(latest_object "$key3")"
 if kill -0 "$get_pid" 2>/dev/null && [[ "$(sql "SELECT object_id FROM keys WHERE key = '$key3'")" == "$new3" ]]; then
   ok "precondition: the overwrite committed while the get of the old version was still reading"
 else
-  fail "precondition: the get finished before the overwrite committed; inconclusive, rerun"
+  inconclusive "precondition: the get finished before the overwrite committed"
 fi
 "${compose[@]}" unpause "$held3" >/dev/null
 if wait "$get_pid" && cmp -s "$work/v1" "$work/v1.out"; then
@@ -363,6 +364,4 @@ echo "restoring the flipped bytes, then checking every touched file:"
 restore_flipped "$flipped"
 check_touched "$flipped" || status=1
 
-echo
-if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi
-exit "$status"
+finish

@@ -109,6 +109,12 @@ done
 
 if ((mix == 0 && errors == 0 && writer_errors == 0 && a > 0 && b > 0)); then
   echo "PASS: no mixed downloads; reads overlapped overwrites (both versions seen)"
+elif ((mix == 0 && errors == 0 && writer_errors == 0)); then
+  # Nothing went wrong, but the reads never saw both versions, so they may
+  # not have overlapped an overwrite: nothing was tested. Exit 75 (rerun),
+  # as scripts/lib/outcome.sh defines.
+  echo "INCONCLUSIVE: no mixed downloads, but only one version was seen (A=$a B=$b); rerun (exit 75)"
+  exit 75
 else
   echo "FAIL: need MIX=0, ERROR=0, writer errors=0, and both A and B seen at least once"
   exit 1

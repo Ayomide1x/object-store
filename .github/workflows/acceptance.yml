@@ -49,7 +49,12 @@ jobs:
         if: matrix.runner == 'ubuntu-24.04-arm'
         run: scripts/check-arm64.sh
       # The demo needs a fresh stack; each script after it is run on the
-      # stack the previous one left, as on a developer's machine.
+      # stack the previous one left, as on a developer's machine. A script
+      # that exits 75 is INCONCLUSIVE (scripts/lib/outcome.sh): nothing
+      # failed, but a precondition or a random draw didn't happen. It is
+      # rerun, up to 3 attempts (the demo on a fresh stack). Inconclusive 3
+      # times in a row still fails the job, labelled as such: nothing was
+      # proven, but it is not a product failure.
       - name: acceptance scripts
         run: |
           mkdir -p logs
@@ -58,11 +63,28 @@ jobs:
           for s in demo stage2-roundtrip stage2-overwrite-check stage3-corrupt-check stage3-crash-check \
                    stage3-fsync-trace stage4-replication-check stage5-failover-check stage6-liveness-check \
                    stage7-repair-check stage8-gc-check stage10-gateway-check stage11-ui-check; do
-            if scripts/$s.sh > logs/$s.log 2>&1; then
-              echo "$s: PASS"
-            else
-              echo "$s: FAIL"; status=1
-            fi
+            for attempt in 1 2 3; do
+              if [ "$attempt" -gt 1 ] && [ "$s" = demo ]; then
+                docker compose down -v && docker compose up --wait -d
+              fi
+              rc=0
+              scripts/$s.sh > logs/$s.$attempt.log 2>&1 || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "$s: PASS$([ "$attempt" -gt 1 ] && echo " (attempt $attempt, after INCONCLUSIVE)")"
+                break
+              elif [ "$rc" -eq 75 ]; then
+                echo "$s: INCONCLUSIVE (attempt $attempt of 3): $(grep -m1 'INCONCLUSIVE:\|inconclusive:' logs/$s.$attempt.log)"
+                if [ "$attempt" -eq 3 ]; then
+                  echo "::error title=$s INCONCLUSIVE 3 times::the check could not run; not a product failure, but nothing was proven"
+                  status=1
+                fi
+              else
+                echo "$s: FAIL (exit $rc)"
+                echo "::error title=$s FAIL::see logs/$s.$attempt.log"
+                status=1
+                break
+              fi
+            done
           done
           exit $status
       - name: go mutation check

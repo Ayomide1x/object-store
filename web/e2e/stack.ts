@@ -61,6 +61,12 @@ export function timings() {
   };
 }
 
+/** An acceptance script's INCONCLUSIVE exit code (scripts/lib/outcome.sh): rerun. */
+export const EXIT_INCONCLUSIVE = 75;
+
+/** Written when demo.sh ends INCONCLUSIVE; read by scripts/stage11-ui-check.sh. */
+export const INCONCLUSIVE_MARKER = path.join(root, "web", "test-results", "demo-inconclusive.txt");
+
 /** The UI polls every 2 s; allow a few polls plus scheduling noise. */
 export const POLL_MARGIN = 10_000;
 

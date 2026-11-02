@@ -1899,3 +1899,66 @@ The end-to-end mutation (the gateway's stage 10 W1, a normal return instead of t
 **Because:** each rule is shown to be load-bearing. U12 first went undetected: visibility was checked in two places, so removing one changed nothing. The poller now reads visibility in one place, and the mutation targets that.
 **Rule:** never run a patch-and-rebuild experiment (such as the end-to-end mutation above) while a mutation script is running: they share the working tree, and a patch applied by one is in the tree the other builds and reverts. Run them one after the other. During this stage's verification the end-to-end mutation was run while the coordinator mutation script ran. Its patch touched only the gateway, which the coordinator script doesn't build, and both were reverted, but the overlap was the mistake this rule prevents.
 **Breaks if:** code edits stop the patches from applying; the scripts refuse to start.
+
+## INCONCLUSIVE is its own verdict (exit 75); stage 4 step 4 draws until a miss is under 1 in 2,000; step 3 allows recorded repair copies (stage 11)
+**Amends:** "Scripts are deterministic again under liveness" (stage 6), whose step 4 ran "up to 3 stop/restart cycles", and whose "inconclusive, rerun" checks exited 1 like any failure. Also corrects "The demo's story and checks" (stage 9): its (1/4)⁹ odds for "no node to stop" predate rotation placement.
+**Chose:**
+
+*A verdict for checks that could not run.* `scripts/lib/outcome.sh` defines three outcomes: PASS exits 0, FAIL exits 1, INCONCLUSIVE exits 75. INCONCLUSIVE means nothing failed, but a precondition didn't happen or a random draw never produced the case to test, so nothing was proven: rerun. A FAIL anywhere wins over it.
+- **Scripts converted:** every check that said "inconclusive, rerun" now calls `inconclusive` and the script ends with `finish`: stage 3 crash, stage 4 steps 3 and 4, stage 5 steps 3–4, stage 7 (both), stage 8 (both) and stage 10. `stage2-overwrite-check.sh` exits 75 when nothing went wrong but only one version was seen. `demo.sh` stops with INCONCLUSIVE and exit 75.
+- **Callers:** `record-demo.sh` passes 75 on. In stage 11, the demo test writes a marker when demo.sh exits 75, and `stage11-ui-check.sh` reports INCONCLUSIVE when that is the suite's only failure.
+- **CI:** `acceptance.yml` reruns a script that exits 75, up to 3 attempts, the demo on a fresh stack. It prints "INCONCLUSIVE (attempt n of 3)" with the reason, and "PASS (attempt n, after INCONCLUSIVE)" if a rerun passes. Inconclusive 3 times still fails the job, labelled "INCONCLUSIVE 3 times: … not a product failure, but nothing was proven". A FAIL is never rerun.
+
+*Stage 4 step 4.* With node3 and node4 stopped, each 1-chunk put made before detection is a fair coin. Placement starts at a random one of the 4 nodes, in sorted order, and takes 3 in a row:
+
+| Start | Nodes placed | Live placed nodes | Outcome |
+|---|---|---|---|
+| node1 | node1, node2, node3 | 2 | success |
+| node4 | node4, node1, node2 | 2 | success |
+| node2 | node2, node3, node4 | 1 | failure |
+| node3 | node3, node4, node1 | 1 | failure |
+
+So each draw succeeds with probability 1/2, independently. The step misses a branch only if all N draws land on the same side: P(miss) = 2 × (1/2)^N = 2^(1−N).
+- **The old limit:** the window from stop to detection is 4–6 s (6 s of silence, minus up to 2 s since the last beat), and fits about 2 one-chunk puts. Your failing run made 2 draws in each of its 3 cycles, all successes. With N ≈ 6, P(miss) = 2^−5 = 1 in 32 (3.1%). With a 3rd draw in a cycle, 2^−6 to 2^−8.
+- **Now:** draws accumulate across cycles until both outcomes are seen, or `MAX_DRAWS` = 12 draws have been made. P(miss) = 2^−11 = 1 in 2,048 (0.049%), under the 1 in 1,000 asked for.
+- **Cycle cap:** `MAX_CYCLES` = 10 bounds only a window that fits fewer draws than usual (at 2 per cycle, 12 draws take 6 cycles).
+- **Typical cost:** the expected number of draws until both outcomes are seen is 3, so most runs end in cycle 1 or 2, and only the unlucky ones pay for restarts.
+- **Running out is INCONCLUSIVE, not FAIL,** naming what wasn't seen. Every draw made followed the per-chunk rule, and a draw that breaks the rule is still an immediate FAIL.
+- **The 3-chunk object** placed before detection fails with certainty, not chance: 3 consecutive chunks leave out 3 consecutive nodes, which always include node1 or node2, so some chunk lands on both stopped nodes.
+
+*Stage 4 step 3, after the unpause.* The check "node3 holds no temp file and no final file for its placed chunks" predates repair (stage 7). A chunk that committed with 2 replicas while node3 was paused is topped up by the reconciler, which may pick node3 as soon as it is back. One run found exactly that: a file node3 wrote 1 s after the unpause, recorded HEALTHY with origin repair 7 ms later. Now a final file on node3 for a placed chunk is allowed only if Postgres has a HEALTHY row for that chunk on node3 with origin repair or repair-found, and the file passes the header, chunk-ID and SHA-256 check (`check_chunk_files`). Any other final file, or any temp file, is still FAIL. Checked against real files on a running stack, each case gave the required verdict:
+
+| Case on node3 | Verdict |
+|---|---|
+| Nothing | allowed |
+| A valid file, no row | reported |
+| A valid file, a HEALTHY repair row | allowed |
+| A valid file, an upload-origin row | reported |
+| A corrupted file, a repair row | reported |
+| A temp file | reported |
+
+*Other checks that depend on random placement* (all objects use the same rotation from a random start):
+
+| Check | Chance the case to test doesn't occur | Why |
+|---|---|---|
+| Stage 4 step 3: the paused node3 is placed (3-chunk object) | 0 | 3 chunks leave out at most one node per chunk; node3 is in at least 2 |
+| `stage3-fsync-trace.sh`: node1 is placed (3 chunks) | 0 | node1 is placed on 2 or 3 chunks |
+| Stage 7 step 3: node2 held chunks of A and B (3 chunks each), else the 4-HEALTHY check is vacuous | 0 | node2 held 4 to 6 |
+| `demo.sh` step 2: a node holds some but not all of the 10 chunks | 0 | each node is left out of 2 or 3 of the 10, so every node qualifies; the old comment's (1/4)⁹ was wrong, and its message now says so |
+| `demo.sh` step 5: a chunk with exactly 3 replicas, none on the returned node | 0 | the returned node was left out of 2 or 3 chunks, which were never on it and never repaired |
+| Stage 5, stage 8 and stage 11's 03-corrupt choose their victim node from the recorded replicas | 0 | deterministic given the placement |
+
+*Checks that depend on timing* (whether a kill or a read lands in the window, not a draw with fixed odds): stage 2's overwrite overlap, stage 3's kill mid-write, stage 4 step 3's "before detection", stage 5's "still ALIVE", stage 7's kill mid-copy and copy landing, stage 8's kill mid-upload and read overlap, stage 10's ≥3 overlapping GETs. Their odds depend on the machine, so no fixed bound can be given. Each is now INCONCLUSIVE rather than FAIL when it misses, and CI reruns it.
+
+**Over:**
+- More cycles at 2 draws each, which still leaves a fixed chance for no reason: draws are the quantity that matters.
+- Running the 1-chunk puts in parallel within one window: more draws per window, but concurrent puts make each outcome's check harder to attribute, for a speedup only unlucky runs need.
+- Seeding or fixing placement for the test: it would test a placement the product never makes.
+- Exit 2 for inconclusive: bash builtins and tools like grep exit 2 on errors, so a crash under `set -e` could pass for inconclusive. 75 is EX_TEMPFAIL ("try again"), and nothing these scripts run returns it.
+**Because:** a check that sometimes can't run must say so differently from a check that ran and found a bug, or every flake looks like a regression and every regression risks being dismissed as a flake.
+
+Measured after the change, 10 stage 4 runs in a row on a fresh stack:
+- **Step 4** passed in all 10 with no inconclusive result: 2, 2, 2, 2, 2, 3, 4, 4, 4 and 6 draws, in 1 to 3 cycles. Three runs needed a second or third cycle, the case the old 3-cycle limit only just covered.
+- **Step 3** failed once: the repair copy described above. That is what led to the step 3 change.
+- **An earlier batch of 10 was discarded:** at 20:10:10Z a `docker compose down -v && up --build`, started by hand in another terminal while the runs were going, stopped and recreated the whole stack mid-run. Runs 4 and 5 of that batch failed on operations the script never issued.
+**Breaks if:** placement stops being uniform over starts (say, weighted by load), so the coin is no longer fair and 2^(1−N) no longer holds; or a script's tool starts using exit 75.

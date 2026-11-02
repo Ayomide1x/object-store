@@ -47,6 +47,7 @@ trap cleanup EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 
 # Runs a shell snippet in alpine with node1's /data mounted (works while node1 is stopped).
 on_volume() { docker run --rm --volumes-from "$node" alpine:3 sh -c "$1"; }
@@ -78,7 +79,7 @@ echo "  node1 state: $(docker inspect -f '{{.State.Status}} (exit {{.State.ExitC
 echo "c. temp files left by the kill:"
 temps="$(on_volume 'ls /data/tmp')"
 if [[ -z "$temps" ]]; then
-  fail "no temp file: the kill landed between chunk writes or after the upload; inconclusive, rerun"
+  inconclusive "no temp file: the kill landed between chunk writes or after the upload"
 else
   sed 's/^/     /' <<<"$temps"
 fi
@@ -156,6 +157,4 @@ else
   fail "get did not return identical bytes"
 fi
 
-echo
-if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi
-exit "$status"
+finish

@@ -12,6 +12,12 @@
 #      (SUSPECT takes 6 s of silence): the paused node is placed, and the upload
 #      finishes within the write deadline plus normal time with nothing
 #      recorded on it. Precondition checked: the paused node was placed.
+#      After unpause, node3 must hold no temp file, and no final file for its
+#      placed chunks, with one exception since stage 7: a chunk that committed
+#      with 2 replicas is topped up by the reconciler, which may pick node3
+#      as soon as it is back. Such a file is allowed only if Postgres has a
+#      HEALTHY row for it on node3 with origin repair or repair-found, and
+#      the file passes the header, chunk-ID and SHA-256 check.
 #   4. Two stopped, put at once, before detection. Each outcome must match the
 #      per-chunk rule computed from chunk_placements (success exactly when every
 #      chunk has >= 2 live placed nodes), and the recorded replicas must match.
@@ -19,10 +25,13 @@
 #      nodes before, exactly the 2 ALIVE ones after. 1-chunk objects are put
 #      until a predicted success and a predicted failure are both seen before
 #      detection; a 3-chunk object placed before detection must fail (rotation
-#      always puts one of its chunks on both stopped nodes). If detection comes
-#      first, both nodes are restarted, brought back ALIVE, and stopped again,
-#      up to 3 cycles. After detection (both DEAD): a 3-chunk object succeeds
-#      with exactly 2 replicas per chunk on the 2 ALIVE nodes.
+#      always puts one of its chunks on both stopped nodes). Each 1-chunk put
+#      is a fair coin (see MAX_DRAWS below). If detection comes first, both
+#      nodes are restarted, brought back ALIVE, and stopped again, until both
+#      outcomes are seen or 12 draws are made (at most 10 cycles); running out
+#      is INCONCLUSIVE, not FAIL (a 1 in 2,048 chance). After detection (both
+#      DEAD): a 3-chunk object succeeds with exactly 2 replicas per chunk on
+#      the 2 ALIVE nodes.
 #   5. Three stopped and DEAD: initiate fails with UNAVAILABLE. Nothing new
 #      is created; the overwritten key still resolves to its previous version,
 #      and a new key to nothing.
@@ -46,6 +55,7 @@ osctl="$root/bin/osctl"
 source "$root/scripts/lib/osctl.sh"
 compose=(docker compose -f "$root/docker-compose.yml")
 source "$root/scripts/lib/liveness.sh"
+source "$root/scripts/lib/volume.sh" # check_chunk_files, for step 3
 # up --wait means the coordinator is serving; uploads need ALIVE nodes.
 wait_alive 4
 work="$(mktemp -d)"
@@ -62,6 +72,7 @@ trap restore EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -F'|' -c "$1"; }
 now() { python3 -c 'import time; print(time.time())'; }
@@ -168,7 +179,7 @@ if "$osctl" put "$work/v3" "replication/one-paused-$run" 2>"$work/put3.err"; the
   elapsed="$(python3 -c "print(round($(now) - $t0, 2))")"
   obj3="$(latest_object "replication/one-paused-$run")"
   if [[ "$(placed_on "$obj3" node3)" == 0 ]]; then
-    fail "precondition: node3 was not placed (detected before initiate?); inconclusive, rerun"
+    inconclusive "precondition: node3 was not placed (detected before initiate?)"
   else
     ok "precondition: node3 was placed on $(placed_on "$obj3" node3) chunks"
   fi
@@ -182,21 +193,42 @@ else
   obj3="$(latest_object "replication/one-paused-$run")"
 fi
 "${compose[@]}" unpause node3 >/dev/null
-# After unpause, node3 sees the cancelled streams and removes its temps.
+# After unpause, node3 sees the cancelled streams and removes its temps. A
+# final file for a placed chunk is allowed only as a recorded, verified repair
+# copy (see the header); anything else left on node3 is a FAIL.
 ids3="$(sql "SELECT p.chunk_id FROM chunk_placements p JOIN chunks c USING (chunk_id)
              WHERE c.object_id = '$obj3' AND p.node_id = 'node3' AND p.origin = 'initiate'" | tr '\n' ' ')"
+# leftover_on_node3: prints each temp file and each final file that isn't an
+# allowed repair copy, one per line; prints the allowed copies to $work/repaired3.
+leftover_on_node3() {
+  local temps finals id
+  : > "$work/repaired3"
+  temps="$(docker run --rm --volumes-from "$("${compose[@]}" ps -q node3)" alpine:3 ls /data/tmp)"
+  [[ -n "$temps" ]] && sed 's/^/temp file /' <<<"$temps"
+  finals="$(docker run --rm --volumes-from "$("${compose[@]}" ps -q node3)" alpine:3 sh -c '
+    for id in "$@"; do [ -e "/data/chunks/$id" ] && echo "$id"; done; true' sh $ids3)"
+  for id in $finals; do
+    if [[ "$(sql "SELECT count(*) FROM chunk_replicas WHERE chunk_id = '$id' AND node_id = 'node3'
+                  AND state = 'HEALTHY' AND origin IN ('repair', 'repair-found')")" == 1 && \
+          "$(check_chunk_files node3 "$id")" == "OK $id" ]]; then
+      echo "$id" >> "$work/repaired3"
+    else
+      echo "final file $id (no HEALTHY repair row on node3, or it fails verification)"
+    fi
+  done
+  return 0
+}
 leftover=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  leftover="$(docker run --rm --volumes-from "$("${compose[@]}" ps -q node3)" alpine:3 sh -c '
-    ls /data/tmp
-    for id in "$@"; do [ -e "/data/chunks/$id" ] && echo "final file $id"; done; true' sh $ids3)"
+  leftover="$(leftover_on_node3)"
   [[ -z "$leftover" ]] && break
   sleep 1
 done
 if [[ -z "$leftover" ]]; then
-  ok "after unpause, node3 has no final file or temp for its $(wc -w <<<"$ids3" | tr -d ' ') placed chunks"
+  repaired="$(grep -c . "$work/repaired3" || true)"
+  ok "after unpause, node3 has no temp file and no unrecorded final file for its $(wc -w <<<"$ids3" | tr -d ' ') placed chunks$( ((repaired > 0)) && echo " ($repaired verified repair copies, recorded as such)")"
 else
-  fail "node3 still has: $leftover"
+  fail "node3 still has: $(tr '\n' ';' <<<"$leftover")"
 fi
 wait_alive 1 node3 || fail "node3 not ALIVE after unpause"
 
@@ -250,11 +282,29 @@ two_stopped_put() {
   fi
 }
 
+# Each 1-chunk put before detection is an independent fair coin. Placement
+# starts at a random one of the 4 nodes (sorted) and takes 3 in a row, so the
+# start decides which node is left out: starting at node1 or node4 leaves out
+# node4 or node3, placing both live nodes (success); starting at node2 or
+# node3 places only one (failure). P = 1/2 each, independent per put.
+#
+# The step misses a branch only if every draw lands on the same side:
+# P(miss) = 2 x (1/2)^N = 2^(1-N) after N draws. A cycle's window (stop to
+# detection, ~4-6 s) fits about 2 draws, so the old limit of 3 cycles gave
+# N of about 6: 2^-5 = 1 in 32, which is what failed. Now draws accumulate
+# across cycles until both outcomes are seen or MAX_DRAWS are made:
+# 2^(1-12) = 2^-11, about 1 in 2,048. MAX_CYCLES only bounds a window that
+# fits fewer draws than usual; most runs finish within 1 or 2 cycles
+# (expected draws until both are seen: 3).
+MAX_DRAWS=12
+MAX_CYCLES=10
 seen_success=no
 seen_failure=no
 three_failed=no
-attempt=0
-for cycle in 1 2 3; do
+draws=0
+puts=0
+both_seen() { [[ "$seen_success" == yes && "$seen_failure" == yes ]]; }
+for ((cycle = 1; cycle <= MAX_CYCLES; cycle++)); do
   echo "   cycle $cycle: stopping node3 and node4"
   "${compose[@]}" stop node3 node4 >/dev/null 2>&1
   width=3 # a fresh cycle starts before detection; each put measures it again
@@ -269,28 +319,35 @@ for cycle in 1 2 3; do
       fi
     fi
   fi
-  while [[ "$width" == 3 ]] && ! [[ "$seen_success" == yes && "$seen_failure" == yes ]] && ((attempt < 12)); do
-    attempt=$((attempt + 1))
-    # The cycle is part of the name: each attempt needs its own key, or a failed
-    # attempt's key would still resolve to an earlier cycle's success.
-    two_stopped_put "one-chunk-c$cycle-$attempt" 1
-    if [[ "$matched" == yes ]]; then
+  while [[ "$width" == 3 ]] && ! both_seen && ((draws < MAX_DRAWS)); do
+    puts=$((puts + 1))
+    # Each put needs its own key, or a failed put's key would still resolve
+    # to an earlier success.
+    two_stopped_put "one-chunk-$puts" 1
+    if [[ "$width" == 3 && "$matched" == yes ]]; then
+      draws=$((draws + 1))
       [[ "$expected" == success ]] && seen_success=yes
       [[ "$expected" == failure ]] && seen_failure=yes
     fi
   done
-  [[ "$seen_success" == yes && "$seen_failure" == yes && "$three_failed" == yes ]] && break
-  ((cycle < 3)) || break
-  echo "   detection came first: restarting node3 and node4 for another cycle"
+  if both_seen && [[ "$three_failed" == yes ]]; then break; fi
+  if ((draws >= MAX_DRAWS)) && [[ "$three_failed" == yes ]]; then break; fi
+  ((cycle < MAX_CYCLES)) || break
+  echo "   detection came first ($draws of at most $MAX_DRAWS draws so far): restarting node3 and node4"
   "${compose[@]}" up -d --wait node3 node4 >/dev/null 2>&1
   wait_alive 1 node3 node4 || fail "node3/node4 not ALIVE"
-  attempt=0
 done
-echo "   before detection: success seen and matched: $seen_success; failure seen and matched: $seen_failure; 3-chunk failed: $three_failed"
-if [[ "$seen_success" == yes && "$seen_failure" == yes && "$three_failed" == yes ]]; then
+echo "   before detection: $draws draws; success seen and matched: $seen_success; failure seen and matched: $seen_failure; 3-chunk failed: $three_failed"
+if both_seen && [[ "$three_failed" == yes ]]; then
   ok "both branches of the per-chunk rule exercised before detection"
 else
-  fail "a branch of the per-chunk rule was not exercised before detection"
+  # Every draw that was made followed the rule (a mismatch is a FAIL above);
+  # the coin just never produced one of the cases.
+  missing=""
+  [[ "$seen_success" == yes ]] || missing+=" a predicted success,"
+  [[ "$seen_failure" == yes ]] || missing+=" a predicted failure,"
+  [[ "$three_failed" == yes ]] || missing+=" a 3-chunk object placed before detection,"
+  inconclusive "not exercised before detection:${missing%,} ($draws draws in $cycle cycles; with 12 draws this happens 1 time in 2,048)"
 fi
 
 wait_state node3 DEAD 30 || fail "node3 never reached DEAD"
@@ -364,6 +421,4 @@ else
   fail "put right after wait_alive failed"
 fi
 
-echo
-if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi
-exit "$status"
+finish

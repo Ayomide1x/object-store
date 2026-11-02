@@ -5,14 +5,16 @@
 // Every wait is an auto-retrying assertion on a data-* attribute, with a
 // timeout derived from the Compose timings; nothing sleeps.
 import { expect, test } from "@playwright/test";
+import { rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { POLL_MARGIN, root, runDemo, timings } from "./stack";
+import { EXIT_INCONCLUSIVE, INCONCLUSIVE_MARKER, POLL_MARGIN, root, runDemo, timings } from "./stack";
 
 const KEY = "demo/photo-archive.bin";
 const CHUNKS = 10; // demo.sh uploads 40 MiB
 
 test("the UI follows demo.sh: Suspect then Dead, under-replicated, repaired, Bad, repaired", async ({ page }) => {
   const t = timings();
+  rmSync(INCONCLUSIVE_MARKER, { force: true });
   const demo = runDemo(5);
   try {
     await page.goto(`/?key=${encodeURIComponent(KEY)}`);
@@ -81,7 +83,13 @@ test("the UI follows demo.sh: Suspect then Dead, under-replicated, repaired, Bad
     await expect(badRow.locator('[data-testid="replica-cell"][data-state="HEALTHY"][data-origin="repair"]')).not.toHaveCount(0);
     await page.screenshot({ path: path.join(root, "web", "test-results", "ui-demo-repaired.png") });
 
-    expect(await demo.exited, demo.output()).toBe(0);
+    const code = await demo.exited;
+    if (code === EXIT_INCONCLUSIVE) {
+      // demo.sh stopped on a precondition, not a failure: tell the stage 11
+      // script, which then reports INCONCLUSIVE (rerun) rather than FAIL.
+      writeFileSync(INCONCLUSIVE_MARKER, demo.output());
+    }
+    expect(code, demo.output()).toBe(0);
   } finally {
     demo.kill();
     await test.info().attach("demo.sh output", { body: demo.output(), contentType: "text/plain" });

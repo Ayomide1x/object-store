@@ -42,6 +42,7 @@ trap 'rm -rf "$work"' EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 t_start=$SECONDS
 
@@ -62,7 +63,13 @@ if (cd "$root/web" && npx playwright test) >"$work/playwright.log" 2>&1; then
   ok "$(grep -E '[0-9]+ passed' "$work/playwright.log" | tr -s ' ')"
 else
   cat "$work/playwright.log"
-  fail "the Playwright suite failed (traces under web/test-results)"
+  # demo.sh ending INCONCLUSIVE fails only the demo test, and leaves a marker:
+  # if that is the only failure, nothing was shown broken.
+  if [[ -f "$root/web/test-results/demo-inconclusive.txt" ]] && grep -qE '^\s+1 failed' "$work/playwright.log"; then
+    inconclusive "demo.sh stopped on a precondition (see the demo test's output above)"
+  else
+    fail "the Playwright suite failed (traces under web/test-results)"
+  fi
 fi
 if [[ "${UPDATE_SCREENSHOTS:-}" == 1 ]]; then
   mkdir -p "$root/docs"
@@ -96,10 +103,4 @@ for g in "$GATEWAY1" "$GATEWAY2"; do
 done
 "$osctl" rm "$key" >/dev/null 2>&1 || true
 
-echo
-if ((status == 0)); then
-  echo "PASS (stage 11 UI acceptance, $((SECONDS - t_start))s)"
-else
-  echo "FAIL"
-fi
-exit $status
+finish "(stage 11 UI acceptance, $((SECONDS - t_start))s)"

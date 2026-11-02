@@ -66,7 +66,15 @@ fail() {
   echo "${b}${red}FAIL${off}"
   exit 1
 }
-inconclusive() { fail "inconclusive: $*"; }
+# inconclusive REASON: the demo stops here, but nothing failed: a precondition
+# for the next step didn't hold. Exit 75, as scripts/lib/outcome.sh defines:
+# rerun.
+inconclusive() {
+  echo "   ? inconclusive: $*"
+  echo
+  echo "${b}${yel}INCONCLUSIVE${off} (exit 75: rerun)"
+  exit 75
+}
 hold() { if ((pause > 0)); then sleep "$pause"; fi; }
 
 # progress TEXT: a line that updates in place on a terminal, and is printed
@@ -229,7 +237,7 @@ fit = [(n, held[n]) for n in ("node1", "node2", "node3", "node4") if 0 < held[n]
 print(*max(fit, key=lambda x: x[1]) if fit else ("", 0))
 EOF
 )
-[[ -n "$stopped" ]] || inconclusive "no node holds some but not all chunks (odds about 4 in a million)"
+[[ -n "$stopped" ]] || inconclusive "no node holds some but not all chunks (rotation placement leaves each node out of 2 or 3 of the 10 chunks, so only failed replica writes can cause this)"
 say "$stopped holds $held of the 10 chunks. Stopping it: it stops sending heartbeats"
 say "(every ${beat}s), and the coordinator judges it by the silence alone."
 t0=$(now)

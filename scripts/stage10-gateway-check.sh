@@ -46,6 +46,7 @@ trap restore EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -c "$1" </dev/null; }
 # mkfile NAME BYTES (macOS head refuses a count of 0)
@@ -235,7 +236,7 @@ wait "$writer"
 if ((mixed == 0 && gets >= 3)); then
   ok "$gets gets during 8 gateway overwrites: each was the old or the new object"
 elif ((mixed == 0)); then
-  fail "only $gets gets overlapped the overwrites; inconclusive, rerun"
+  inconclusive "only $gets gets overlapped the overwrites"
 else
   fail "$mixed of $gets gets during overwrites returned neither version"
 fi
@@ -284,5 +285,4 @@ echo "== restoring flipped bytes"
 restore_flipped "$flipped"
 check_touched "$flipped" || status=1
 
-if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi
-exit "$status"
+finish

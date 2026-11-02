@@ -52,6 +52,7 @@ trap restore EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -F'|' -c "$1"; }
 db_now() { sql "SELECT clock_timestamp()"; }
@@ -227,7 +228,7 @@ if docker logs "$watcher" 2>&1 | grep -q killed; then
   if [[ -n "$temps" ]]; then
     ok "precondition: node4 was killed with a copy in flight ($(wc -l <<<"$temps" | tr -d ' ') temp file)"
   else
-    fail "precondition: no temp file on node4: the kill missed the copy; inconclusive, rerun"
+    inconclusive "precondition: no temp file on node4: the kill missed the copy"
   fi
   all="$(docker run --rm --volumes-from "$node4" alpine:3 ls /data/chunks | tr '\n' ' ')"
   out="$(check_chunk_files node4 $all)"
@@ -241,7 +242,7 @@ if docker logs "$watcher" 2>&1 | grep -q killed; then
   wait_repaired $((copy_timeout + 2 * interval + margin)) "repair/e-$run" --not node1 && ok "a later pass completed E's copies" \
     || fail "E not fully repaired"
 else
-  fail "no repair copy landed on node4 in time; inconclusive, rerun"
+  inconclusive "no repair copy landed on node4 in time"
 fi
 "${compose[@]}" up -d --wait node1 >/dev/null 2>&1
 wait_alive 4 || fail "not all nodes ALIVE at the end"
@@ -252,6 +253,4 @@ echo "restoring the flipped bytes, then checking every touched file:"
 restore_flipped "$flipped"
 check_touched "$flipped" || status=1
 
-echo
-if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi
-exit "$status"
+finish

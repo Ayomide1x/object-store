@@ -169,7 +169,7 @@ These hold at every stage after the one that introduced them; code that would br
 | `stage11-ui-check.sh` | on a fresh stack, the browser suite above; a foreign Host gets 403 on every route and a cross-origin DELETE deletes nothing; both gateways healthy with the allowlist set |
 | `demo.sh` | the demo story, end to end |
 
-Scripts that corrupt files restore them afterwards and check that every file they touched is gone or verifies. A mutation counts as detected when its named test fails (for the coordinator, in a run of only that test's class); each script then runs the full unmutated suite once. CI runs the Go, coordinator and web unit tests on every push, and the acceptance scripts and the three mutation checks weekly.
+Each script ends PASS (exit 0), FAIL (exit 1: the product got a check wrong) or INCONCLUSIVE (exit 75: nothing failed, but a precondition or a random draw didn't happen, so rerun); CI reruns an inconclusive script up to 3 times. Scripts that corrupt files restore them afterwards and check that every file they touched is gone or verifies. A mutation counts as detected when its named test fails (for the coordinator, in a run of only that test's class); each script then runs the full unmutated suite once. CI runs the Go, coordinator and web unit tests on every push, and the acceptance scripts and the three mutation checks weekly.
 
 ## Design decisions
 

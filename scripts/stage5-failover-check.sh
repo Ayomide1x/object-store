@@ -12,7 +12,7 @@
 #      Since stage 6, steps 3 and 4 check a precondition, as stage 4 step 3
 #      does: right before the get, the node's persisted state must still be
 #      ALIVE (detection takes 6 s of silence; the get starts at once). If it is
-#      not, the step fails as "inconclusive, rerun", because a node already
+#      not, the step is INCONCLUSIVE (exit 75: rerun), because a node already
 #      listed DEAD is read last and the get would not exercise failover. A pass
 #      therefore always means the get really failed over from the stopped or
 #      paused node. Liveness-ordered reads are covered by
@@ -54,6 +54,7 @@ trap restore EXIT
 
 status=0
 fail() { echo "  FAIL: $*"; status=1; }
+source "$root/scripts/lib/outcome.sh"
 ok() { echo "  ok: $*"; }
 sql() { "${compose[@]}" exec -T postgres psql -U objectstore -d objectstore -tA -c "$1"; }
 now() { python3 -c 'import time; print(time.time())'; }
@@ -75,7 +76,7 @@ still_alive() {
   if [[ "$st" == ALIVE ]]; then
     ok "precondition: the coordinator still sees $1 ALIVE"
   else
-    fail "precondition: $1 is already $st, so the get would not fail over from it; inconclusive, rerun"
+    inconclusive "precondition: $1 is already $st, so the get would not fail over from it"
   fi
 }
 # The node a get's log says served CHUNK.
@@ -218,6 +219,4 @@ echo "restoring the flipped bytes, then checking every touched file:"
 restore_flipped "$flipped"
 check_touched "$flipped" || status=1
 
-echo
-if ((status == 0)); then echo "PASS"; else echo "FAIL"; fi
-exit "$status"
+finish
