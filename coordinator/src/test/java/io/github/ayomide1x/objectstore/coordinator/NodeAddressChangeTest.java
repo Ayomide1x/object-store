@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.github.ayomide1x.objectstore.v1.StatChunksRequest;
 import io.github.ayomide1x.objectstore.v1.StatChunksResponse;
@@ -45,6 +46,9 @@ class NodeAddressChangeTest {
 
     final List<AutoCloseable> cleanup = new ArrayList<>();
 
+    /** When a silent peer first accepted a connection (System.nanoTime), or 0. */
+    final AtomicLong silentFirstAccept = new AtomicLong();
+
     @AfterEach
     void close() throws Exception {
         TestDns.reset();
@@ -56,6 +60,7 @@ class NodeAddressChangeTest {
     /** A fake node answering StatChunks as nodeId, on addr:port. */
     Server node(String nodeId, InetAddress addr, int port) throws IOException {
         Server s = NettyServerBuilder.forAddress(new InetSocketAddress(addr, port))
+                .permitKeepAliveTime(5, TimeUnit.SECONDS).permitKeepAliveWithoutCalls(true) // as a real node
                 .addService(new StorageNodeServiceGrpc.StorageNodeServiceImplBase() {
                     @Override
                     public void statChunks(StatChunksRequest req, StreamObserver<StatChunksResponse> out) {
@@ -81,7 +86,9 @@ class NodeAddressChangeTest {
         Thread t = Thread.ofVirtual().start(() -> {
             try {
                 while (true) {
-                    held.add(ss.accept());
+                    Socket s = ss.accept();
+                    silentFirstAccept.compareAndSet(0, System.nanoTime());
+                    held.add(s);
                 }
             } catch (IOException e) {
                 // closed
@@ -106,12 +113,15 @@ class NodeAddressChangeTest {
         }
     }
 
+    /** The node call deadline client() configures. */
+    static final Duration NODE_CALL = Duration.ofSeconds(2);
+
     /** Long by default, as in production; tests of the rate limit set their own. */
     Duration replaceInterval = Duration.ofSeconds(5);
 
     NodeClient client() {
         CoordinatorProperties p = new CoordinatorProperties("node3|" + HOST + ":1|" + HOST + ":1",
-                Duration.ofSeconds(2), Duration.ofSeconds(6), Duration.ofSeconds(15), 2, Duration.ZERO,
+                NODE_CALL, Duration.ofSeconds(6), Duration.ofSeconds(15), 2, Duration.ZERO,
                 Duration.ofSeconds(30), Duration.ZERO, 8, 2, Duration.ofSeconds(30), Duration.ofHours(24),
                 Duration.ZERO, Duration.ofMinutes(15), Duration.ofHours(24), 256, 4, 1, Duration.ofHours(24),
                 Duration.ofSeconds(1), Duration.ofHours(24), false, replaceInterval);
@@ -164,10 +174,15 @@ class NodeAddressChangeTest {
      * takes its old address while DNS still points there, so the channel
      * connects to it and stays CONNECTING; then DNS points to the node. The
      * old code never reached the node again (every call DEADLINE_EXCEEDED).
+     * Keepalive also gets the channel out, but only after about 12 s
+     * (NodeClient.KEEPALIVE_TIME + KEEPALIVE_TIMEOUT): the readiness check is
+     * the fast way out, so the test asserts its speed, well inside keepalive's
+     * bound, and that a not-ready replacement did it.
      * Mutation: the readiness check before each call is removed.
      */
     @Test
     void aChannelThatNeverBecomesReadyIsReplaced() throws Exception {
+        replaceInterval = Duration.ofSeconds(2);
         InetAddress oldAddr = InetAddress.getByName("127.0.0.1");
         InetAddress newAddr = InetAddress.getByName("::1");
         int port = freePort();
@@ -183,21 +198,26 @@ class NodeAddressChangeTest {
         silent(oldAddr, port);
         assertThat(statAnswered(c, n3)).as("the silent peer answers nothing").isFalse();
 
-        // Now DNS says where the node is. Within one replace interval plus
-        // one call, calls reach it, and keep reaching it. (The call above may
-        // already have used this node's replacement for the interval.)
+        // Now DNS says where the node is. Timed from the first connection to
+        // the silent peer, calls reach it within BOUND, and keep reaching it.
+        // (The call above may already have used this node's replacement for
+        // the interval.)
         node("node3", newAddr, port);
         TestDns.names.put(HOST, newAddr);
-        long deadline = System.nanoTime() + (replaceInterval.plusSeconds(4)).toNanos();
+        Duration bound = replaceInterval.plus(NODE_CALL).plusSeconds(1);
+        long stuckAt = silentFirstAccept.get();
         boolean reached = false;
-        while (!reached && System.nanoTime() < deadline) {
+        while (!reached && System.nanoTime() - stuckAt < bound.toNanos()) {
             reached = statAnswered(c, n3);
         }
-        assertThat(reached).as("a call reaches the node at its new address within the replace interval").isTrue();
+        assertThat(reached).as("a call reaches the node at its new address within %s of getting stuck", bound)
+                .isTrue();
+        assertThat(bound).as("well inside keepalive's bound")
+                .isLessThan(NodeClient.KEEPALIVE_TIME.plus(NodeClient.KEEPALIVE_TIMEOUT).dividedBy(2));
+        assertThat(c.notReadyReplacements(n3)).as("through a not-ready replacement").isPositive();
         for (int i = 0; i < 3; i++) {
             assertThat(statAnswered(c, n3)).as("and every call after").isTrue();
         }
-        assertThat(c.stats(n3).replacements()).isBetween(1L, 2L);
     }
 
     /**

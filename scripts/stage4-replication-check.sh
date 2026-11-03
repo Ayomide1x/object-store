@@ -52,6 +52,25 @@
 #      The coordinator once kept a channel stuck after an address change: not
 #      ready, never failing, every call timing out. The deterministic proof of
 #      the fix is NodeAddressChangeTest; this step checks the whole path.
+#   7. Half-open connections (scripts/lib/halfopen.sh): one connection's
+#      packets are dropped silently in both directions and nothing is closed,
+#      while new connections between the same two services get through.
+#      a. The coordinator's connection to node2, right after a call on it (so
+#         its keepalive ping is about 10 s away). A put placed on node2 then
+#         does not record node2's replica (the call times out: the connection
+#         really is half-open); keepalive closes it within 12 s and a later
+#         put records node2 again, over a new connection. node2 has no
+#         liveness event throughout: its heartbeats use another connection.
+#      b. node2's heartbeat connection. The beat on it times out (2 s, before
+#         the kernel's TCP_USER_TIMEOUT of 3 s), node2 logs a redial and beats
+#         at once on a new connection, about 4.2 s after its last good beat at
+#         worst: node2 may blip SUSPECT, is ALIVE again within about one
+#         heartbeat interval, never DEAD.
+#      c. gateway1's connection to the coordinator. /cluster fails on it, then
+#         works again over a new connection: within about 2 s, since the
+#         request in flight leaves data unacknowledged and grpc-go's
+#         TCP_USER_TIMEOUT (the keepalive timeout) closes the connection;
+#         keepalive's 12 s at most.
 #
 # Node volumes are read from a throwaway alpine container with --volumes-from,
 # because the node image is distroless.
@@ -67,6 +86,7 @@ compose=(docker compose -f "$root/docker-compose.yml")
 source "$root/scripts/lib/liveness.sh"
 source "$root/scripts/lib/volume.sh" # check_chunk_files, corrupt_byte
 source "$root/scripts/lib/ipswap.sh"
+source "$root/scripts/lib/halfopen.sh"
 # up --wait means the coordinator is serving; uploads need ALIVE nodes.
 wait_alive 4
 work="$(mktemp -d)"
@@ -79,6 +99,7 @@ deadline=10
 export OSCTL_CHUNK_WRITE_TIMEOUT="${deadline}s"
 
 restore() {
+  halfopen_cleanup >/dev/null 2>&1 || true
   "${compose[@]}" unpause node1 node2 node3 node4 >/dev/null 2>&1 || true
   if [[ "${swapped:-}" == yes ]]; then unpin_ips node1 node3 >/dev/null 2>&1 || true; fi
   "${compose[@]}" up -d --wait >/dev/null 2>&1 || true
@@ -521,5 +542,172 @@ fi
 unpin_ips node1 node3
 swapped=no
 wait_alive 4 || fail "not all nodes ALIVE after unpinning their addresses"
+
+
+echo
+echo "7. half-open connections: one connection's packets dropped silently, nothing closed"
+coord_ip="$(halfopen_ip coordinator)"
+hb_interval=2 suspect_after=6 # Compose: NODE_HEARTBEAT_INTERVAL, COORDINATOR_SUSPECT_AFTER
+mkfile_mib one7 1
+# put7 KEY: a 1-chunk put; prints whether node2 was placed and whether its
+# upload replica was recorded ("1 1": both), or "failed".
+put7() {
+  local c
+  osctl_run put "$work/one7" "$1" >/dev/null || { echo failed; return 0; }
+  c="$(sql "SELECT c.chunk_id FROM keys k JOIN chunks c USING (object_id) WHERE k.key = '$1'")"
+  echo "$(sql "SELECT count(*) FROM chunk_placements WHERE chunk_id = '$c' AND node_id = 'node2'")" \
+    "$(sql "SELECT count(*) FROM chunk_replicas WHERE chunk_id = '$c' AND node_id = 'node2' AND origin = 'upload'")"
+}
+# new_conn SERVICE PORT_ARGS... OLD: true if SERVICE now has a matching
+# connection that isn't one of OLD's lines.
+new_conn() {
+  local svc="$1" pp="$2" lp="$3" old="$4" c
+  while read -r c; do
+    [[ -n "$c" ]] && ! grep -qxF "$c" <<<"$old" && return 0
+  done <<<"$(halfopen_conns "$svc" "$coord_ip" "$pp" "$lp")"
+  return 1
+}
+elapsed() { python3 -c "import sys, time; print(f'{time.time() - float(sys.argv[1]):.1f}')" "$1"; }
+
+echo "7a. the coordinator's connection to node2"
+since="$(sql "SELECT now()")"
+halfopen_helper node2 >/dev/null # started first: installing iptables takes seconds
+synced=""
+for try in $(seq 1 12); do
+  # A put that records node2's replica has just read from the connection.
+  [[ "$(put7 "replication/halfopen-sync-$try-$run")" == "1 1" ]] && { synced=yes; break; }
+done
+old="$(halfopen_conns node2 "$coord_ip" - 9102)"
+if [[ -z "$synced" ]]; then
+  inconclusive "7a: no put in 12 recorded node2's replica, so none could time the drop"
+elif [[ -z "$old" ]]; then
+  fail "7a: no connection from the coordinator to node2 to drop"
+else
+  while read -r l f; do halfopen_drop node2 "$l" "$f"; done <<<"$old"
+  t0="$(now)"
+  echo "   dropped node2's side of: $(tr '\n' ' ' <<<"$old")"
+  pre=""
+  for try in 1 2 3 4; do
+    r="$(put7 "replication/halfopen-pre-$try-$run")"
+    [[ "$r" == 1\ * ]] && { pre="${r#1 }"; break; }
+  done
+  if [[ -z "$pre" ]]; then
+    inconclusive "7a: no put placed on node2 right after the drop"
+  elif [[ "$pre" != 0 ]]; then
+    fail "7a: a put right after the drop recorded node2's replica: the connection was not half-open"
+  else
+    ok "half-open: right after the drop, a put placed on node2 did not record its replica ($(elapsed "$t0") s after the drop)"
+    back=""
+    for try in $(seq 1 30); do
+      [[ "$(put7 "replication/halfopen-back-$try-$run")" == "1 1" ]] && { back="$(elapsed "$t0")"; break; }
+      (($(python3 -c "import sys, time; print(int(time.time() - float(sys.argv[1])))" "$t0") > 30)) && break
+      sleep 1
+    done
+    if [[ -z "$back" ]]; then
+      fail "7a: 30 s after the drop, puts placed on node2 still don't record it: the half-open connection was never closed"
+    else
+      # Keepalive: a ping 10 s after the last read, closed 2 s later; plus the put that noticed.
+      (($(python3 -c "import sys; print(int(float(sys.argv[1]) <= 12 + 2 + 3))" "$back"))) \
+        && ok "node2's replica recorded again $back s after the drop (keepalive: within 12 s, plus one put)" \
+        || fail "node2's replica recorded again only $back s after the drop, want within 17 s"
+      new_conn node2 - 9102 "$old" && ok "the coordinator reaches node2 over a new connection" \
+        || fail "7a: no new connection from the coordinator to node2"
+    fi
+  fi
+  ev="$(sql "SELECT coalesce(string_agg(to_state, ',' ORDER BY event_id), '') FROM liveness_events WHERE node_id = 'node2' AND at >= '$since'")"
+  [[ -z "$ev" ]] && ok "node2 had no liveness event throughout (its heartbeats use another connection)" \
+    || fail "7a: node2's liveness changed: $ev"
+fi
+halfopen_cleanup
+
+echo "7b. node2's heartbeat connection"
+since="$(sql "SELECT now()")"
+old="$(halfopen_conns node2 "$coord_ip" 9090 -)"
+if [[ -z "$old" ]]; then
+  fail "7b: no heartbeat connection from node2 to drop"
+else
+  log_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  while read -r l f; do halfopen_drop node2 "$l" "$f"; done <<<"$old"
+  t0="$(now)"
+  echo "   dropped: $(tr '\n' ' ' <<<"$old")"
+  resumed=""
+  for _ in $(seq 1 50); do
+    new_conn node2 9090 - "$old" && { resumed="$(elapsed "$t0")"; break; }
+    sleep 0.2
+  done
+  sleep $((2 * hb_interval)) # let any transition land
+  if [[ -z "$resumed" ]]; then
+    fail "7b: no new heartbeat connection within 10 s of the drop"
+  else
+    # At most one interval (2.2 s with jitter) to the next beat, which times out (2 s), then a redial.
+    ok "node2 heartbeats on a new connection $resumed s after the drop (expected within about 4.2 s)"
+  fi
+  # The mechanism: the beat timed out and the loop redialed. Had the kernel's
+  # TCP_USER_TIMEOUT closed the connection first, the beat would have failed
+  # UNAVAILABLE with redial false, and reconnecting would wait an interval.
+  hb_log="$("${compose[@]}" logs --no-log-prefix --since "$log_since" node2 2>&1 | grep '"msg":"heartbeat failed' || true)"
+  if grep -q '"redial":true' <<<"$hb_log"; then
+    ok "node2's beat timed out and it redialed: $(grep -m1 -o '"error":"[^"]*"' <<<"$hb_log")"
+  else
+    fail "7b: node2 did not log a redial after a timed-out beat: ${hb_log:-no heartbeat failure logged}"
+  fi
+  ev="$(sql "SELECT coalesce(string_agg(to_state || '@' || round(extract(epoch FROM at)::numeric, 1), ' ' ORDER BY event_id), '')
+             FROM liveness_events WHERE node_id = 'node2' AND at >= '$since'")"
+  echo "   node2 liveness events: ${ev:-none}"
+  if [[ "$ev" == *DEAD* ]]; then
+    fail "7b: node2 went DEAD"
+  else
+    ok "node2 never went DEAD"
+  fi
+  if [[ "$ev" == *SUSPECT* ]]; then
+    # SUSPECT then ALIVE: back within about one interval (plus 1 s for the sweep).
+    gap="$(python3 - "$ev" <<'PY'
+import sys
+ev = [e.split("@") for e in sys.argv[1].split()]
+s = next(float(t) for st, t in ev if st == "SUSPECT")
+a = [float(t) for st, t in ev if st == "ALIVE" and float(t) >= s]
+print(f"{a[0] - s:.1f}" if a else "never")
+PY
+)"
+    [[ "$gap" != never ]] && (($(python3 -c "import sys; print(int(float(sys.argv[1]) <= float(sys.argv[2])))" "$gap" "$((hb_interval + 1))"))) \
+      && ok "node2 blipped SUSPECT and was ALIVE again $gap s later" \
+      || fail "7b: node2 went SUSPECT and was ALIVE again only after: $gap s"
+  fi
+  [[ "$(liveness_states)" == *node2=ALIVE* ]] && ok "node2 ALIVE" || fail "7b: node2 not ALIVE: $(liveness_states)"
+fi
+halfopen_cleanup
+
+echo "7c. gateway1's connection to the coordinator"
+halfopen_helper gateway1 >/dev/null
+curl -sf --max-time 5 "http://127.0.0.1:9081/cluster" >/dev/null || fail "7c: /cluster failed before the drop"
+old="$(halfopen_conns gateway1 "$coord_ip" 9090 -)"
+if [[ -z "$old" ]]; then
+  fail "7c: no connection from gateway1 to the coordinator to drop"
+else
+  while read -r l f; do halfopen_drop gateway1 "$l" "$f"; done <<<"$old"
+  t0="$(now)"
+  echo "   dropped: $(tr '\n' ' ' <<<"$old")"
+  if curl -sf --max-time 4 "http://127.0.0.1:9081/cluster" >/dev/null; then
+    fail "7c: /cluster worked right after the drop: the connection was not half-open"
+  else
+    ok "half-open: /cluster fails right after the drop"
+    back=""
+    while :; do
+      curl -sf --max-time 4 "http://127.0.0.1:9081/cluster" >/dev/null && { back="$(elapsed "$t0")"; break; }
+      (($(python3 -c "import sys, time; print(int(time.time() - float(sys.argv[1])))" "$t0") > 30)) && break
+      sleep 1
+    done
+    if [[ -z "$back" ]]; then
+      fail "7c: /cluster still failing 30 s after the drop"
+    else
+      (($(python3 -c "import sys; print(int(float(sys.argv[1]) <= 12 + 4 + 1))" "$back"))) \
+        && ok "/cluster works again $back s after the drop (TCP_USER_TIMEOUT: 2 s with a request in flight; keepalive: 12 s at most)" \
+        || fail "/cluster works again only $back s after the drop, want within 17 s"
+      new_conn gateway1 9090 - "$old" && ok "gateway1 reaches the coordinator over a new connection" \
+        || fail "7c: no new connection from gateway1 to the coordinator"
+    fi
+  fi
+fi
+halfopen_cleanup
 
 finish

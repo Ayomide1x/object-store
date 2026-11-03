@@ -1,0 +1,13 @@
+--- a/coordinator/src/main/resources/application.yaml
++++ b/coordinator/src/main/resources/application.yaml
+@@ -12,10 +12,6 @@
+       # permit half that, so pings that arrive a little early never close a
+       # good connection ("too many pings"). Code constants, not deploy config:
+       # they must line up with the clients' (DECISIONS.md, stage 11).
+-      keepalive:
+-        permit:
+-          time: 5s
+-          without-calls: true
+ logging:
+   structured:
+     format:

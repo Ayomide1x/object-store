@@ -1,0 +1,14 @@
+--- a/node/internal/heartbeat/heartbeat.go
++++ b/node/internal/heartbeat/heartbeat.go
+@@ -75,10 +75,8 @@
+ 		grpc.WithConnectParams(grpc.ConnectParams{
+ 			Backoff:           backoff.Config{BaseDelay: interval, Multiplier: 1, Jitter: 0.1, MaxDelay: interval},
+ 			MinConnectTimeout: interval,
+-		}),
+-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+-			Time: keepaliveTime, Timeout: keepaliveTimeout, PermitWithoutStream: true,
+ 		}))
++	_ = keepalive.ClientParameters{}
+ 	if err != nil {
+ 		return nil, fmt.Errorf("dial coordinator %s: %w", addr, err)
+ 	}

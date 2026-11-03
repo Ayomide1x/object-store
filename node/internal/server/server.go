@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
@@ -59,16 +61,24 @@ const (
 	// useful bound.
 	streamWindow = 1 << 20
 	connWindow   = 16 << 20
+	// minPingInterval is the most often a client may send keepalive pings,
+	// with or without calls in flight. The coordinator pings every 10 s
+	// (NodeClient.KEEPALIVE_TIME); permitting half that means pings that
+	// arrive a little early never get the connection closed for "too many
+	// pings". gRPC's default permits one every 5 min, and none without calls.
+	minPingInterval = 5 * time.Second
 )
 
 // GRPCOptions are the options a node's gRPC server must use. With them, a
 // write holds at most about 3 MiB in gRPC: one stream window of unread data,
-// plus one message as received and as decoded.
+// plus one message as received and as decoded. They also permit the
+// coordinator's keepalive pings.
 func GRPCOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.StaticStreamWindowSize(streamWindow),
 		grpc.StaticConnWindowSize(connWindow),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: minPingInterval, PermitWithoutStream: true}),
 	}
 }
 

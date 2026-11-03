@@ -1,0 +1,13 @@
+--- a/node/internal/heartbeat/heartbeat.go
++++ b/node/internal/heartbeat/heartbeat.go
+@@ -127,9 +127,7 @@
+ 			}
+ 			failing = true
+ 		}
+-		if timedOut && l.redial(log) {
+-			continue // beat again at once, on the new connection
+-		}
++		_ = l.redial
+ 
+ 		t := time.NewTimer(jitter(cfg.Interval))
+ 		select {

@@ -2043,3 +2043,126 @@ The restart smoke test stays as step 6a.
 **Because:** "ALIVE" comes from the node's heartbeats, but writes, repair and GC need the coordinator to reach the node. A channel that silently stops connecting turns a healthy node into a permanent hole in replica accounting. Metadata never overstates, but the coordinator under-counts forever, and repair keeps copying chunks the node already has.
 
 **Breaks if:** a call legitimately needs more than half its deadline just to connect, a slow path across regions rather than this LAN, so healthy channels get replaced. Or the half-open case starts happening in practice, which this doesn't cover without keepalive.
+
+## gRPC keepalive on every long-lived connection; the heartbeat also redials after one timed-out beat (stage 11)
+**Amends:** "A node channel that isn't ready within half the call's deadline is replaced; only that replacement is rate-limited" (stage 11), which left keepalive "as a separate decision".
+
+**The gap:** a half-open connection is one whose far end, or the path to it, is gone with nothing closed. Before this change it lasted until TCP gave up, about 15 min on Linux:
+- **Coordinator → node:** the channel stayed READY, so the readiness check let every call through, and every call ended DEADLINE_EXCEEDED. The node stayed ALIVE, because its heartbeats use another connection.
+- **Node → coordinator heartbeat:** beats timed out and the node went falsely DEAD, which starts repair.
+- **Gateway → coordinator:** every HTTP request timed out after `GATEWAY_COORDINATOR_TIMEOUT`.
+
+**Chose:**
+
+| Connection | Ping after | Ack timeout | Pings without calls | Detected within |
+|---|---|---|---|---|
+| Coordinator → node (`NodeClient`) | 10 s | 2 s | yes | 12 s |
+| Node → coordinator (heartbeat) | 10 s | 3 s | yes | redial after one timed-out beat: 4.2 s at worst; keepalive 13 s as the backstop |
+| Gateway → coordinator (`httpapi.DialCoordinator`) | 10 s | 2 s | yes | about 2 s with a request in flight; 12 s at most |
+
+- **10 s is the floor** in both grpc-go and grpc-java: shorter values are rounded up.
+- **Pings with no call in flight:** the coordinator's calls (2 s each, about every 10 s) are shorter than the ping interval, so pings only during calls would rarely fire. A connection that went half-open between calls would then be found only by the next call failing.
+- **Per-operation connections get no keepalive:** the gateway's and osctl's replica reads and writes use a fresh connection, already bounded by its read or write deadline.
+- **The hand-off:** when keepalive closes a connection, grpc-java ends the calls in flight with UNAVAILABLE ("Keepalive failed"), which take the unlimited replace-and-retry path. With no call in flight the channel goes IDLE, and the next call's readiness wait (`getState(true)`) reconnects in milliseconds. So nothing is replaced and the rate limit doesn't come into it; `NodeKeepaliveTest` checks there was no not-ready replacement.
+- **The heartbeat redial:**
+  - after one beat that ends DEADLINE_EXCEEDED, the loop closes its connection, dials a new one and beats at once;
+  - worst case: the next beat goes at most 2.2 s after the last good one (an interval with its jitter) and times out 2 s later, so it lands on the new connection 4.2 s after the last good beat, plus one dial;
+  - that is 1.8 s under SUSPECT (6 s) and 10.8 s under DEAD (15 s), where keepalive alone (11 s, then up to 2.2 s for the next beat) left 1.8 s under DEAD and certain SUSPECT;
+  - **one timed-out beat, not two:** two would be 2.2 + 2 + 2.2 + 2 = 8.4 s, so certain SUSPECT. A false redial costs one dial, and the connection carries nothing but heartbeats. Against a hung coordinator the loop beats back to back, still one at a time, so at most one beat per interval.
+
+**TCP_USER_TIMEOUT, found on the stack mid-build:**
+- **grpc-go** sets the kernel's `TCP_USER_TIMEOUT` to the keepalive timeout on Linux (`internal/transport/http2_client.go`, grpc-go 1.85.0), so data left unacknowledged that long closes the connection, without waiting for a ping.
+- **grpc-java** sets it only with Netty's epoll transport, which isn't on the coordinator's classpath (NIO is used). The coordinator's channels rely on pings alone.
+- **Measured in stage 4 step 7:**
+  - **7a, coordinator → node2:** recovered after 12.6 s and 13.1 s (ping at 10 s, timeout 2 s, plus the put that noticed);
+  - **7b, node2's heartbeat, with an ack timeout of 1 s (the first design):** the beat failed UNAVAILABLE ("connection timed out") after about 1 s, before its 2 s deadline, so the redial never ran; node2 reconnected on the next beat, 4.5 s and 4.7 s after the drop. The worst case would have been about 6 s, at SUSPECT;
+  - **7b with 3 s:** the beat ended DeadlineExceeded, node2 logged `"redial":true`, and it beat on a new connection 2.3 s after the drop, with no liveness event;
+  - **7c, gateway1 → coordinator:** `/cluster` answered 503 after 2.2 s, and the next request succeeded on a new connection; recovered 2.3 s after the drop, twice.
+- **So the heartbeat's ack timeout is 3 s,** longer than the 2 s beat timeout. The beat's deadline fires first, and the redial runs on Linux as on macOS (which has no TCP_USER_TIMEOUT). The backstop becomes 10 + 3 = 13 s, still 2 s under DEAD.
+- **The gateway keeps 2 s:** with a request in flight, a half-open connection now recovers in about 2 s instead of 12. A false close costs one request (503) on an otherwise idle LAN path.
+- **The Go unit tests cannot show this.** Their half-open proxy runs in user space, and its kernel acknowledges every byte, so TCP_USER_TIMEOUT never fires under it, on Linux (golang:1.27, run in a container: same results and timings as on macOS) or macOS. Only dropped packets show it, so step 7b checks node2's log for the redial.
+
+**Tests and mutations, each caught by its named test:**
+
+| Mutation | Removes | Caught by |
+|---|---|---|
+| S16 | keepalive on `NodeClient` channels | `NodeKeepaliveTest.aHalfOpenNodeConnectionIsClosedAndTheNextCallReconnects` |
+| h5 | the heartbeat's redial after a timed-out beat (keepalive still on) | `TestBeatsResumeOnANewConnectionAfterAHalfOpenConnection` |
+| h6 | keepalive on the heartbeat connection | `TestDialedConnectionNoticesAHalfOpenConnection` |
+| w20 | keepalive on the gateway's coordinator connection | `TestCoordinatorConnectionRecoversFromAHalfOpenConnection` |
+
+- **The control,** `withoutKeepaliveAHalfOpenConnectionStaysReadyAndCallsTimeOut`: a channel without keepalive behind a frozen proxy stays READY on its one connection, and every call times out for 13 s. It proves the proxy really makes a connection half-open, so the keepalive tests can't pass trivially.
+- **The redial test** runs at a 200 ms interval. Beats must resume on a new connection within one beat timeout plus one interval and its jitter, plus 50 ms, of the freeze. The longest silence the coordinator sees must stay under SUSPECT scaled (3 intervals), so far under DEAD (7.5).
+- **h1, h2 and h4 were regenerated** for the restructured loop (`heartbeat.New` and `Loop.Run`, which owns the connection so it can replace it), and m2 because the node server's doc comment moved its context. Each is still caught by its named test.
+
+**Over:**
+- **OS TCP keepalive alone:** it misses a peer whose kernel acknowledges but whose HTTP/2 has stalled, and setting its timings from Java needs options specific to the transport.
+- **A redial on UNAVAILABLE as well:** a refused connection is UNAVAILABLE at once, so the loop would spin while the coordinator is down.
+- **A heartbeat ack timeout of 1 s:** TCP_USER_TIMEOUT gets there before the beat deadline and the redial never runs.
+- **Servers pinging their clients:** that only removes the server's leftover socket, one per incident. On nodes, Go's default OS TCP keepalive (15 s idle × 9 probes) already does it in about 2.5 min.
+
+**Because:** a half-open connection turns a live node into a 15-minute hole in replica accounting, a live node into a false DEAD (and needless repair), or a live gateway into 15 minutes of timeouts. Pings find it in seconds, at the cost of one HTTP/2 PING per idle connection every 10 s.
+
+**Breaks if:** the path between services adds more than 2 s (3 s for heartbeats) of delay to an ack, so healthy connections get closed. Or a NAT, firewall or load balancer in between has an idle timeout under 10 s, or swallows HTTP/2 PINGs. Or `NODE_HEARTBEAT_INTERVAL` is raised to 3 s or more, so the beat timeout is no longer shorter than the 3 s TCP_USER_TIMEOUT and the redial stops running first.
+
+## Each server permits pings at half its clients' rate, with or without calls (stage 11)
+**Chose:**
+
+| Server | Permits a ping every | Without calls | Its clients ping every | Margin |
+|---|---|---|---|---|
+| Node (Go `EnforcementPolicy`, `server.GRPCOptions`) | 5 s | yes | coordinator: 10 s | 2× |
+| Coordinator (`spring.grpc.server.keepalive.permit.*`, application.yaml) | 5 s | yes | heartbeats and gateways: 10 s | 2× |
+
+- **Why not equal:** a client measures its interval from its last read, a server between ping arrivals, so jitter can bring two pings closer together. Both libraries tolerate two early pings, but the margin shouldn't depend on that.
+- **The coordinator's test node servers** (`FakeNodes`, `NodeAddressChangeTest`, `NodeKeepaliveTest`) permit pings as real nodes do. Under grpc-java's defaults they would answer "too many pings" in any test that leaves a channel idle for 30 s.
+
+**Over:** the libraries' defaults, which permit a ping every 5 min at most, and none without calls. The third ping from a client, at about 30 s, gets the connection closed for "too many pings": a good connection lost every 30 s.
+
+**Tested:**
+- `TestCoordinatorPingRateIsPermitted` (node) and `CoordinatorPingPolicyIT` (coordinator): a client pinging every 10 s with no calls keeps its one connection for 36 s.
+- Mutations n11 (the node's default policy) and S17 (the coordinator's default policy) each get exactly that: 2 connections, the first closed for too many pings.
+
+**Breaks if:** a client's ping interval is lowered under 5 s (the libraries' 10 s floor prevents it), or a proxy that terminates gRPC sits in between with its own stricter policy.
+
+## Keepalive values are code constants, not environment variables (stage 11)
+**Chose:** constants at each use site:
+- `NodeClient.KEEPALIVE_TIME` and `KEEPALIVE_TIMEOUT`;
+- the heartbeat's `keepaliveTime` and `keepaliveTimeout`;
+- the gateway's `coordinatorKeepalive*`;
+- the node's `minPingInterval`;
+- the coordinator's permit in application.yaml, the same kind of default as its port.
+
+**Over:** environment variables documented in docker-compose.yml, as for other config.
+
+**Because:** each value must line up with the other side's. A client set to ping more often than its server permits closes good connections. The heartbeat's timeout must stay longer than its beat timeout. The 10 s floor leaves nothing to tune downward. Tunable separately, they are misconfigurations waiting to happen; this entry and the comments at each site keep the pairs together.
+
+**Breaks if:** a deployment's network needs different timings (for example a slower path between regions). Then they should become configuration validated as pairs, not separate knobs.
+
+## The half-open check drops one connection by both ends' address and port, not the node's traffic (stage 11)
+**Chose:** in stage 4 step 7, `scripts/lib/halfopen.sh` runs a helper container (`alpine:3` with iptables, so it needs the network on first use). The helper shares one service's network namespace and has NET_ADMIN. It drops one connection's packets in both directions, matched by both ends' address and port, and closes nothing. New connections between the same two services get through.
+- Each sub-check first makes the connection fresh: a put that records node2, or a `/cluster` request, so the next ping is about 10 s away. Then it shows the connection really is half-open: a put placed on node2 doesn't record it, or `/cluster` fails. Only then does it time the recovery and check that a new connection exists.
+- Cleanup deletes the rules (they live in the service's namespace, not the helper's) and then the helpers, on success and in the exit trap.
+
+**Over:** dropping all of a node's packets for a while. Reconnects fail too until the drop ends, and then TCP retransmission revives the old connection by itself, so the check would pass with or without keepalive.
+
+**Because:** the failure keepalive exists for is one dead connection while a new one would work: a peer gone, a middlebox that forgot the connection, an address that moved.
+
+**Breaks if:** a service stops having exactly the connections the check expects (for example the coordinator keeps two channels per node), or Docker's network stops honouring iptables rules in a container's namespace. Then the precondition fails, and the check reports a FAIL rather than a false pass.
+
+## Keepalive is the slow way out of a channel that never becomes ready; the readiness check is the fast one, and its test asserts that speed (stage 11)
+**Chose:** keep the readiness check before each node call (a channel not READY within half the deadline is replaced, rate-limited per node). Its regression test, `NodeAddressChangeTest.aChannelThatNeverBecomesReadyIsReplaced`, now:
+- uses a 2 s replace interval;
+- times recovery from the first connection to the silent peer;
+- requires it within the replace interval plus one node call plus 1 s (5 s), under half of keepalive's 12 s;
+- requires a not-ready replacement (`notReadyReplacements > 0`), so a recovery driven by keepalive fails it however fast it is.
+
+Measured: 3.02–3.03 s in 10 runs out of 10 (the 1 s readiness wait, then the 2 s interval).
+
+**Over:**
+- Keeping the old bound (replace interval plus 4 s, timed from when the node came back). Once node channels had keepalive, the s12 mutation (readiness check removed) passed it: grpc-java pings even before the HTTP/2 handshake completes, so a connection to a peer that never speaks HTTP/2 is closed after about 12 s, and the channel's reconnect resolves the new address inside the old window.
+- Registering s12 to one of the other four tests that fail under it. Then the test written for this regression stops guarding it.
+- A test-only switch to turn keepalive off. Keepalive stays a code constant (see the entry above).
+
+**Because:** with keepalive in place, the readiness check is worth having for its speed: about 3 s instead of about 12 s, the difference between a node call failing for one replace interval and failing past SUSPECT. A test that accepts either way out no longer guards that.
+
+**Breaks if:** the node call deadline or the replace interval grows until replace interval + one call + 1 s reaches half of KEEPALIVE_TIME + KEEPALIVE_TIMEOUT. The test asserts that ordering, so it fails rather than silently accepting keepalive's recovery.

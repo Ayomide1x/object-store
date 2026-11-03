@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 	"github.com/Ayomide1x/object-store/internal/download"
@@ -365,6 +367,35 @@ func (s *Server) cluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toClusterResponse(resp))
+}
+
+// Keepalive on the coordinator connection: ping after 10 s without reading
+// anything (grpc-go's floor), calls or no calls, and drop the connection if
+// the ack takes over 2 s. The coordinator permits pings every 5 s, half this
+// rate.
+const (
+	coordinatorKeepaliveTime    = 10 * time.Second
+	coordinatorKeepaliveTimeout = 2 * time.Second
+)
+
+// DialCoordinator returns the gateway's one connection to the coordinator,
+// shared by all requests. It holds no request state; grpc-go reconnects it if
+// the coordinator restarts. Every call gets a deadline of timeout (see
+// CoordinatorDeadline). Keepalive closes a half-open connection (the
+// coordinator's end, or the path, gone without closing anything) within
+// 12 s, where without it every request would time out until TCP gave up,
+// about 15 min; the next request reconnects.
+func DialCoordinator(addr string, timeout time.Duration) (*grpc.ClientConn, error) {
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(CoordinatorDeadline(timeout)),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time: coordinatorKeepaliveTime, Timeout: coordinatorKeepaliveTimeout, PermitWithoutStream: true,
+		}))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	return conn, nil
 }
 
 // CoordinatorDeadline returns a unary interceptor that gives every

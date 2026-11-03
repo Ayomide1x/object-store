@@ -95,23 +95,22 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}()
 
 	// Heartbeats run beside serving and never block it.
-	coordConn, err := heartbeat.Dial(cfg.coordinatorAddr, cfg.heartbeatInterval)
+	instanceID := heartbeat.NewInstanceID()
+	hb, err := heartbeat.New(heartbeat.Config{
+		NodeID: cfg.nodeID, InstanceID: instanceID, Interval: cfg.heartbeatInterval,
+		Addr: cfg.coordinatorAddr, Log: log,
+	})
 	if err != nil {
 		srv.Stop()
 		return err
 	}
-	defer coordConn.Close()
 	hbCtx, stopHeartbeats := context.WithCancel(ctx)
 	defer stopHeartbeats()
 	hbDone := make(chan struct{})
-	instanceID := heartbeat.NewInstanceID()
 	log.Info("heartbeating", "coordinator", cfg.coordinatorAddr, "interval", cfg.heartbeatInterval, "instance_id", instanceID)
 	go func() {
 		defer close(hbDone)
-		heartbeat.Run(hbCtx, heartbeat.Config{
-			NodeID: cfg.nodeID, InstanceID: instanceID, Interval: cfg.heartbeatInterval,
-			Client: objectstorev1.NewCoordinatorServiceClient(coordConn), Log: log,
-		})
+		hb.Run(hbCtx) // closes its connection when it returns
 	}()
 
 	select {

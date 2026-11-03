@@ -41,6 +41,9 @@ expected_test() {
     h2-loop-exits-on-error) echo "TestSurvivesTheCoordinatorBeingDown" ;;
     h3-ignores-cancellation) echo "TestStopsPromptlyOnCancellation" ;;
     h4-default-reconnect-backoff) echo "TestSurvivesTheCoordinatorBeingDown" ;;
+    h5-no-redial-after-timeout) echo "TestBeatsResumeOnANewConnectionAfterAHalfOpenConnection" ;;
+    h6-no-heartbeat-keepalive) echo "TestDialedConnectionNoticesAHalfOpenConnection" ;;
+    n11-default-ping-policy) echo "TestCoordinatorPingRateIsPermitted" ;;
     r1-read-order-ignores-liveness) echo "TestDeadReplicasAreReadLast" ;;
     q1-push-ignores-expected-hash) echo "TestPushChunk/source_is_not_the_recorded_chunk" ;;
     q2-push-response-without-node-id) echo "TestPushChunk/copies_a_verified_chunk" ;;
@@ -72,6 +75,7 @@ expected_test() {
     w17-inline-disposition) echo "TestDownloadIsAnAttachment" ;;
     w18-health-probe-sends-listen-host) echo "TestHealthProbeSendsAnAllowedHost" ;;
     w19-csp-allows-inline-scripts) echo "TestEveryResponseCarriesTheSecurityHeaders" ;;
+    w20-no-coordinator-keepalive) echo "TestCoordinatorConnectionRecoversFromAHalfOpenConnection" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

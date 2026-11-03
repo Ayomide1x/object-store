@@ -5,15 +5,19 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
+	"github.com/Ayomide1x/object-store/internal/halfopen"
 )
 
 const interval = 50 * time.Millisecond
@@ -34,11 +38,31 @@ type fakeCoordinator struct {
 	inFlight    atomic.Int32
 	maxInFlight atomic.Int32
 	first       atomic.Int64 // unix nanos of the first beat
+
+	mu     sync.Mutex
+	landed []landing // every beat that reached the coordinator
+}
+
+// landing is one beat as the coordinator saw it: when, and on which connection.
+type landing struct {
+	at   time.Time
+	peer string
+}
+
+func (f *fakeCoordinator) landings() []landing {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]landing(nil), f.landed...)
 }
 
 func (f *fakeCoordinator) Heartbeat(ctx context.Context, req *objectstorev1.HeartbeatRequest) (*objectstorev1.HeartbeatResponse, error) {
 	f.beats.Add(1)
 	f.first.CompareAndSwap(0, time.Now().UnixNano())
+	if p, ok := peer.FromContext(ctx); ok {
+		f.mu.Lock()
+		f.landed = append(f.landed, landing{at: time.Now(), peer: p.Addr.String()})
+		f.mu.Unlock()
+	}
 	n := f.inFlight.Add(1)
 	defer f.inFlight.Add(-1)
 	for {
@@ -66,27 +90,22 @@ func serve(t *testing.T, lis net.Listener, f *fakeCoordinator) {
 	t.Cleanup(srv.Stop)
 }
 
-// client dials the way the node does, so the reconnect backoff under test is the real one.
-func client(t *testing.T, addr string) objectstorev1.CoordinatorServiceClient {
+// start runs the loop against addr in the background, dialling the way the
+// node does (so the reconnect backoff under test is the real one), and
+// returns a function that cancels it and fails the test unless Run returns
+// within limit.
+func start(t *testing.T, addr string, interval time.Duration) func(limit time.Duration) {
 	t.Helper()
-	conn, err := Dial(addr, interval)
+	l, err := New(Config{NodeID: "node1", InstanceID: "test", Interval: interval, Addr: addr,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
-	return objectstorev1.NewCoordinatorServiceClient(conn)
-}
-
-// start runs the loop in the background and returns a function that cancels
-// it and fails the test unless Run returns within limit.
-func start(t *testing.T, c objectstorev1.CoordinatorServiceClient) func(limit time.Duration) {
-	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Run(ctx, Config{NodeID: "node1", InstanceID: "test", Interval: interval, Client: c,
-			Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		l.Run(ctx)
 	}()
 	stop := func(limit time.Duration) {
 		cancel()
@@ -116,7 +135,7 @@ func TestBeatsImmediatelyThenOnTheInterval(t *testing.T) {
 	f := &fakeCoordinator{}
 	serve(t, lis, f)
 	began := time.Now()
-	stop := start(t, client(t, lis.Addr().String()))
+	stop := start(t, lis.Addr().String(), interval)
 	time.Sleep(10 * interval)
 	stop(interval)
 
@@ -140,7 +159,7 @@ func TestSurvivesTheCoordinatorBeingDown(t *testing.T) {
 	addr := lis.Addr().String()
 	lis.Close() // down
 	f := &fakeCoordinator{}
-	stop := start(t, client(t, addr))
+	stop := start(t, addr, interval)
 
 	time.Sleep(40 * interval)          // 2 s down
 	lis, err = net.Listen("tcp", addr) // back on the same address
@@ -173,7 +192,7 @@ func TestAHungCoordinatorCostsOneBeatAtATime(t *testing.T) {
 	}
 	f := &fakeCoordinator{mode: hang}
 	serve(t, lis, f)
-	stop := start(t, client(t, lis.Addr().String()))
+	stop := start(t, lis.Addr().String(), interval)
 	time.Sleep(10 * interval)
 	stop(2 * interval)
 
@@ -192,7 +211,7 @@ func TestRejectedBeatsAreRetried(t *testing.T) {
 	}
 	f := &fakeCoordinator{mode: reject}
 	serve(t, lis, f)
-	stop := start(t, client(t, lis.Addr().String()))
+	stop := start(t, lis.Addr().String(), interval)
 	time.Sleep(5 * interval)
 	stop(interval)
 	if n := f.beats.Load(); n < 3 {
@@ -206,7 +225,103 @@ func TestStopsPromptlyOnCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	serve(t, lis, &fakeCoordinator{mode: hang}) // even mid-beat
-	stop := start(t, client(t, lis.Addr().String()))
+	stop := start(t, lis.Addr().String(), interval)
 	time.Sleep(interval / 2)
 	stop(interval) // returns within one beat's timeout
+}
+
+// halfOpen serves a fake coordinator behind a proxy whose connections can be
+// made half-open.
+func halfOpen(t *testing.T) (*fakeCoordinator, *halfopen.Proxy) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeCoordinator{}
+	serve(t, lis, f)
+	p, err := halfopen.Start(lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	return f, p
+}
+
+// A half-open heartbeat connection (the coordinator's end gone, nothing
+// closed) fails every beat on it. The loop drops it after one timed-out beat
+// and beats at once on a new connection, so beats resume within one beat
+// timeout plus one interval of the freeze, and the coordinator's longest
+// silence stays under SUSPECT (3 intervals at the demo's 2 s and 6 s), let
+// alone DEAD (7.5). Keepalive is on, but needs 11 s: this is the redial.
+func TestBeatsResumeOnANewConnectionAfterAHalfOpenConnection(t *testing.T) {
+	const iv = 200 * time.Millisecond
+	f, proxy := halfOpen(t)
+	stop := start(t, proxy.Addr(), iv)
+	for deadline := time.Now().Add(20 * iv); len(f.landings()) < 3; {
+		if time.Now().After(deadline) {
+			t.Fatal("no beats before the freeze")
+		}
+		time.Sleep(iv / 10)
+	}
+
+	proxy.Freeze()
+	frozenAt := time.Now()
+	frozenPeer := f.landings()[len(f.landings())-1].peer
+	var resumed time.Duration
+	for deadline := frozenAt.Add(15 * iv); resumed == 0 && time.Now().Before(deadline); time.Sleep(iv / 20) {
+		for _, b := range f.landings() {
+			if b.peer != frozenPeer {
+				resumed = b.at.Sub(frozenAt)
+				break
+			}
+		}
+	}
+	time.Sleep(3 * iv)
+	stop(2 * iv)
+
+	if resumed == 0 {
+		t.Fatalf("no beat on a new connection within %s of the freeze (the redial missing?)", 15*iv)
+	}
+	// One beat timeout (iv) plus one interval and its jitter, plus 50 ms for the dial and scheduling.
+	if bound := iv + iv + iv/10 + 50*time.Millisecond; resumed > bound {
+		t.Errorf("beats resumed %s after the freeze, want within %s", resumed, bound)
+	}
+	var maxGap time.Duration
+	ls := f.landings()
+	for i := 1; i < len(ls); i++ {
+		maxGap = max(maxGap, ls[i].at.Sub(ls[i-1].at))
+	}
+	if suspect := 3 * iv; maxGap >= suspect {
+		t.Errorf("longest silence %s, want under %s (SUSPECT, scaled; DEAD is %s)", maxGap, suspect, iv*15/2)
+	}
+	if n := proxy.Accepted(); n != 2 {
+		t.Errorf("%d connections, want 2 (one frozen, one new)", n)
+	}
+}
+
+// Keepalive is the backstop: with no beat in flight, a connection from Dial
+// notices it is half-open within keepaliveTime plus keepaliveTimeout and
+// leaves READY, so the next beat reconnects.
+func TestDialedConnectionNoticesAHalfOpenConnection(t *testing.T) {
+	t.Parallel()
+	_, proxy := halfOpen(t)
+	conn, err := Dial(proxy.Addr(), interval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := objectstorev1.NewCoordinatorServiceClient(conn).Heartbeat(ctx, &objectstorev1.HeartbeatRequest{NodeId: "node1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	proxy.Freeze()
+	bound := keepaliveTime + keepaliveTimeout + time.Second
+	for deadline := time.Now().Add(bound); conn.GetState() == connectivity.Ready; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("still READY %s after the connection went half-open (no keepalive?)", bound)
+		}
+	}
 }

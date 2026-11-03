@@ -1,0 +1,12 @@
+--- a/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
++++ b/coordinator/src/main/java/io/github/ayomide1x/objectstore/coordinator/NodeClient.java
+@@ -408,9 +408,6 @@
+ 
+     private ManagedChannel newChannel(String addr) {
+         ManagedChannel ch = ManagedChannelBuilder.forTarget(addr).usePlaintext()
+-                .keepAliveTime(KEEPALIVE_TIME.toNanos(), TimeUnit.NANOSECONDS)
+-                .keepAliveTimeout(KEEPALIVE_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)
+-                .keepAliveWithoutCalls(true)
+                 .build();
+         live.add(ch);
+         created.incrementAndGet();

@@ -20,9 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
 	"github.com/Ayomide1x/object-store/gateway/internal/httpapi"
 	"github.com/Ayomide1x/object-store/gateway/internal/webui"
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
@@ -66,13 +63,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	// One connection to the coordinator, shared by all requests. It holds no
-	// request state; grpc-go reconnects it if the coordinator restarts.
-	conn, err := grpc.NewClient(cfg.coordinatorAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithUnaryInterceptor(httpapi.CoordinatorDeadline(cfg.coordinatorTimeout)))
+	conn, err := httpapi.DialCoordinator(cfg.coordinatorAddr, cfg.coordinatorTimeout)
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", cfg.coordinatorAddr, err)
+		return err
 	}
 	defer conn.Close()
 

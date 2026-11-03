@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -310,7 +311,10 @@ final class FakeNodes {
             FakeNode node = new FakeNode("node" + i);
             node.owner = this;
             try {
-                node.server = ServerBuilder.forPort(0).addService(node).build().start();
+                // Permits the coordinator's keepalive pings as a real node does.
+                node.server = ServerBuilder.forPort(0)
+                        .permitKeepAliveTime(5, TimeUnit.SECONDS).permitKeepAliveWithoutCalls(true)
+                        .addService(node).build().start();
             } catch (IOException e) {
                 throw new IllegalStateException("start fake " + node.nodeId, e);
             }

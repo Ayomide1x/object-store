@@ -65,6 +65,16 @@ import org.springframework.stereotype.Component;
  * stale channel replace it once and all use the new one), logged at WARN and
  * counted; the old channel is shut down, then forced down after a grace.
  *
+ * <p>A connection can also go half-open: the node or the path is gone, nothing
+ * is closed, and the channel stays READY while every call times out (until
+ * TCP gives up, about 15 min). Keepalive pings find it: every channel pings
+ * after {@link #KEEPALIVE_TIME} without reading anything, calls or no calls,
+ * and closes the connection if no ack comes within {@link #KEEPALIVE_TIMEOUT}.
+ * Calls in flight then end UNAVAILABLE (the unlimited replace-and-retry
+ * above); with none in flight the channel goes IDLE and the next call's
+ * readiness wait reconnects it. Nodes permit pings every 5 s without calls
+ * (node/internal/server), half this rate.
+ *
  * <p>Two rules apply to every node response the coordinator records facts
  * from:
  * <ul>
@@ -84,6 +94,14 @@ public class NodeClient implements DisposableBean {
 
     /** How long failed calls count toward a node's recent_call_failures. */
     static final Duration FAILURE_WINDOW = Duration.ofMinutes(1);
+
+    /**
+     * Keepalive: ping after this long without reading anything. 10 s is
+     * grpc-java's floor (shorter values are rounded up to it).
+     */
+    static final Duration KEEPALIVE_TIME = Duration.ofSeconds(10);
+    /** Keepalive: close the connection if a ping isn't acked this fast; the node RPC deadline. */
+    static final Duration KEEPALIVE_TIMEOUT = Duration.ofSeconds(2);
 
     private final Duration timeout;
     private final Duration copyTimeout;
@@ -107,6 +125,7 @@ public class NodeClient implements DisposableBean {
         // Guarded by this.
         long lastNotReadyReplacementNanos = Long.MIN_VALUE;
         long replacements;
+        long notReadyReplacements; // for tests
         final Deque<Long> failures = new ArrayDeque<>();
 
         NodeChannel(String addr) {
@@ -355,6 +374,7 @@ public class NodeClient implements DisposableBean {
             nc.channel = fresh;
             if (rateLimited) {
                 nc.lastNotReadyReplacementNanos = now;
+                nc.notReadyReplacements++;
             }
             replacements = ++nc.replacements;
         }
@@ -387,7 +407,11 @@ public class NodeClient implements DisposableBean {
     }
 
     private ManagedChannel newChannel(String addr) {
-        ManagedChannel ch = ManagedChannelBuilder.forTarget(addr).usePlaintext().build();
+        ManagedChannel ch = ManagedChannelBuilder.forTarget(addr).usePlaintext()
+                .keepAliveTime(KEEPALIVE_TIME.toNanos(), TimeUnit.NANOSECONDS)
+                .keepAliveTimeout(KEEPALIVE_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)
+                .keepAliveWithoutCalls(true)
+                .build();
         live.add(ch);
         created.incrementAndGet();
         return ch;
@@ -427,6 +451,17 @@ public class NodeClient implements DisposableBean {
     /** Channels ever created. For tests. */
     long createdChannels() {
         return created.get();
+    }
+
+    /** Replacements of a channel that wasn't ready in time (the rate-limited kind). For tests. */
+    long notReadyReplacements(Node node) {
+        NodeChannel nc = channels.get(node.internalAddr());
+        if (nc == null) {
+            return 0;
+        }
+        synchronized (nc) {
+            return nc.notReadyReplacements;
+        }
     }
 
     @Override

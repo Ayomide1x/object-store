@@ -86,6 +86,8 @@ expected_test() {
     s13-replacement-not-single-flight) echo "NodeAddressChangeTest|concurrentCallsOnAStuckChannelReplaceItOnce()" ;;
     s14-no-replacement-rate-limit) echo "NodeAddressChangeTest|replacementIsRateLimitedPerNode()" ;;
     s15-unavailable-retry-rate-limited) echo "NodeAddressChangeTest|theFirstCallAfterANodeReturnsOnANewAddressSucceedsWithinTheWindow()" ;;
+    s16-node-channels-no-keepalive) echo "NodeKeepaliveTest|aHalfOpenNodeConnectionIsClosedAndTheNextCallReconnects()" ;;
+    s17-server-default-ping-policy) echo "CoordinatorPingPolicyIT|pingsAtTheClientsRateWithoutCallsKeepTheConnection()" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

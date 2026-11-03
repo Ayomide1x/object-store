@@ -1,0 +1,15 @@
+--- a/gateway/internal/httpapi/httpapi.go
++++ b/gateway/internal/httpapi/httpapi.go
+@@ -388,10 +388,8 @@
+ func DialCoordinator(addr string, timeout time.Duration) (*grpc.ClientConn, error) {
+ 	conn, err := grpc.NewClient(addr,
+ 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+-		grpc.WithUnaryInterceptor(CoordinatorDeadline(timeout)),
+-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+-			Time: coordinatorKeepaliveTime, Timeout: coordinatorKeepaliveTimeout, PermitWithoutStream: true,
+-		}))
++		grpc.WithUnaryInterceptor(CoordinatorDeadline(timeout)))
++	_ = keepalive.ClientParameters{}
+ 	if err != nil {
+ 		return nil, fmt.Errorf("dial %s: %w", addr, err)
+ 	}

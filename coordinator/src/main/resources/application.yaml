@@ -8,6 +8,14 @@ spring:
   grpc:
     server:
       port: 9090
+      # Clients ping every 10 s without calls (nodes' heartbeats, gateways);
+      # permit half that, so pings that arrive a little early never close a
+      # good connection ("too many pings"). Code constants, not deploy config:
+      # they must line up with the clients' (DECISIONS.md, stage 11).
+      keepalive:
+        permit:
+          time: 5s
+          without-calls: true
 logging:
   structured:
     format:
