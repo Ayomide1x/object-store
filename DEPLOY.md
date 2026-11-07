@@ -3,11 +3,24 @@
 This guide puts the object store at `https://objectstore.ayomideo.dev` on a single ARM VM (Ubuntu 24.04, arm64, 4 cores, 23 GiB) that already runs other Compose projects and a Caddy container serving them over HTTPS.
 
 **Layout:**
-- **Caddy** runs in its own Compose project with host networking. It terminates HTTPS, asks for a password (basic auth), and proxies to the two gateways on `127.0.0.1:9081` and `127.0.0.1:9082`.
-- **The object store** runs from this repo as the Compose project `objectstore`, with `docker-compose.prod.yml` layered on the tested `docker-compose.yml`. Only the two gateway ports are published, on loopback. Postgres, the coordinator and the nodes are reachable only on the project's own network.
-- **Backups:** a daily `pg_dump` of the metadata, kept 14 days.
+- **Caddy** runs in its own Compose project with host networking. It terminates HTTPS, asks for a password (basic auth, bcrypt at cost 10, the hash in Caddy's environment), and proxies to the two gateways on `127.0.0.1:9081` and `127.0.0.1:9082`. The site block is [`deploy/objectstore.caddy`](deploy/objectstore.caddy).
+- **The object store** runs from this repo as the Compose project `objectstore`, with [`docker-compose.prod.yml`](docker-compose.prod.yml) layered on the tested `docker-compose.yml`, which is unchanged. The VM's `.env` selects it ([`.env.prod.example`](.env.prod.example)). It sets:
+  - only the gateways' ports published, on 127.0.0.1; Postgres, the coordinator and the nodes are reachable only on the project's own network;
+  - a required Postgres password;
+  - GC at the code defaults (15 min read grace, 24 h pending timeout);
+  - `restart: unless-stopped` and rotated logs.
+- **Backups:** [`scripts/backup-db.sh`](scripts/backup-db.sh) takes a daily `pg_dump` of the metadata, kept 14 days. It covers the metadata only: the chunk files and the backups share the VM's one disk.
 
-The reasons for each choice are in DECISIONS.md, in the entries marked "(deployment)".
+**Checks:**
+- **[`scripts/caddy-check.sh`](scripts/caddy-check.sh)** verifies, locally, with the VM's Caddy version and that exact block, that Caddy keeps the gateway's guarantees:
+  - `%2F` stays encoded;
+  - uploads stream without buffering or a timeout;
+  - a broken download fails at the client over HTTP/1.1, HTTP/2 and HTTP/3;
+  - Host and Origin pass through;
+  - a wrong password costs under 100 ms.
+- **[`scripts/deploy-smoke.sh`](scripts/deploy-smoke.sh)** checks the live deployment from your own machine.
+
+The reasons for each choice are in DECISIONS.md, in the entries marked "(deployment)". Deploying somewhere other than this VM? See [Deploying anywhere else](#deploying-anywhere-else).
 
 The commands under "On the VM" run over SSH; those under "On your Mac" run in this repo on your machine. Nothing here runs tests, Testcontainers or mutation scripts on the VM.
 
@@ -265,3 +278,11 @@ That only works if no migration ran in between; otherwise restore the backup tak
 - **A flood of password guesses.** Each costs about 48 ms of CPU, so a sustained flood can still slow the VM and your other sites. Real rate limiting needs a custom Caddy build, shared with your other sites. If Caddy's logs show guessing, that's the next step, or fail2ban on Caddy's 401s.
 - **The coordinator being down.** It's a single point of failure by design: uploads and downloads stop, and the nodes keep their data.
 - **Anyone with the password.** There's one login, and it can read, upload and delete everything.
+
+## Deploying anywhere else
+
+What this guide relies on that another setup must provide too:
+- **Memory:** every service has a hard limit, about 4.25 GiB in total, derived from worst-case bounds and checked by saturating each cap (see DECISIONS.md, stages 9 and 10).
+- **No authentication in the services:** keep every port on loopback and put the gateways behind a proxy that authenticates. The proxy must pass `%2F` in paths through undecoded, must not buffer bodies or impose a whole-request timeout, must abort a response the gateway aborts, and must pass Host on unchanged (or add the name it sends to `GATEWAY_ALLOWED_HOSTS`). `scripts/caddy-check.sh` shows how to check each of these.
+- **Watching costs:** each open UI tab polls every 2 s. The coordinator caches the expensive counts for `COORDINATOR_STATUS_CACHE_TTL` (1 s), so the scan behind them runs at most once a second however many tabs watch; it still grows with the number of chunks.
+- **Keepalive pings on the network path:** every long-lived gRPC connection (coordinator to nodes, nodes' heartbeats, gateways to the coordinator) sends an HTTP/2 PING after 10 s without traffic. Anything between the services, such as a NAT, firewall or load balancer, must pass those pings and have an idle timeout over 10 s, and a proxy that terminates gRPC must permit a ping every 10 s. A half-open connection is then found within 12 s (13 s for a heartbeat connection, which a node normally replaces after one timed-out beat, about 4 s). The values are code constants that must match on both sides (DECISIONS.md, stage 11).

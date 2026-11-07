@@ -60,7 +60,7 @@ test("the UI follows demo.sh: Suspect then Dead, under-replicated, repaired, Bad
     await expect(page.locator('[data-testid="chunk-row"][data-counted="3"]')).toHaveCount(CHUNKS, { timeout: POLL_MARGIN });
     await expect(card).toHaveAttribute("data-state", "DEAD");
 
-    // For the README: the dead bay, the copies that replaced it, the feed.
+    // For docs/web-ui.md: the dead bay, the copies that replaced it, the feed.
     await page.getByRole("button", { name: "Refresh" }).click();
     await expect(page.locator(`[data-testid="object-item"][data-key="${KEY}"]`)).toHaveCount(1);
     await page.screenshot({ path: path.join(root, "web", "test-results", "ui-demo-repair.png") });
