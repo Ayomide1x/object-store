@@ -2166,3 +2166,110 @@ Measured: 3.02–3.03 s in 10 runs out of 10 (the 1 s readiness wait, then the 2
 **Because:** with keepalive in place, the readiness check is worth having for its speed: about 3 s instead of about 12 s, the difference between a node call failing for one replace interval and failing past SUSPECT. A test that accepts either way out no longer guards that.
 
 **Breaks if:** the node call deadline or the replace interval grows until replace interval + one call + 1 s reaches half of KEEPALIVE_TIME + KEEPALIVE_TIMEOUT. The test asserts that ordering, so it fails rather than silently accepting keepalive's recovery.
+
+## The Host allowlist accepts a bare host name, which matches only a Host header without a port (deployment)
+**Chose:** a `GATEWAY_ALLOWED_HOSTS` entry may be a bare DNS name (`objectstore.ayomideo.dev`) as well as `host:port`. A bare name matches only a Host header with no port: what a browser sends for an `https://` URL on port 443, which Caddy passes on unchanged. An IP address without a port, or anything that isn't a DNS name, is refused at startup.
+
+**Over:**
+- Having Caddy rewrite Host to a `host:port` the gateway already accepts (`header_up Host 127.0.0.1:9081`). The browser's `Origin` would then no longer match Host, so the cross-origin check would depend on `Sec-Fetch-Site` alone and refuse the UI's writes from browsers that don't send it.
+- Ignoring the port when matching. Then `evil.example:9081` and `objectstore.ayomideo.dev:8443` would match as well, a looser check than it needs to be.
+
+**Because:** the allowlist exists against DNS rebinding, and a rebinding page sends its own name in Host whether a port is there or not. Matching the exact header a browser sends keeps the check as strict as it was. The cross-origin check (Go's `CrossOriginProtection`) needs no change: browsers send `Sec-Fetch-Site: same-origin`, and without it an `Origin` of `https://objectstore.ayomideo.dev` has the same host as Host. `TestBareHostNameBehindAProxy` covers both cases.
+
+**Breaks if:** the gateway is served on a non-default port through a proxy that passes Host on: the browser then sends `name:port`, which needs its own `host:port` entry. Or a proxy rewrites Host, which breaks the Origin comparison.
+
+## Caddy reaches the gateways on their loopback ports; only those two ports are published (deployment)
+**Chose:** on the VM, Caddy runs with host networking (`network_mode: host`, in its own Compose project) and proxies to `127.0.0.1:9081` and `127.0.0.1:9082`, the gateways' published ports. `docker-compose.prod.yml` keeps those two ports and unpublishes Postgres, the coordinator and the four nodes (`ports: !reset []`). Those are reachable only on the project's own network.
+
+**Over:**
+- Attaching the gateways to a Docker network Caddy is on. Caddy is on no Docker network: with host networking, its only network is the host's.
+- Keeping every port published on 127.0.0.1, as in development. Nothing on the VM's host uses them, and 9090 and 5432 are common ports for other projects to want.
+
+**Because:** loopback-only ports are reachable from Caddy (in the host's network namespace) and from nothing outside the VM. That's the same exposure the development stack has, minus the ports only `osctl` and the scripts use. `scripts/caddy-check.sh` runs Caddy the same way locally: host networking, the published loopback ports, and Docker's `docker-proxy` in between.
+
+**Breaks if:** Caddy moves off host networking: then the gateways need to be on its network, and the loopback ports stop working for it. Or something on the VM needs `osctl` or direct gRPC: then the nodes' and coordinator's ports must come back, and `COORDINATOR_NODES`' client addresses (127.0.0.1:910x) must be ones that client can reach.
+
+## Caddy proxies with its defaults: each behaviour our guarantees depend on is verified, not assumed (deployment)
+**Chose:** the site block (`deploy/objectstore.caddy`) is `basic_auth` plus `reverse_proxy` to both gateways, with only `lb_try_duration 5s` and `fail_duration 30s`. There's no `encode`, no `request_buffers`, no timeouts and no header changes. `scripts/caddy-check.sh` checks, with Caddy v2.11.7 (the VM's version) and this exact block:
+- `%2F` in a key reaches the gateway still encoded (a key with "/", " " and "%" round-trips; a raw "/" is still refused);
+- request bodies stream: a 512 MiB upload at 2 MB/s over HTTP/2 took 262 s, chunks were written on the nodes from 11 s on, and Caddy's memory peaked at 31 MiB;
+- a download the gateway aborts is aborted to the client: over HTTP/1.1 curl exits 18, over HTTP/2 the stream is reset (curl exit 92), and over HTTP/3 the stream is reset with H3_INTERNAL_ERROR, each after exactly the verified chunk 0;
+- Host and Origin are passed on unchanged: same-origin writes succeed, and a foreign Origin gets 403;
+- a PUT over 5 GiB still gets 413, and the coordinator is asked nothing.
+
+**Over:**
+- Adding settings "to be safe" (`flush_interval -1`, `request_buffers 0`, explicit timeouts). Each is either already the default or one more thing to keep right.
+- Active health checks. Their probe sends the upstream's own address as Host, which the gateway refuses with 403. Passive health (a refused connection skips that gateway for 30 s) covers a gateway restart, and `lb_try_duration` retries only failed connections, so no request body is sent twice.
+
+**Because:** all three guarantees (keys with "/", streaming without a whole-request timeout, a broken download never looking complete) are ones a proxy can quietly undo. Checking them against the version and block actually deployed is the only way to know.
+
+**Breaks if:** Caddy's defaults change in an upgrade, for example buffering bodies or answering an upstream failure with a complete response; or someone adds `encode` (compression) to the block. Rerun `scripts/caddy-check.sh` with the new version before upgrading Caddy on the VM.
+
+## Basic auth at Caddy, bcrypt at cost 10 with a long random password, and no exemption for /healthz (deployment)
+**Chose:** Caddy's `basic_auth` in front of every route, including the UI, `/cluster` and `/healthz`. The user name and bcrypt hash come from Caddy's environment (`{$OBJECTSTORE_USER}`, `{$OBJECTSTORE_PASSWORD_HASH}`), so neither is in any repository. The password is 32 random characters from `openssl rand`, kept in a password manager. The hash is made with `htpasswd -niBC 10`, so bcrypt cost 10, with the password read from stdin. `scripts/caddy-check.sh` fails if a wrong password costs more than 100 ms.
+
+**Over:**
+- `caddy hash-password`, which uses bcrypt cost 14 and has no option to change it. Measured with Caddy v2.11.7: every new wrong password took about 0.73 s of one core. At cost 10 it takes about 48 ms, and the first right login 64 ms. Caddy caches each password's result, so the UI's polling (about one request a second per tab) costs 0.2 ms either way: the cost only matters for guesses.
+- Exempting `/healthz`. Docker's healthcheck runs inside the gateway container against the gateway itself and never goes through Caddy, and there is no external monitor. An uptime monitor added later would need `handle /healthz` ahead of `basic_auth`, exposing only "ok".
+- Authentication in the gateway itself. That's out of scope (CLAUDE.md), and Caddy already sits in front.
+
+**Because:** the password, not bcrypt's cost, is what makes guessing hopeless. A 32-character random password has far more entropy than any number of guesses could cover, at cost 10 or 14. Cost 14's only effect is to make each guess expensive for the VM, which also serves two other sites.
+
+**Remaining risk:** at about 48 ms per guess, a sustained flood of guesses (about 20 a second per core) can still load the VM's 4 cores and slow the other sites. Real rate limiting would need a custom Caddy build with a plugin (`caddy-ratelimit`). That build would be shared with the other sites, so it's out of scope for now.
+
+**Breaks if:** the password becomes something guessable (then cost 10 is too cheap), or guess traffic appears in Caddy's logs. Then add rate limiting, or a host-level ban such as fail2ban on Caddy's 401s.
+
+## Production settings live in an override file that .env selects (deployment)
+**Chose:** `docker-compose.prod.yml` layered on `docker-compose.yml`. On the VM, `.env` sets `COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml` and `COMPOSE_PROJECT_NAME=objectstore`, so every plain `docker compose` there includes the override. The override sets:
+- the Postgres password, required, with no default;
+- GC at the code defaults;
+- `restart: unless-stopped`;
+- rotated logs (`json-file`, 5 × 10 MB per service);
+- the gateways' allowed Host (`objectstore.ayomideo.dev`);
+- the ports described above.
+
+`.env.prod.example` documents the format.
+
+**Over:**
+- Editing `docker-compose.yml`. It is what every acceptance script and the verification runs test.
+- A second, standalone production Compose file. It would copy, and drift from, every limit and setting the stages measured.
+- Passing `-f` on every command. The first one typed without it would start a stack with the development password, GC timings and ports.
+
+**Because:** the override changes only what differs in production, and each change is listed in its header with what it weakens.
+
+**What it weakens, compared with the acceptance scripts:**
+- Only the gateways are reachable from the host. `osctl` and the scripts can't reach the coordinator or the nodes there, and none runs there.
+- GC: stage 8's "no orphan files after the GC window" now takes 24 h, and the scripts' GC waits would not finish. That's acceptable, because these are the code defaults the compose file already called the production values.
+- `restart: unless-stopped` turns a crashing node into SUSPECT/ALIVE flapping instead of DEAD. Repair still follows the real liveness state, and `docker compose stop` (stage 6) is respected.
+- Caddy is a new hop. `scripts/caddy-check.sh` and `scripts/deploy-smoke.sh` cover it.
+
+**Breaks if:** someone runs the VM's stack from a directory without that `.env`, or deletes it. Then the override is gone (and Compose fails on nothing, since the base file has defaults). DEPLOY.md's checks look for `objectstore` as the project name and for no published ports but the gateways'.
+
+## Production GC timings are the code defaults: read grace 15 minutes, pending timeout 24 hours (deployment)
+**Chose:** `COORDINATOR_GC_READ_GRACE=15m` and `COORDINATOR_GC_PENDING_TIMEOUT=24h` in the override. All other timings, liveness included, stay as tested.
+
+**Over:**
+- The demo values (60 s and 120 s). An upload counts from its start, so 120 s would abandon any upload slower than about 35 Mbit/s for a 500 MiB file, and a home connection's uplink is often slower.
+- Something shorter than 24 h, such as 6 h. The gateway caps an object at 5 GiB, which takes about 6 h at 2 Mbit/s, so 6 h would have no margin.
+
+**Because:** an abandoned upload's chunk files cost disk for up to a day. A legitimate upload cut off by GC costs the upload.
+
+**Breaks if:** uploads slower than 5 GiB per 24 h (under about 0.5 Mbit/s) matter, or abandoned uploads fill the disk faster than a day's GC clears them.
+
+## The backup is a daily pg_dump of the metadata only, kept 14 days (deployment)
+**Chose:** `scripts/backup-db.sh`, run from cron on the VM at 03:15 every day. It runs `pg_dump -Fc` through the running Postgres container into a temp file, checks the dump's table of contents with `pg_restore --list`, then renames it into `~/backups/objectstore/`. Dumps older than 14 days are deleted, but only after a new one succeeded.
+
+**Over:**
+- A backup sidecar container. A cron entry on the host is one line to read and check, and it runs with the same `.env`.
+- Copying the Postgres volume while it runs. A file copy of a running database isn't consistent.
+
+**Because:** Postgres is the only metadata truth (invariant 7). Losing it loses every key even though the chunk files survive.
+
+**What it doesn't cover:**
+- The chunk files. All four node volumes are on the VM's one disk, so the three replicas protect against a node failing, not against losing the disk or the VM: that loses everything.
+- The backups themselves, which sit on that same disk.
+- Restoring an older dump loses the objects written since. A chunk that GC deleted since then fails its reads, loudly, as invariant 5 requires.
+
+An offsite copy (for example Oracle's boot-volume backups, or copying the dumps elsewhere) is out of scope for now.
+
+**Breaks if:** the data starts to matter beyond a demo. Then the disk is the single point of failure, and the backups need to leave the VM.

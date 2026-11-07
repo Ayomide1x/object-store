@@ -1,0 +1,80 @@
+# Production settings for one VM behind Caddy (DEPLOY.md). Layered on
+# docker-compose.yml, which stays exactly what the acceptance scripts test.
+# Selected by the VM's .env (see .env.prod.example):
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+#
+# so a plain `docker compose` there always includes this file.
+#
+# What changes, and what it weakens (DECISIONS.md, "(deployment)" entries):
+# - Only the two gateways keep a published port, on 127.0.0.1, for Caddy
+#   (host networking) to proxy to. Postgres, the coordinator and the nodes are
+#   reachable only on the project's network: osctl and the acceptance scripts
+#   can't reach them from the host, and none runs there.
+# - The Postgres password must be set in .env; there is no default.
+# - GC keeps the code defaults (read grace 15m, pending timeout 24h), not the
+#   demo values: an upload may take up to 24h, and the GC checks of the
+#   acceptance scripts would take that long.
+# - Every service restarts unless stopped, and its logs are rotated.
+#
+# !reset needs Docker Compose 2.24.4 or later.
+
+x-prod: &prod
+  restart: unless-stopped
+  # Docker's default json-file driver never rotates. 5 files of 10 MB per
+  # service: at most about 400 MB of logs for the 8 services.
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  postgres:
+    <<: *prod
+    environment:
+      POSTGRES_PASSWORD: ${OBJECTSTORE_DB_PASSWORD:?set OBJECTSTORE_DB_PASSWORD in .env}
+    ports: !reset []
+
+  coordinator:
+    <<: *prod
+    environment:
+      SPRING_DATASOURCE_PASSWORD: ${OBJECTSTORE_DB_PASSWORD:?set OBJECTSTORE_DB_PASSWORD in .env}
+      # The code defaults. How long a superseded or removed object's files
+      # are kept, so a download that already holds the chunk list finishes:
+      COORDINATOR_GC_READ_GRACE: 15m
+      # How long an upload may stay PENDING, counted from its start, before
+      # its chunk files are deleted. The gateway caps an object at 5 GiB:
+      # about 6h at 2 Mbit/s.
+      COORDINATOR_GC_PENDING_TIMEOUT: 24h
+    ports: !reset []
+
+  node1:
+    <<: *prod
+    ports: !reset []
+
+  node2:
+    <<: *prod
+    ports: !reset []
+
+  node3:
+    <<: *prod
+    ports: !reset []
+
+  node4:
+    <<: *prod
+    ports: !reset []
+
+  # The gateways keep 127.0.0.1:9081 and :9082 from docker-compose.yml. The
+  # Host header served is the public name alone: the browser sends no port
+  # for https on 443, and Caddy passes Host on unchanged. The healthcheck
+  # sends it too.
+  gateway1:
+    <<: *prod
+    environment:
+      GATEWAY_ALLOWED_HOSTS: objectstore.ayomideo.dev
+
+  gateway2:
+    <<: *prod
+    environment:
+      GATEWAY_ALLOWED_HOSTS: objectstore.ayomideo.dev

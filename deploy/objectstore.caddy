@@ -1,0 +1,27 @@
+# The object store's site block for Caddy (DEPLOY.md). Caddy runs with host
+# networking and proxies to the two gateways' loopback ports. With Caddy's
+# defaults, which scripts/caddy-check.sh verifies against this exact block:
+# %2F in keys reaches the gateway still encoded, request bodies stream (no
+# buffering, no body or write timeout), and a download the gateway aborts is
+# aborted to the client too, over HTTP/1.1, HTTP/2 and HTTP/3. So: no encode
+# (compression would hide an abort's short body behind chunking), no
+# request_buffers, no timeouts. Host is passed on unchanged, which the
+# gateway's allowlist and cross-origin check rely on.
+#
+# OBJECTSTORE_USER and OBJECTSTORE_PASSWORD_HASH (from caddy hash-password)
+# come from Caddy's environment, so no credential is in this file.
+objectstore.ayomideo.dev {
+	basic_auth {
+		{$OBJECTSTORE_USER} {$OBJECTSTORE_PASSWORD_HASH}
+	}
+	reverse_proxy 127.0.0.1:9081 127.0.0.1:9082 {
+		# A refused connection (a gateway restarting) is retried on the
+		# other gateway for up to 5 s. Only failures to connect are retried,
+		# so no request body is ever sent twice.
+		lb_try_duration 5s
+		# Passive health: a gateway that failed to connect is skipped for 30 s.
+		# No active health checks: their probe would send 127.0.0.1:9081 as
+		# Host, which the gateway refuses.
+		fail_duration 30s
+	}
+}

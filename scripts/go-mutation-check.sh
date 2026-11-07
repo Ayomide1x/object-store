@@ -76,6 +76,7 @@ expected_test() {
     w18-health-probe-sends-listen-host) echo "TestHealthProbeSendsAnAllowedHost" ;;
     w19-csp-allows-inline-scripts) echo "TestEveryResponseCarriesTheSecurityHeaders" ;;
     w20-no-coordinator-keepalive) echo "TestCoordinatorConnectionRecoversFromAHalfOpenConnection" ;;
+    w21-allowed-hosts-require-port) echo "TestBareHostNameBehindAProxy" ;;
     *) echo "unknown mutation $1" >&2; return 1 ;;
   esac
 }

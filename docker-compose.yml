@@ -268,10 +268,13 @@ services:
   # whole-request timeout). GATEWAY_CHUNK_WRITE_TIMEOUT and _READ_TIMEOUT
   # bound each replica write and read, as osctl's do. GOMEMLIMIT: Go's soft
   # memory limit, under mem_limit above. GATEWAY_ALLOWED_HOSTS (required):
-  # the Host header values served, host:port, comma-separated; any other Host
-  # gets 403 (against DNS rebinding: a hostile domain resolving to 127.0.0.1).
-  # It must include the host and port you type in the browser. The
-  # healthcheck sends the first entry as its Host. The web UI is served at /.
+  # the Host header values served, comma-separated, each host:port or a bare
+  # host name (which matches only a Host without a port, as a browser sends
+  # for https on 443 through a proxy); any other Host gets 403 (against DNS
+  # rebinding: a hostile domain resolving to 127.0.0.1). It must include the
+  # host and port you type in the browser. The healthcheck sends the first
+  # entry as its Host. The web UI is served at /. (docker-compose.prod.yml
+  # sets it for the deployment.)
   gateway1:
     <<: *gateway
     environment:

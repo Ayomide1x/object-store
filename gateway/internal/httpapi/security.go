@@ -8,9 +8,13 @@ import (
 	"strings"
 )
 
-// ParseAllowedHosts parses GATEWAY_ALLOWED_HOSTS: comma-separated host:port
-// entries, such as "localhost:9081,127.0.0.1:9081". An empty list is an
-// error: the gateway refuses to start rather than serve every Host.
+// ParseAllowedHosts parses GATEWAY_ALLOWED_HOSTS: comma-separated entries,
+// each host:port, such as "localhost:9081,127.0.0.1:9081", or a bare host
+// name, such as "objectstore.example.com". A bare name matches only a Host
+// header without a port: what a browser sends for an https:// URL on the
+// default port, through a reverse proxy that passes Host on. An IP address
+// with no port is refused (IPv6 needs brackets and a port anyway); an empty
+// list is an error: the gateway refuses to start rather than serve every Host.
 func ParseAllowedHosts(s string) ([]string, error) {
 	var hosts []string
 	for _, entry := range strings.Split(s, ",") {
@@ -18,9 +22,16 @@ func ParseAllowedHosts(s string) ([]string, error) {
 		if entry == "" {
 			continue
 		}
+		if !strings.Contains(entry, ":") {
+			if !isHostName(entry) {
+				return nil, fmt.Errorf("allowed host %q must be host:port or a host name", entry)
+			}
+			hosts = append(hosts, entry)
+			continue
+		}
 		host, port, err := net.SplitHostPort(entry)
 		if err != nil || host == "" {
-			return nil, fmt.Errorf("allowed host %q must be host:port", entry)
+			return nil, fmt.Errorf("allowed host %q must be host:port or a host name", entry)
 		}
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 			return nil, fmt.Errorf("allowed host %q has a bad port", entry)
@@ -28,13 +39,33 @@ func ParseAllowedHosts(s string) ([]string, error) {
 		hosts = append(hosts, entry)
 	}
 	if len(hosts) == 0 {
-		return nil, fmt.Errorf("at least one allowed host:port is required")
+		return nil, fmt.Errorf("at least one allowed host is required")
 	}
 	return hosts, nil
 }
 
+// isHostName reports whether s is a DNS name (letters, digits, "-" and "."
+// labels, not all digits and dots, so not an IPv4 address).
+func isHostName(s string) bool {
+	if s == "" || net.ParseIP(s) != nil {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !('a' <= r && r <= 'z' || '0' <= r && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // AllowHosts refuses, with 403, every request whose Host header is not in
-// hosts (compared without case, port included). It guards against DNS
+// hosts (compared without case, port included: a bare name matches only a
+// Host without a port). It guards against DNS
 // rebinding: a page on a hostile domain that resolves to 127.0.0.1 is
 // same-origin with the gateway as far as the browser is concerned, but its
 // requests carry that domain in Host. It applies to every route, reads

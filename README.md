@@ -113,7 +113,7 @@ Open <http://127.0.0.1:9081/> (or 9082) once the stack is up.
 Things worth knowing:
 - Keys `.` and `..` can't be reached from any browser (the URL parser removes those path segments, even encoded), so the UI won't upload them and lists them as osctl-only.
 - A download is a plain link: the browser streams it to disk. If it breaks partway the browser marks it failed; the gateway never completes a download it couldn't verify.
-- `GATEWAY_ALLOWED_HOSTS` lists the `host:port` names the gateway answers to; any other Host gets 403 (against DNS rebinding). Add any other name you reach it by.
+- `GATEWAY_ALLOWED_HOSTS` lists the names the gateway answers to, `host:port` or a bare host name (which matches only a Host without a port, as a browser sends for `https://` on 443); any other Host gets 403 (against DNS rebinding). Add any other name you reach it by.
 
 **Developing the UI:** `cd web && npm ci && npm run dev` serves it on <http://127.0.0.1:5173> with hot reload, proxying the API to a running gateway (`GATEWAY=http://127.0.0.1:9082` to pick the other one). `npm test`, `npm run lint` and `npm run typecheck` are the fast checks. `make web` builds it into the gateway's embed directory for a local `bin/gateway`; without that, `go build` still works and `/` answers 503 "web UI not built". The gateway image always builds it.
 
@@ -168,6 +168,8 @@ These hold at every stage after the one that introduced them; code that would br
 | `stage10-gateway-check.sh` | curl round trips; 411 and 413; a later chunk corrupt on every replica gives a broken transfer with exactly the verified prefix; two gateways and a restart; overwrite, rm, ls and stat match `osctl` in both directions |
 | `stage11-ui-check.sh` | on a fresh stack, the browser suite above; a foreign Host gets 403 on every route and a cross-origin DELETE deletes nothing; both gateways healthy with the allowlist set |
 | `demo.sh` | the demo story, end to end |
+| `caddy-check.sh` | (deployment, local) with the VM's Caddy and site block in front of the production stack: basic auth on every route and a wrong password's cost; Host and Origin passed through; `%2F` kept encoded; 413; a broken download fails over HTTP/1.1, HTTP/2 and HTTP/3; a 512 MiB upload streams |
+| `deploy-smoke.sh` | (deployment, from your machine) against the live URL: 401 without the password, `/cluster`, a round trip under a key with "/", a broken download over HTTP/2 and in your browser |
 
 Each script ends PASS (exit 0), FAIL (exit 1: the product got a check wrong) or INCONCLUSIVE (exit 75: nothing failed, but a precondition or a random draw didn't happen, so rerun); CI reruns an inconclusive script up to 3 times. Scripts that corrupt files restore them afterwards and check that every file they touched is gone or verifies. A mutation counts as detected when its named test fails (for the coordinator, in a run of only that test's class); each script then runs the full unmutated suite once. CI runs the Go, coordinator and web unit tests on every push, and the acceptance scripts and the three mutation checks weekly.
 
@@ -188,19 +190,29 @@ Every non-obvious choice is recorded in [DECISIONS.md](DECISIONS.md): what was c
 - [Host allowlist against DNS rebinding](DECISIONS.md#host-allowlist-on-every-route-the-health-probe-sends-an-allowed-host-stage-11)
 - [Browser tests wait on states, never on time](DECISIONS.md#browser-tests-wait-on-states-never-on-time-stage-11)
 
-## Before deploying
+## Deployment
 
-Nothing is deployed yet. The shipped Compose file is the development and demo stack; a deploy (for example to a single small ARM VM) would need:
+[DEPLOY.md](DEPLOY.md) is the whole procedure for one ARM VM (Ubuntu 24.04) that also hosts other Compose projects, with Caddy in front at `https://objectstore.ayomideo.dev`:
+- **Caddy, with host networking,** terminates HTTPS, asks for a password (basic auth, bcrypt at cost 10, the hash in Caddy's environment) and proxies to the gateways' loopback ports. The site block is [`deploy/objectstore.caddy`](deploy/objectstore.caddy).
+- **[`docker-compose.prod.yml`](docker-compose.prod.yml)** layers the production settings on the tested `docker-compose.yml`, which is unchanged. The VM's `.env` selects it ([`.env.prod.example`](.env.prod.example)). It sets:
+  - only the gateways' ports published, on 127.0.0.1;
+  - a required Postgres password;
+  - GC at the code defaults (15 min read grace, 24 h pending timeout);
+  - `restart: unless-stopped` and rotated logs.
+- **[`scripts/caddy-check.sh`](scripts/caddy-check.sh)** verifies, locally, with the VM's Caddy version and that exact block, that Caddy keeps the gateway's guarantees:
+  - `%2F` stays encoded;
+  - uploads stream without buffering or a timeout;
+  - a broken download fails at the client over HTTP/1.1, HTTP/2 and HTTP/3;
+  - Host and Origin pass through;
+  - a wrong password costs under 100 ms.
+- **[`scripts/deploy-smoke.sh`](scripts/deploy-smoke.sh)** checks the live deployment from your own machine.
+- **[`scripts/backup-db.sh`](scripts/backup-db.sh)** takes the daily metadata backup. It covers the metadata only: the chunk files and the backups share the VM's one disk.
 
-- **A real Postgres password:** set `OBJECTSTORE_DB_PASSWORD` (copy `.env.example` to `.env`).
-- **Production GC timings:** the shipped `COORDINATOR_GC_READ_GRACE` (60 s) and `COORDINATOR_GC_PENDING_TIMEOUT` (120 s) are demo values; use the code defaults, 15 min and 24 h.
-- **Ports kept on loopback:** with no authentication, reach the services through an SSH tunnel. Drop or remap Postgres's host port (5432) if the host runs another Postgres; only the scripts use it.
+Anywhere else, keep in mind:
 - **Memory:** every service has a hard limit, about 4.25 GiB in total, derived from worst-case bounds and checked by saturating each cap (see DECISIONS.md, stages 9 and 10).
-- **The gateways have no authentication either:** keep them on loopback too. Behind a reverse proxy, make sure it passes `%2F` in paths through undecoded, or keys with slashes stop resolving, and add the name it uses to `GATEWAY_ALLOWED_HOSTS`, or every request gets 403. The UI's delete is protected against cross-site requests and DNS rebinding, not against anyone who can reach the port.
+- **No authentication in the services:** keep every port on loopback and put the gateways behind a proxy that authenticates. The proxy must pass `%2F` in paths through undecoded, must not buffer bodies or impose a whole-request timeout, must abort a response the gateway aborts, and must pass Host on unchanged (or add the name it sends to `GATEWAY_ALLOWED_HOSTS`). `scripts/caddy-check.sh` shows how to check each of these.
 - **Watching costs:** each open UI tab polls every 2 s. The coordinator caches the expensive counts for `COORDINATOR_STATUS_CACHE_TTL` (1 s), so the scan behind them runs at most once a second however many tabs watch; it still grows with the number of chunks.
-- **Restart policies and log rotation:** none are set (the crash tests stop nodes on purpose); add `restart: unless-stopped` and json-file `max-size` for a long-running host.
 - **Keepalive pings on the network path:** every long-lived gRPC connection (coordinator to nodes, nodes' heartbeats, gateways to the coordinator) sends an HTTP/2 PING after 10 s without traffic. Anything between the services, such as a NAT, firewall or load balancer, must pass those pings and have an idle timeout over 10 s, and a proxy that terminates gRPC must permit a ping every 10 s. A half-open connection is then found within 12 s (13 s for a heartbeat connection, which a node normally replaces after one timed-out beat, about 4 s). The values are code constants that must match on both sides (DECISIONS.md, stage 11).
-- **Backups:** Postgres is the only metadata truth, and the coordinator is a single point of failure by design. Schedule `pg_dump`.
 
 ## Out of scope
 
@@ -219,7 +231,10 @@ internal/upload/        a whole upload (initiate, fan-out writes, complete), sha
 internal/download/      a whole download (failover, verified streaming, reports), shared likewise
 internal/chunkwrite/    per-replica chunk writer shared by the uploads and the nodes' copies
 gen/go/                 generated Go code (committed)
-scripts/                demo, acceptance and mutation scripts
+scripts/                demo, acceptance, mutation and deployment scripts
+deploy/                 Caddy's site block for the deployment (DEPLOY.md)
 docs/                   the demo recording and UI screenshots
 DECISIONS.md            every design decision
+DEPLOY.md               deploying to one VM behind Caddy
+docker-compose.prod.yml the production override (DEPLOY.md)
 ```

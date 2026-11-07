@@ -16,9 +16,16 @@ func TestParseAllowedHosts(t *testing.T) {
 		{"localhost:9081,127.0.0.1:9081", []string{"localhost:9081", "127.0.0.1:9081"}, false},
 		{" LocalHost:9081 , ", []string{"localhost:9081"}, false},
 		{"[::1]:9081", []string{"[::1]:9081"}, false},
+		{"localhost", []string{"localhost"}, false},
+		{"ObjectStore.Example.com,127.0.0.1:9081", []string{"objectstore.example.com", "127.0.0.1:9081"}, false},
 		{"", nil, true},
 		{" , ", nil, true},
-		{"localhost", nil, true},
+		{"127.0.0.1", nil, true},
+		{"::1", nil, true},
+		{"localhost:", nil, true},
+		{"example.com/x", nil, true},
+		{"-example.com", nil, true},
+		{"example..com", nil, true},
 		{":9081", nil, true},
 		{"localhost:http", nil, true},
 		{"localhost:0", nil, true},
@@ -140,6 +147,73 @@ func TestSameOriginAndHeaderlessMutationsAllowed(t *testing.T) {
 				if resp.StatusCode != http.StatusOK {
 					t.Fatalf("%s: %s, want 200", method, resp.Status)
 				}
+			}
+		})
+	}
+}
+
+// Behind a reverse proxy on the default https port: the browser sends Host
+// without a port, the proxy passes it on, and a bare allowed name matches it,
+// and only it. The UI's own writes pass the cross-origin check: Sec-Fetch-Site
+// same-origin, or (older browsers) an https Origin whose host is the Host.
+// Mutation: entries without a port are refused again.
+func TestBareHostNameBehindAProxy(t *testing.T) {
+	hosts, err := ParseAllowedHosts("objectstore.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.AllowedHosts = hosts
+	c := newCluster(t, options{cfg: cfg})
+	const name = "objectstore.example.com"
+	tests := []struct {
+		name     string
+		method   string
+		host     string
+		headers  map[string]string
+		want     int
+		wantCode string
+	}{
+		{"GET, Host without a port", "GET", name, nil, http.StatusOK, ""},
+		{"PUT, Sec-Fetch-Site same-origin", "PUT", name, map[string]string{"Sec-Fetch-Site": "same-origin"}, http.StatusOK, ""},
+		{"PUT, same https Origin", "PUT", name, map[string]string{"Origin": "https://" + name}, http.StatusOK, ""},
+		{"DELETE, Sec-Fetch-Site and Origin", "DELETE", name,
+			map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "https://" + name}, http.StatusOK, ""},
+		{"PUT, cross-site", "PUT", name,
+			map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"}, http.StatusForbidden, "CROSS_ORIGIN"},
+		{"PUT, foreign Origin", "PUT", name, map[string]string{"Origin": "https://evil.example"}, http.StatusForbidden, "CROSS_ORIGIN"},
+		{"GET, Host with a port", "GET", name + ":443", nil, http.StatusForbidden, "HOST_NOT_ALLOWED"},
+		{"GET, another name", "GET", "evil.example", nil, http.StatusForbidden, "HOST_NOT_ALLOWED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.method == "GET" || tt.method == "DELETE" {
+				put, _ := http.NewRequest("PUT", objectURL(c, "k"), strings.NewReader("data"))
+				put.Host = name
+				resp, err := http.DefaultClient.Do(put)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+			}
+			req, err := http.NewRequest(tt.method, objectURL(c, "k"), strings.NewReader("data"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = tt.host
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.want {
+				t.Fatalf("%s, want %d", resp.Status, tt.want)
+			}
+			if tt.wantCode != "" && errorCode(t, resp) != tt.wantCode {
+				t.Fatalf("error code, want %s", tt.wantCode)
 			}
 		})
 	}
