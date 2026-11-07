@@ -1,8 +1,19 @@
 # object-store
 
-A small S3-style distributed object store. Clients upload objects under a key; each object is split into 4 MiB chunks, every chunk is checksummed and replicated to three of four storage nodes, and a coordinator keeps all metadata in PostgreSQL. It tracks node liveness through heartbeats and re-replicates chunks that lose a replica. Clients are a CLI (`osctl`), a stateless HTTP gateway (`curl`, or anything that speaks HTTP), and a browser UI the gateway serves, which shows where every chunk lives and watches the cluster heal.
+A distributed object store in the style of S3, built from scratch: Go storage nodes, a Java/Spring Boot coordinator, gRPC and Protocol Buffers, PostgreSQL, and a React/TypeScript UI that shows the cluster heal in real time.
 
-The core rule: **the metadata plane and the data plane are separate.** The coordinator decides where bytes go and records what exists. It never carries object bytes: clients and storage nodes move them between themselves.
+**Live:** https://objectstore.ayomideo.dev (password-protected; contact me for access)
+
+**Highlights**
+- **Never overstates durability:** an upload commits only after the coordinator confirms with the nodes themselves that every chunk has at least 2 fsynced, checksum-verified copies.
+- **Self-healing:** heartbeat-based failure detection, then node-to-node re-replication back to 3 copies. The coordinator never carries object bytes.
+- **Every byte served is verified:** a download that can't be verified fails visibly instead of completing, checked end to end through the production proxy setup (the deployed Caddy version and site block) over HTTP/1.1, HTTP/2 and HTTP/3.
+- **137 mutation tests:** each one deliberately breaks a rule, and a named test must catch it. Acceptance scripts crash, pause and corrupt real nodes.
+- **Diagnosed a grpc-java bug and built the way out:** a node channel stuck for good after the node's IP changed, traced from a failed acceptance run to a known, still-unfixed upstream issue; the coordinator now detects the stuck channel and replaces it ([DECISIONS.md](DECISIONS.md#a-node-channel-that-isnt-ready-within-half-the-calls-deadline-is-replaced-only-that-replacement-is-rate-limited-stage-11)).
+
+Clients upload objects under a key; each object is split into 4 MiB chunks, every chunk is checksummed and replicated to three of four storage nodes, and a coordinator keeps all metadata in PostgreSQL.
+
+The core rule: **the metadata plane and the data plane are separate.** The coordinator decides where bytes go and records what exists; clients and storage nodes move the bytes between themselves.
 
 ![demo](docs/demo.gif)
 
