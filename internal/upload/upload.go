@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -56,14 +57,15 @@ type Uploader struct {
 	objectID string
 	timeout  time.Duration
 	log      *slog.Logger
+	dialOpts []grpc.DialOption
 	// skipped maps a node ID to the error that took it out of this upload.
 	skipped map[string]error
 }
 
 // New returns an Uploader for one object. timeout bounds each replica write,
-// connection included.
-func New(objectID string, timeout time.Duration, log *slog.Logger) *Uploader {
-	return &Uploader{objectID: objectID, timeout: timeout, log: log, skipped: map[string]error{}}
+// connection included. dialOpts are added to each node connection.
+func New(objectID string, timeout time.Duration, log *slog.Logger, dialOpts ...grpc.DialOption) *Uploader {
+	return &Uploader{objectID: objectID, timeout: timeout, log: log, dialOpts: dialOpts, skipped: map[string]error{}}
 }
 
 type replicaResult struct {
@@ -91,7 +93,7 @@ func (u *Uploader) WriteChunk(ctx context.Context, c Chunk, src io.ReaderAt) ([]
 			defer cancel()
 			sum, err := chunkwrite.Write(wctx, t.Address,
 				chunkwrite.Header{ChunkID: c.ID, ObjectID: u.objectID, Size: c.Size},
-				io.NewSectionReader(src, c.Offset, c.Size))
+				io.NewSectionReader(src, c.Offset, c.Size), u.dialOpts...)
 			results <- replicaResult{nodeID: t.NodeID, sum: sum, err: err}
 		}()
 	}
@@ -106,7 +108,7 @@ func (u *Uploader) WriteChunk(ctx context.Context, c Chunk, src io.ReaderAt) ([]
 			if status.Code(r.err) == codes.DeadlineExceeded {
 				r.err = fmt.Errorf("no answer within %s: %w", u.timeout, r.err)
 			}
-			log.Warn("replica write failed; node skipped for the rest of this upload", "error", r.err)
+			log.WarnContext(ctx, "replica write failed; node skipped for the rest of this upload", "error", r.err)
 			u.skipped[r.nodeID] = r.err
 			failures = append(failures, fmt.Sprintf("%s: %v", r.nodeID, r.err))
 		case sum != nil && !bytes.Equal(sum, r.sum):
@@ -117,7 +119,7 @@ func (u *Uploader) WriteChunk(ctx context.Context, c Chunk, src io.ReaderAt) ([]
 		default:
 			sum = r.sum
 			acked = append(acked, r.nodeID)
-			log.Info("replica written", "index", c.Index, "bytes", c.Size)
+			log.InfoContext(ctx, "replica written", "index", c.Index, "bytes", c.Size)
 		}
 	}
 

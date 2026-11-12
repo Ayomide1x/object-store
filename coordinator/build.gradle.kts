@@ -24,6 +24,9 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-jdbc")
     implementation("org.springframework.boot:spring-boot-starter-flyway")
     implementation("org.flywaydb:flyway-database-postgresql")
+    // @Trace on the repair and GC passes. Only annotations: the tracer itself is
+    // the Java agent, attached in production (docker-compose.prod.yml).
+    implementation("com.datadoghq:dd-trace-api:1.67.1")
     runtimeOnly("org.postgresql:postgresql")
 
     testImplementation("org.springframework.boot:spring-boot-starter-test")

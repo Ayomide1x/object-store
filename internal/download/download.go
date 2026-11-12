@@ -161,7 +161,7 @@ func (d *Downloader) ReadChunk(ctx context.Context, c Chunk) ([]byte, error) {
 		log := d.log.With("chunk_id", c.ID, "node_id", r.NodeID)
 		data, err := d.readReplica(ctx, r, c)
 		if err == nil {
-			log.Info("chunk read", "index", c.Index, "bytes", len(data))
+			log.InfoContext(ctx, "chunk read", "index", c.Index, "bytes", len(data))
 			return data, nil
 		}
 		if ctx.Err() != nil {
@@ -178,7 +178,7 @@ func (d *Downloader) ReadChunk(ctx context.Context, c Chunk) ([]byte, error) {
 		if !v.failOver {
 			return nil, fmt.Errorf("read chunk %d (%s) from %s: %w", c.Index, c.ID, r.NodeID, err)
 		}
-		log.Warn("replica read failed; failing over", "index", c.Index, "error", err,
+		log.WarnContext(ctx, "replica read failed; failing over", "index", c.Index, "error", err,
 			"reported", v.report != noReport, "demoted", v.demote)
 	}
 	return nil, fmt.Errorf("chunk %d (%s): all %d replicas failed: %s",

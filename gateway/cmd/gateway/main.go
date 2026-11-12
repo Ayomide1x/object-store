@@ -23,6 +23,7 @@ import (
 	"github.com/Ayomide1x/object-store/gateway/internal/httpapi"
 	"github.com/Ayomide1x/object-store/gateway/internal/webui"
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
+	"github.com/Ayomide1x/object-store/internal/tracing"
 )
 
 // shutdownGrace is how long in-flight requests get to finish on SIGTERM. It
@@ -47,7 +48,8 @@ func main() {
 		return
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Lines logged with a request's context carry its trace ID.
+	log := slog.New(tracing.LogHandler(slog.NewJSONHandler(os.Stdout, nil)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -63,6 +65,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// Off unless DD_TRACE_ENABLED=true. Stopped last, after the server has
+	// drained, so the last requests' spans are flushed.
+	stopTracing := tracing.Start(tracing.ServiceGateway, log, nil)
+	defer stopTracing()
+
 	conn, err := httpapi.DialCoordinator(cfg.coordinatorAddr, cfg.coordinatorTimeout)
 	if err != nil {
 		return err

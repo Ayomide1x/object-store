@@ -32,9 +32,11 @@ type Header struct {
 
 // Write streams h.Size bytes from r to the node at addr and returns the
 // SHA-256 it sent, after checking the node acknowledged the same size and
-// hash. ctx bounds the whole write, connection included.
-func Write(ctx context.Context, addr string, h Header, r io.Reader) ([]byte, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+// hash. ctx bounds the whole write, connection included. opts are added to
+// the connection's own (the gateway and nodes add tracing).
+func Write(ctx context.Context, addr string, h Header, r io.Reader, opts ...grpc.DialOption) ([]byte, error) {
+	opts = append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opts...)
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}

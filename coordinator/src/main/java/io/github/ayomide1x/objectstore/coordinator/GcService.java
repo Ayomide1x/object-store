@@ -16,6 +16,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import datadog.trace.api.Trace;
 import io.github.ayomide1x.objectstore.coordinator.LivenessTracker.State;
 import io.github.ayomide1x.objectstore.coordinator.MetadataRepository.BadReplica;
 import io.github.ayomide1x.objectstore.coordinator.MetadataRepository.DeletionTask;
@@ -108,6 +109,10 @@ public class GcService implements InitializingBean, DisposableBean {
     }
 
     /** Runs one pass. Synchronized: passes never overlap. */
+    // Its own trace in Datadog when the Java agent is attached (production
+    // only): the pass's queries and the calls it makes to nodes are its spans.
+    // Without the agent the annotation does nothing.
+    @Trace(operationName = "gc.pass", resourceName = "gc pass")
     public synchronized PassResult runPass() {
         repository.pruneGcPasses(properties.gcPassRetention());
         long passId = repository.startGcPass();

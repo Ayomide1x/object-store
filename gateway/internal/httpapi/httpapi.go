@@ -27,6 +27,7 @@ import (
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 	"github.com/Ayomide1x/object-store/internal/download"
+	"github.com/Ayomide1x/object-store/internal/tracing"
 	"github.com/Ayomide1x/object-store/internal/upload"
 )
 
@@ -57,6 +58,9 @@ type Server struct {
 	uploadSlots   chan struct{}
 	downloadSlots chan struct{}
 	nodeDialOpts  []grpc.DialOption
+	// traceDialOpts trace the calls made to nodes (a no-op unless the
+	// tracer was started); nodeDialOpts includes them.
+	traceDialOpts []grpc.DialOption
 }
 
 // NodeDialOptions bound what one connection to a node can buffer when it
@@ -77,7 +81,8 @@ func New(coord objectstorev1.CoordinatorServiceClient, cfg Config, log *slog.Log
 		log:           log,
 		uploadSlots:   make(chan struct{}, cfg.MaxUploads),
 		downloadSlots: make(chan struct{}, cfg.MaxDownloads),
-		nodeDialOpts:  NodeDialOptions(),
+		nodeDialOpts:  append(NodeDialOptions(), tracing.DialOptions(tracing.ServiceGateway)...),
+		traceDialOpts: tracing.DialOptions(tracing.ServiceGateway),
 	}
 }
 
@@ -101,7 +106,26 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /{$}", s.cfg.UI)
 		mux.Handle("GET /assets/", s.cfg.UI)
 	}
-	return AllowHosts(s.cfg.AllowedHosts, sameOriginWrites(mux))
+	h := AllowHosts(s.cfg.AllowedHosts, sameOriginWrites(mux))
+	return tracing.HTTPHandler(h, tracing.ServiceGateway, routeOf(mux))
+}
+
+// routeOf names the route a request matches, for its trace: "PUT
+// /objects/{key}", never the key itself. A request no route takes is
+// "<method> unmatched".
+func routeOf(mux *http.ServeMux) func(*http.Request) string {
+	return func(r *http.Request) string {
+		_, pattern := mux.Handler(r)
+		if pattern == "" {
+			return r.Method + " unmatched"
+		}
+		// Patterns that name a method ("PUT /objects/{key}") lose it here:
+		// the request's own method is what ran (HEAD on a GET route).
+		if _, path, ok := strings.Cut(pattern, " "); ok {
+			pattern = path
+		}
+		return r.Method + " " + pattern
+	}
 }
 
 // unmatched explains requests under /objects/ that no route takes: an empty
@@ -125,12 +149,12 @@ func (s *Server) unmatched(w http.ResponseWriter, r *http.Request) {
 
 // acquire takes a slot without waiting. When none is free it answers 503 and
 // returns false: overload is refused at once, not queued.
-func acquire(w http.ResponseWriter, log *slog.Logger, slots chan struct{}, what string) bool {
+func acquire(ctx context.Context, w http.ResponseWriter, log *slog.Logger, slots chan struct{}, what string) bool {
 	select {
 	case slots <- struct{}{}:
 		return true
 	default:
-		log.Warn(what+" rejected: concurrency limit reached", "limit", cap(slots))
+		log.WarnContext(ctx, what+" rejected: concurrency limit reached", "limit", cap(slots))
 		w.Header().Set("Retry-After", "1")
 		// An upload's body is not read: close rather than drain it (see put).
 		w.Header().Set("Connection", "close")
@@ -185,7 +209,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	}
 	// Checked before the body is read: a client that sent Expect:
 	// 100-continue never transfers a body we refuse.
-	if !acquire(w, log, s.uploadSlots, "upload") {
+	if !acquire(r.Context(), w, log, s.uploadSlots, "upload") {
 		return
 	}
 	defer func() { <-s.uploadSlots }()
@@ -195,11 +219,12 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	objectID, err := upload.Put(r.Context(), s.coord, log, key, r.ContentLength, src, upload.Options{
 		ChunkWriteTimeout: s.cfg.ChunkWriteTimeout,
 		NodeAddresses:     objectstorev1.NodeAddressSet_NODE_ADDRESS_SET_INTERNAL,
+		DialOptions:       s.traceDialOpts,
 	})
 	if err != nil {
 		// Nothing was completed, so nothing committed: the upload stays
 		// PENDING and garbage collection removes what was written.
-		log.Warn("upload failed; nothing committed", "error", err)
+		log.WarnContext(r.Context(), "upload failed; nothing committed", "error", err)
 		w.Header().Set("Connection", "close")
 		if errors.Is(err, upload.ErrSource) {
 			// Answer even if the client may be gone (net/http cancels the
@@ -224,7 +249,7 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	log := s.log.With("key", key)
-	if !acquire(w, log, s.downloadSlots, "download") {
+	if !acquire(r.Context(), w, log, s.downloadSlots, "download") {
 		return
 	}
 	defer func() { <-s.downloadSlots }()
@@ -250,19 +275,19 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 		out.start() // a 0-byte object has written nothing yet
-		log.Info("download complete", "bytes", obj.Size, "chunks", len(obj.Chunks))
+		log.InfoContext(r.Context(), "download complete", "bytes", obj.Size, "chunks", len(obj.Chunks))
 	case errors.As(err, &writeErr):
-		log.Warn("download ended: client stopped reading", "bytes_sent", out.written, "error", err)
+		log.WarnContext(r.Context(), "download ended: client stopped reading", "bytes_sent", out.written, "error", err)
 	case !out.started:
 		// Nothing sent yet: a proper status is still possible.
-		log.Warn("download failed before the first byte", "error", err)
+		log.WarnContext(r.Context(), "download failed before the first byte", "error", err)
 		writeUpstreamError(w, err)
 	default:
 		// The status line and Content-Length are out and some verified bytes
 		// with them. Ending normally would leave a short body that some
 		// clients accept; aborting closes the connection (HTTP/1.1) or resets
 		// the stream (HTTP/2), so the client sees a broken transfer.
-		log.Error("download failed mid-stream; aborting the connection",
+		log.ErrorContext(r.Context(), "download failed mid-stream; aborting the connection",
 			"bytes_sent", out.written, "bytes_declared", obj.Size, "error", err)
 		panic(http.ErrAbortHandler)
 	}
@@ -321,7 +346,7 @@ func (s *Server) rm(w http.ResponseWriter, r *http.Request) {
 		writeUpstreamError(w, err)
 		return
 	}
-	s.log.Info("key removed; files are deleted after the grace period", "key", key, "object_id", resp.GetObjectId())
+	s.log.InfoContext(r.Context(), "key removed; files are deleted after the grace period", "key", key, "object_id", resp.GetObjectId())
 	writeJSON(w, http.StatusOK, rmResponse{Key: key, ObjectID: resp.GetObjectId()})
 }
 
@@ -386,12 +411,16 @@ const (
 // 12 s, where without it every request would time out until TCP gave up,
 // about 15 min; the next request reconnects.
 func DialCoordinator(addr string, timeout time.Duration) (*grpc.ClientConn, error) {
-	conn, err := grpc.NewClient(addr,
+	opts := append([]grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// Runs before the tracing interceptors (chained ones run after it), so
+		// each call's span carries its deadline.
 		grpc.WithUnaryInterceptor(CoordinatorDeadline(timeout)),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time: coordinatorKeepaliveTime, Timeout: coordinatorKeepaliveTimeout, PermitWithoutStream: true,
-		}))
+		}),
+	}, tracing.DialOptions(tracing.ServiceGateway)...)
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}

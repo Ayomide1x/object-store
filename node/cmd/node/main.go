@@ -24,6 +24,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
+	"github.com/Ayomide1x/object-store/internal/tracing"
 	"github.com/Ayomide1x/object-store/node/internal/chunkstore"
 	"github.com/Ayomide1x/object-store/node/internal/heartbeat"
 	"github.com/Ayomide1x/object-store/node/internal/server"
@@ -49,7 +50,8 @@ func main() {
 		return
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Lines logged with a call's context carry its trace ID.
+	log := slog.New(tracing.LogHandler(slog.NewJSONHandler(os.Stdout, nil)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -66,6 +68,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	log = log.With("node_id", cfg.nodeID)
+	// Off unless DD_TRACE_ENABLED=true. The four nodes share one service in
+	// Datadog; node_id tells them apart.
+	stopTracing := tracing.Start(tracing.ServiceNode, log, map[string]string{"node_id": cfg.nodeID})
+	defer stopTracing()
 
 	store, err := chunkstore.New(cfg.dataDir)
 	if err != nil {
@@ -80,8 +86,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("listen on %s: %w", cfg.listenAddr, err)
 	}
 
-	srv := grpc.NewServer(server.GRPCOptions()...)
-	objectstorev1.RegisterStorageNodeServiceServer(srv, server.New(cfg.nodeID, store, log, cfg.maxReads, cfg.maxWrites))
+	// Docker's health probe calls Check every 10 s: not worth a trace each.
+	opts := append(server.GRPCOptions(), tracing.ServerOptions(tracing.ServiceNode, "/grpc.health.v1.Health/Check")...)
+	srv := grpc.NewServer(opts...)
+	objectstorev1.RegisterStorageNodeServiceServer(srv, server.New(cfg.nodeID, store, log, cfg.maxReads, cfg.maxWrites,
+		tracing.DialOptions(tracing.ServiceNode)...))
 	// SERVING only now: temp cleanup is done and the listener is open.
 	healthSrv := health.NewServer()
 	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

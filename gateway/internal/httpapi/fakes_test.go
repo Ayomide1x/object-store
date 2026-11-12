@@ -23,6 +23,13 @@ import (
 	"google.golang.org/grpc/status"
 
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
+	"github.com/Ayomide1x/object-store/internal/tracing"
+)
+
+// Service names of the fake servers' spans.
+const (
+	testNodeService        = "test-node"
+	testCoordinatorService = "test-coordinator"
 )
 
 // fakeNode stores chunks in memory. corrupt makes it serve a chunk with one
@@ -381,7 +388,8 @@ func newCluster(t *testing.T, o options) *cluster {
 		lis := listen(t)
 		n := &fakeNode{id: fmt.Sprintf("node%d", i), addr: lis.Addr().String(), chunks: map[string][]byte{},
 			corrupt: map[string]bool{}, holdReads: map[string]chan struct{}{}}
-		srv := grpc.NewServer()
+		// Traced like a real node (no spans unless a test starts a tracer).
+		srv := grpc.NewServer(tracing.ServerOptions(testNodeService)...)
 		objectstorev1.RegisterStorageNodeServiceServer(srv, n)
 		go srv.Serve(lis)
 		t.Cleanup(srv.Stop)
@@ -390,13 +398,15 @@ func newCluster(t *testing.T, o options) *cluster {
 	c.coord = &fakeCoordinator{nodes: c.nodes, chunkSize: o.chunkSize, pending: map[string]fakeObject{},
 		objects: map[string]fakeObject{}, errs: map[string]error{}}
 	lis := listen(t)
-	gsrv := grpc.NewServer()
+	gsrv := grpc.NewServer(tracing.ServerOptions(testCoordinatorService)...)
 	objectstorev1.RegisterCoordinatorServiceServer(gsrv, c.coord)
 	go gsrv.Serve(lis)
 	t.Cleanup(gsrv.Stop)
 
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithUnaryInterceptor(CoordinatorDeadline(5*time.Second)))
+	conn, err := grpc.NewClient(lis.Addr().String(), append([]grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(CoordinatorDeadline(5 * time.Second)),
+	}, tracing.DialOptions(tracing.ServiceGateway)...)...)
 	if err != nil {
 		t.Fatal(err)
 	}

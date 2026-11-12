@@ -16,6 +16,11 @@
 #   demo values: an upload may take up to 24h, and the GC checks of the
 #   acceptance scripts would take that long.
 # - Every service restarts unless stopped, and its logs are rotated.
+# - The gateways, the coordinator and the nodes send traces to the Datadog
+#   Agent (a container outside this project, named dd-agent) over the
+#   external "datadog" network, which must exist first (DEPLOY.md):
+#     docker network create datadog && docker network connect datadog dd-agent
+#   Tracing is off in docker-compose.yml.
 #
 # !reset needs Docker Compose 2.24.4 or later.
 
@@ -28,6 +33,18 @@ x-prod: &prod
     options:
       max-size: 10m
       max-file: "5"
+
+# Tracing for the Go services (internal/tracing). DD_TRACE_ENABLED: tracing is
+# off unless "true". DD_AGENT_HOST: where the Datadog Agent takes traces (port
+# 8126), by its container name on the datadog network. DD_ENV: the env tag
+# every span carries. The service name is set in code.
+x-go-tracing: &go-tracing
+  DD_TRACE_ENABLED: "true"
+  DD_AGENT_HOST: dd-agent
+  DD_ENV: prod
+
+# The project's own network, plus the one the Agent is on.
+x-datadog-networks: &datadog-networks [default, datadog]
 
 services:
   postgres:
@@ -44,7 +61,26 @@ services:
 
   coordinator:
     <<: *prod
+    networks: *datadog-networks
     environment:
+      # Tracing: Datadog's Java agent, carried in the image, attached here.
+      # The heap and direct-memory settings are docker-compose.yml's, repeated
+      # because this value replaces that one.
+      JAVA_TOOL_OPTIONS: "-javaagent:/app/dd-java-agent.jar -XX:MaxRAMPercentage=50 -XX:MaxDirectMemorySize=64m"
+      DD_SERVICE: objectstore-coordinator
+      DD_ENV: prod
+      DD_AGENT_HOST: dd-agent
+      # Heartbeats (two a second from four nodes) make no trace.
+      DD_TRACE_GRPC_IGNORED_INBOUND_METHODS: objectstore.v1.CoordinatorService/Heartbeat
+      # A query outside any request (the liveness sweep, every second, and the
+      # event writer) would be a one-span trace of its own: drop those. Queries
+      # inside a traced call or pass are kept with it.
+      DD_TRACE_SAMPLING_RULES: '[{"name": "postgresql.query", "sample_rate": 0}]'
+      # JVM metrics go to the Agent's DogStatsD, which takes only local
+      # traffic; off rather than sending into nothing.
+      DD_JMXFETCH_ENABLED: "false"
+      # The startup summary goes to stderr, which Datadog files as an error.
+      DD_TRACE_STARTUP_LOGS: "false"
       SPRING_DATASOURCE_PASSWORD: ${OBJECTSTORE_DB_PASSWORD:?set OBJECTSTORE_DB_PASSWORD in .env}
       # The code defaults. How long a superseded or removed object's files
       # are kept, so a download that already holds the chunk list finishes:
@@ -58,18 +94,26 @@ services:
   node1:
     <<: *prod
     ports: !reset []
+    networks: *datadog-networks
+    environment: *go-tracing
 
   node2:
     <<: *prod
     ports: !reset []
+    networks: *datadog-networks
+    environment: *go-tracing
 
   node3:
     <<: *prod
     ports: !reset []
+    networks: *datadog-networks
+    environment: *go-tracing
 
   node4:
     <<: *prod
     ports: !reset []
+    networks: *datadog-networks
+    environment: *go-tracing
 
   # The gateways keep 127.0.0.1:9081 and :9082 from docker-compose.yml. The
   # Host header served is the public name alone: the browser sends no port
@@ -77,10 +121,19 @@ services:
   # sends it too.
   gateway1:
     <<: *prod
+    networks: *datadog-networks
     environment:
+      <<: *go-tracing
       GATEWAY_ALLOWED_HOSTS: objectstore.ayomideo.dev
 
   gateway2:
     <<: *prod
+    networks: *datadog-networks
     environment:
+      <<: *go-tracing
       GATEWAY_ALLOWED_HOSTS: objectstore.ayomideo.dev
+
+networks:
+  # Created once on the VM and shared with the Datadog Agent (header above).
+  datadog:
+    external: true

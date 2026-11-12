@@ -103,6 +103,13 @@ Expected: `gateway1 [('127.0.0.1', '9081')] unless-stopped`, `gateway2 [('127.0.
 
 ## 3. Build and start (on the VM)
 
+**First, the network the Datadog Agent shares.** The production override sends traces to a Datadog Agent container named `dd-agent`, running outside this project, over an external network called `datadog`. Compose refuses to start until that network exists. Create it once, and connect the Agent to it:
+```sh
+docker network create datadog
+docker network connect datadog dd-agent      # skip if the VM has no Agent: traces are then dropped
+```
+If the Agent is ever recreated, run the `connect` line again. Without an Agent, everything still works: the tracers log that they can't send, and drop the traces.
+
 ```sh
 cd ~/object-store
 docker compose build                       # native arm64; the first build takes several minutes
@@ -269,6 +276,8 @@ docker compose up -d --wait
 That only works if no migration ran in between; otherwise restore the backup taken before the upgrade.
 
 **Upgrading Caddy:** run `scripts/caddy-check.sh` locally with the new version first (step 0.2).
+
+**Traces.** In Datadog, APM → Traces, filter `env:prod`. The services are `objectstore-gateway`, `objectstore-coordinator`, `objectstore-node` (one for all four; the `node_id` tag tells them apart) and `postgresql` (the coordinator's queries). An upload is one trace: the gateway's `PUT /objects/{key}`, the coordinator's calls and queries, and every replica write. Repair and GC passes are traces of their own (`repair.pass`, `gc.pass`). Log lines from the gateway and nodes that belong to a request carry its trace ID, so a trace links to its logs.
 
 **Uptime monitoring:** `/healthz` is behind the password like everything else. If you add an external monitor, give it the credentials, or add `handle /healthz { reverse_proxy 127.0.0.1:9081 }` above `basic_auth` in the site block. That exposes only "ok".
 

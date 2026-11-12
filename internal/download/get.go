@@ -51,10 +51,10 @@ func SendReports(coord objectstorev1.CoordinatorServiceClient, log *slog.Logger,
 		})
 		cancel()
 		if err != nil {
-			log.Warn("bad replica report failed", "chunk_id", r.ChunkID, "node_id", r.NodeID, "error", err)
+			log.WarnContext(ctx, "bad replica report failed", "chunk_id", r.ChunkID, "node_id", r.NodeID, "error", err)
 			continue
 		}
-		log.Info("bad replica reported", "chunk_id", r.ChunkID, "node_id", r.NodeID,
+		log.InfoContext(ctx, "bad replica reported", "chunk_id", r.ChunkID, "node_id", r.NodeID,
 			"reason", r.Reason.String(), "verdict", resp.GetVerdict().String())
 	}
 }

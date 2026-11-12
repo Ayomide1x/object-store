@@ -2285,3 +2285,97 @@ An offsite copy (for example Oracle's boot-volume backups, or copying the dumps 
 **Because:** an error count that is mostly noise trains you to ignore it. With the source named, the Postgres pipeline reads each line's own level, and the nodes' real errors (such as a chunk failing verification) stand out.
 
 **Breaks if:** the Agent stops honouring container labels, or Postgres's log format changes so the pipeline no longer parses the level. Then checkpoints show as errors again.
+
+## Datadog's own tracers, not OpenTelemetry (deployment)
+**Chose:** distributed tracing with Datadog's tracers.
+- **Gateway and nodes:** `dd-trace-go` v2 (2.12.0), behind `internal/tracing`. It provides gRPC interceptors on every traced server and client, a wrapper on the gateway's HTTP handler, and an `slog` handler that adds the trace ID to lines logged with a context.
+- **Coordinator:** Datadog's Java agent (1.67.1), attached with `-javaagent`. It traces gRPC, both served and called, and every JDBC query, with no code change. `@Trace` (from `dd-trace-api`) makes each repair pass and GC pass a trace of its own.
+
+The trace context travels in gRPC metadata. One upload is therefore one trace across Go, Java and Postgres. Checked locally against a stand-in for the Agent: a 9 MiB upload through the production settings arrived as one trace of 66 spans. It held the gateway's `PUT /objects/{key}`, the coordinator's InitiateUpload and CompleteUpload with their queries, all nine WriteChunk calls on three nodes, and the coordinator's StatChunks calls to all four.
+
+**Over:**
+- **OpenTelemetry** (the OTel SDK and `otelgrpc` in Go, the OTel Java agent, OTLP to the Datadog Agent). Its advantage is portability: changing tracing vendor would be configuration only. It would have meant recreating the Agent with its OTLP receiver turned on, which drops the Agent's manually connected networks. The Java side would also take more setup to get JDBC spans and log correlation, which Datadog's agent gives by default.
+- **Tracing by hand,** with spans around chosen functions only. That's more code, and it's easy to miss a call.
+
+**Because:** the Agent was already on the VM with APM turned on. The goal was traces in Datadog. These tracers need the least configuration, and give the coordinator's queries and the link from traces to logs without extra work.
+
+**What it costs:**
+- **The Go tracer is process-wide.** dd-trace-go keeps the tracer in a package variable. That breaks "no package-level mutable state" (CLAUDE.md). It is limited to one place: `tracing.Start` in each `main`, with `tracer.Stop` deferred.
+- **The coordinator keeps one extra span per call.** Its agent adds a `grpc.message` span per received message. Unlike in Go, this version has no setting to turn that off on the server side (`DD_INTEGRATION_GRPC_MESSAGE_ENABLED` covers only calls the coordinator makes). For unary calls it's one extra span each.
+- **Bigger Go binaries.** The gateway image grew from 36 to 54 MB, and each node's from 31 to 51 MB. The added modules are pure Go, so arm64 builds are unaffected (invariant 10).
+
+**Breaks if:** the project moves off Datadog. Then OpenTelemetry is the better choice, and `internal/tracing` is the one Go file to replace.
+
+## Tracing is on only in the production override (deployment)
+**Chose:** the hooks are always compiled in, but they make spans only where a tracer runs.
+- **Go:** `tracing.Start` starts the tracer only when `DD_TRACE_ENABLED=true`. Until then, dd-trace-go's global tracer is a no-op, and the interceptors cost a function call each.
+- **Java:** the agent's jar is in the image (pinned by SHA-256 in `coordinator/Dockerfile`), but only `docker-compose.prod.yml` attaches it, through `JAVA_TOOL_OPTIONS`.
+
+**Over:** tracing on in `docker-compose.yml` too. With no Agent locally, every service would log failed sends every few seconds. The acceptance scripts' runs would also no longer be the stack they measured.
+
+**Because:** the base file stays exactly what the acceptance scripts test (see "Production settings live in an override file that .env selects").
+
+**Breaks if:** someone sets `DD_TRACE_ENABLED=true` outside production with no Agent. Then the services log a failed send every few seconds. Nothing else changes.
+
+## Heartbeats, health checks and background queries make no trace (deployment)
+**Chose:**
+- **Not traced:**
+  - **Heartbeats.** The node's heartbeat connection has no interceptors, and the coordinator ignores the method (`DD_TRACE_GRPC_IGNORED_INBOUND_METHODS`).
+  - **Docker's health probes:** `GET /healthz` on the gateways, and `grpc.health.v1.Health/Check` on the nodes.
+- **Dropped:** queries that aren't part of any request, such as the liveness sweep's (`DD_TRACE_SAMPLING_RULES` sets `postgresql.query` root spans to rate 0).
+- **One span per call on the Go side,** never one per streamed 1 MiB frame (`WithStreamMessages(false)`).
+
+The local check had no heartbeat or health spans. Each root-level query was marked rejected (sampling priority −1), which the real Agent drops.
+
+**Over:** tracing everything and sampling down. Heartbeats alone are two calls a second, so at any sampling rate they would outnumber the requests worth reading.
+
+**Because:** a trace should answer "what happened to this upload, download or repair". Liveness has its own record: the nodes table and the UI's activity feed.
+
+**Breaks if:** a heartbeat or health-check problem needs a trace. Then remove its exclusion while you investigate.
+
+## The services reach the Agent over a shared external network (deployment)
+**Chose:** an external Docker network, `datadog`, created once on the VM, with the Agent container (`dd-agent`) connected to it. In the override, the gateways, the coordinator and the nodes join it alongside the project's own network. They reach the Agent at `dd-agent:8126` (`DD_AGENT_HOST`). Postgres does not join.
+
+**Over:**
+- **Connecting the Agent to this project's network** (`docker network connect objectstore_default dd-agent`), as was done for the Redis checks. It works, but it isn't written down anywhere in the project.
+- **A Unix socket shared through a host directory.** It needs the Agent recreated with a new mount, and the distroless images run as a non-root user, who must be able to write to the socket.
+- **The Agent's port on the host, reached through `host-gateway`.** That port would also be open to everything else on the host.
+
+**Because:** the dependency is declared in the override, which fails loudly if the network is missing. One network serves any later project that sends traces.
+
+**What it weakens:** the traced services share a network with the Agent, and with any other project's services that join it. Nothing on it is authenticated, as on the project's own network.
+
+**Breaks if:** the Agent is recreated without being reconnected to `datadog`. Then traces are dropped and the tracers log failed sends, but the services keep working (DEPLOY.md, step 3).
+
+## Span names are routes, not object keys (deployment)
+**Chose:** the gateway's HTTP span is named by the route that matched (`PUT /objects/{key}`, `GET /cluster`, or `<method> unmatched`), never by the URL. gRPC spans are named by method.
+
+**Over:** the URL. Every object would then be its own resource in Datadog, which makes per-endpoint latency and error rates useless.
+
+**Because:** Datadog groups by resource, and a route is what an endpoint is.
+
+**What it doesn't do:** keep keys out of Datadog. The span's `http.url` tag carries the full path. The gateway's logs already name keys (for example "key removed", "upload complete"), and they reach Datadog too.
+
+**Breaks if:** keys become sensitive. Then the URL tag needs redacting, and so do the log lines.
+
+## Memory limits unchanged with tracing on: measured, not assumed (deployment)
+**Chose:** no change to any `mem_limit`.
+
+**How it was measured:** locally, with the production settings and a stand-in Agent that accepted and decoded every trace. The load was 12 looping 40 MiB uploads and 24 looping 100 MiB downloads against gateway1 for 60 s, which kept both its caps full (thousands of 503s per run). Memory was sampled with `docker stats` about once a second, so short peaks can be missed (the stage 9 and 10 entries sampled the cgroup every 0.2 s).
+
+| Peak (MiB) | Tracing off | Tracing on |
+|---|---|---|
+| Coordinator (limit 768) | 300, 326 | 485, 446, 453 |
+| Gateway1 (limit 384) | 267, 278 | 345, 253, 249 |
+| Busiest node (limit 576) | 86, 93 | 140, 131, 102 |
+
+Idle: the coordinator went from 243 to 402 MiB; each Go service from about 11 to 12–35 MiB.
+
+**Readings:**
+- **The coordinator** consistently uses about 130–185 MiB more. That is the agent's own classes and threads, outside the 384 MiB heap. Added to stage 9's overload peak of 383 MiB, it comes to about 570 of 768 MiB.
+- **The gateway** shows no consistent increase. Two of three tracing-on runs peaked below both tracing-off runs. The 345 MiB run was the first one, when the laptop was slowest (half the completed requests of the others). It is still the highest reading, about 40 MiB under the limit.
+- **The nodes** stay far under their limit. Their peaks include page cache, which the kernel reclaims (stage 10).
+
+**Over:** raising limits ahead of a measured need. Each MiB added to the stack's 4.25 GiB comes out of a VM shared with other projects.
+
+**Breaks if:** the gateway's worst case sits near 345 MiB more often than these runs suggest. Datadog now reports each container's memory against its limit, which is where that would show first. An alert on `docker.mem.in_use` above 0.9 for the gateways would catch it before an OOM kill.

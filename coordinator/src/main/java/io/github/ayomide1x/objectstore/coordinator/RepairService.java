@@ -16,6 +16,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import datadog.trace.api.Trace;
 import io.github.ayomide1x.objectstore.coordinator.LivenessTracker.State;
 import io.github.ayomide1x.objectstore.coordinator.MetadataRepository.RepairChunk;
 import io.github.ayomide1x.objectstore.coordinator.MetadataRepository.ReplicaRow;
@@ -170,6 +171,10 @@ public class RepairService implements InitializingBean, DisposableBean {
     }
 
     /** Runs one reconciler pass. Synchronized: passes never overlap. */
+    // Its own trace in Datadog when the Java agent is attached (production
+    // only): the pass's queries and the calls it makes to nodes are its spans.
+    // Without the agent the annotation does nothing.
+    @Trace(operationName = "repair.pass", resourceName = "repair pass")
     public synchronized PassResult runPass() {
         repository.pruneRepairPasses(properties.repairPassRetention());
         repository.pruneLivenessEvents(properties.livenessEventRetention());

@@ -11,6 +11,10 @@
 # OBJECTSTORE_DB_PASSWORD sets the Postgres password for both Postgres and the
 # coordinator. Unset, it is "objectstore", for local development only: set it
 # (for example in a gitignored .env; see .env.example) for anything else.
+#
+# Tracing (Datadog APM) is off here. docker-compose.prod.yml turns it on and
+# documents its variables (DD_TRACE_ENABLED, DD_AGENT_HOST, DD_ENV and the
+# coordinator's DD_* settings).
 
 # Settings shared by both gateways.
 x-gateway: &gateway

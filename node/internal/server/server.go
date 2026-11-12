@@ -32,9 +32,10 @@ const (
 type Server struct {
 	objectstorev1.UnimplementedStorageNodeServiceServer
 
-	nodeID string
-	store  *chunkstore.Store
-	log    *slog.Logger
+	nodeID   string
+	store    *chunkstore.Store
+	log      *slog.Logger
+	dialOpts []grpc.DialOption
 	// readSlots bounds concurrent reads. Each read holds a whole chunk in
 	// memory (up to 4 MiB) while verifying it, so this caps read memory.
 	readSlots chan struct{}
@@ -44,9 +45,10 @@ type Server struct {
 }
 
 // New returns a Server that stores chunks in store and serves at most
-// maxReads reads and maxWrites writes at once.
-func New(nodeID string, store *chunkstore.Store, log *slog.Logger, maxReads, maxWrites int) *Server {
-	return &Server{nodeID: nodeID, store: store, log: log,
+// maxReads reads and maxWrites writes at once. dialOpts are added to the
+// connection of each push to another node.
+func New(nodeID string, store *chunkstore.Store, log *slog.Logger, maxReads, maxWrites int, dialOpts ...grpc.DialOption) *Server {
+	return &Server{nodeID: nodeID, store: store, log: log, dialOpts: dialOpts,
 		readSlots: make(chan struct{}, maxReads), writeSlots: make(chan struct{}, maxWrites)}
 }
 
@@ -109,7 +111,7 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 	case s.writeSlots <- struct{}{}:
 		defer func() { <-s.writeSlots }()
 	default:
-		log.Warn("write rejected: concurrent write limit reached", "limit", cap(s.writeSlots))
+		log.WarnContext(ctx, "write rejected: concurrent write limit reached", "limit", cap(s.writeSlots))
 		return status.Errorf(codes.ResourceExhausted, "node %s is serving %d writes; retry later", s.nodeID, cap(s.writeSlots))
 	}
 
@@ -120,27 +122,27 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 	case errors.Is(err, chunkstore.ErrInvalidID):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case err != nil:
-		log.Error("check chunk exists", "error", err)
+		log.ErrorContext(ctx, "check chunk exists", "error", err)
 		return status.Error(codes.Internal, err.Error())
 	case exists:
-		log.Warn("write rejected: chunk exists")
+		log.WarnContext(ctx, "write rejected: chunk exists")
 		return status.Errorf(codes.AlreadyExists, "chunk %s already exists", header.GetChunkId())
 	}
 
 	w, err := s.store.NewWriter(ctx, header.GetChunkId())
 	if errors.Is(err, chunkstore.ErrDeleted) {
-		log.Warn("write rejected: chunk deleted")
+		log.WarnContext(ctx, "write rejected: chunk deleted")
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	if err != nil {
-		log.Error("start chunk write", "error", err)
+		log.ErrorContext(ctx, "start chunk write", "error", err)
 		return status.Error(codes.Internal, err.Error())
 	}
 
 	sum, err := receiveData(stream, w, header.GetSizeBytes())
 	if err != nil {
 		w.Abort()
-		log.Warn("write failed", "error", err, "bytes_received", w.Written())
+		log.WarnContext(ctx, "write failed", "error", err, "bytes_received", w.Written())
 		return err
 	}
 
@@ -149,20 +151,20 @@ func (s *Server) WriteChunk(stream objectstorev1.StorageNodeService_WriteChunkSe
 	case errors.Is(err, chunkstore.ErrChecksumMismatch):
 		// The request contradicts itself; the client still has the data and
 		// may retry. Nothing exists under the final name.
-		log.Warn("write rejected: checksum mismatch", "error", err)
+		log.WarnContext(ctx, "write rejected: checksum mismatch", "error", err)
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, chunkstore.ErrExists):
-		log.Warn("write rejected: chunk exists at link")
+		log.WarnContext(ctx, "write rejected: chunk exists at link")
 		return status.Error(codes.AlreadyExists, err.Error())
 	case errors.Is(err, chunkstore.ErrDeleted):
-		log.Warn("write undone: chunk deleted during the write", "error", err)
+		log.WarnContext(ctx, "write undone: chunk deleted during the write", "error", err)
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case err != nil:
-		log.Error("commit chunk", "error", err)
+		log.ErrorContext(ctx, "commit chunk", "error", err)
 		return status.Error(codes.Internal, err.Error())
 	}
 
-	log.Info("chunk written", "bytes", w.Written(), "sha256", fmt.Sprintf("%x", sum))
+	log.InfoContext(ctx, "chunk written", "bytes", w.Written(), "sha256", fmt.Sprintf("%x", sum))
 	return stream.SendAndClose(&objectstorev1.WriteChunkResponse{
 		ChunkId:      header.GetChunkId(),
 		BytesWritten: w.Written(),
@@ -244,12 +246,12 @@ func (s *Server) StatChunks(ctx context.Context, req *objectstorev1.StatChunksRe
 		case errors.Is(err, chunkstore.ErrNotFound):
 			stat.State = objectstorev1.ChunkStat_STATE_MISSING
 		case errors.Is(err, chunkstore.ErrCorrupt):
-			s.log.Error("stat found a bad chunk header", "node_id", s.nodeID, "chunk_id", id, "error", err)
+			s.log.ErrorContext(ctx, "stat found a bad chunk header", "node_id", s.nodeID, "chunk_id", id, "error", err)
 			stat.State = objectstorev1.ChunkStat_STATE_BAD_HEADER
 		case errors.Is(err, chunkstore.ErrInvalidID):
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		default:
-			s.log.Error("stat chunk", "node_id", s.nodeID, "chunk_id", id, "error", err)
+			s.log.ErrorContext(ctx, "stat chunk", "node_id", s.nodeID, "chunk_id", id, "error", err)
 			return nil, status.Errorf(codes.Internal, "stat chunk %s: %v", id, err)
 		}
 		resp.Stats = append(resp.Stats, stat)
@@ -283,7 +285,7 @@ func (s *Server) VerifyChunk(ctx context.Context, req *objectstorev1.VerifyChunk
 		resp.State = objectstorev1.VerifyChunkResponse_STATE_CORRUPT
 		resp.Detail = err.Error()
 	case err != nil:
-		log.Error("verify chunk", "error", err)
+		log.ErrorContext(ctx, "verify chunk", "error", err)
 		return nil, status.Errorf(codes.Internal, "verify chunk %s: %v", req.GetChunkId(), err)
 	default:
 		// The file is internally consistent; it must also be the chunk the
@@ -295,7 +297,7 @@ func (s *Server) VerifyChunk(ctx context.Context, req *objectstorev1.VerifyChunk
 			resp.State = objectstorev1.VerifyChunkResponse_STATE_HEALTHY
 		}
 	}
-	log.Info("chunk verified on request", "state", resp.GetState().String(), "detail", resp.GetDetail())
+	log.InfoContext(ctx, "chunk verified on request", "state", resp.GetState().String(), "detail", resp.GetDetail())
 	return resp, nil
 }
 
@@ -324,20 +326,20 @@ func (s *Server) PushChunk(ctx context.Context, req *objectstorev1.PushChunkRequ
 	case errors.Is(err, chunkstore.ErrNotFound):
 		return nil, status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, chunkstore.ErrCorrupt):
-		log.Error("push source failed verification; refusing to copy it", "error", err)
+		log.ErrorContext(ctx, "push source failed verification; refusing to copy it", "error", err)
 		return nil, status.Error(codes.DataLoss, err.Error())
 	case err != nil:
 		return nil, status.Errorf(codes.Internal, "read chunk %s: %v", req.GetChunkId(), err)
 	}
 	if sum := sha256.Sum256(data); !bytes.Equal(sum[:], req.GetExpectedSha256()) {
-		log.Error("push source is not the recorded chunk; refusing to copy it")
+		log.ErrorContext(ctx, "push source is not the recorded chunk; refusing to copy it")
 		return nil, status.Errorf(codes.DataLoss, "chunk %s: stored sha256 %x differs from the coordinator's record %x",
 			req.GetChunkId(), sum, req.GetExpectedSha256())
 	}
 
 	resp := &objectstorev1.PushChunkResponse{NodeId: s.nodeID, ChunkId: req.GetChunkId()}
 	_, err = chunkwrite.Write(ctx, req.GetTargetAddress(),
-		chunkwrite.Header{ChunkID: req.GetChunkId(), Size: int64(len(data))}, bytes.NewReader(data))
+		chunkwrite.Header{ChunkID: req.GetChunkId(), Size: int64(len(data))}, bytes.NewReader(data), s.dialOpts...)
 	switch {
 	case err == nil:
 		resp.Outcome = objectstorev1.PushChunkResponse_OUTCOME_COPIED
@@ -348,7 +350,7 @@ func (s *Server) PushChunk(ctx context.Context, req *objectstorev1.PushChunkRequ
 		resp.Outcome = objectstorev1.PushChunkResponse_OUTCOME_TARGET_FAILED
 		resp.Detail = err.Error()
 	}
-	log.Info("chunk pushed", "outcome", resp.GetOutcome().String(), "bytes", len(data), "detail", resp.GetDetail())
+	log.InfoContext(ctx, "chunk pushed", "outcome", resp.GetOutcome().String(), "bytes", len(data), "detail", resp.GetDetail())
 	return resp, nil
 }
 
@@ -367,7 +369,7 @@ func (s *Server) DeleteChunks(ctx context.Context, req *objectstorev1.DeleteChun
 	// Checked before anything is touched: a request meant for another node
 	// (the caller's address for it is stale) must not delete this node's files.
 	if req.GetNodeId() != s.nodeID {
-		s.log.Error("delete refused: addressed to another node", "node_id", s.nodeID, "addressed_to", req.GetNodeId())
+		s.log.ErrorContext(ctx, "delete refused: addressed to another node", "node_id", s.nodeID, "addressed_to", req.GetNodeId())
 		return nil, status.Errorf(codes.FailedPrecondition, "this is node %q, request is for node %q", s.nodeID, req.GetNodeId())
 	}
 	deletions := make([]chunkstore.Deletion, 0, len(req.GetChunks()))
@@ -379,7 +381,7 @@ func (s *Server) DeleteChunks(ctx context.Context, req *objectstorev1.DeleteChun
 	case errors.Is(err, chunkstore.ErrInvalidID):
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	case err != nil:
-		s.log.Error("delete chunks", "node_id", s.nodeID, "error", err)
+		s.log.ErrorContext(ctx, "delete chunks", "node_id", s.nodeID, "error", err)
 		return nil, status.Errorf(codes.Internal, "delete chunks: %v", err)
 	}
 
@@ -389,7 +391,7 @@ func (s *Server) DeleteChunks(ctx context.Context, req *objectstorev1.DeleteChun
 		if removed[i] {
 			outcome = objectstorev1.ChunkDeletionResult_OUTCOME_DELETED
 		}
-		s.log.Info("chunk deleted", "node_id", s.nodeID, "chunk_id", d.ChunkID,
+		s.log.InfoContext(ctx, "chunk deleted", "node_id", s.nodeID, "chunk_id", d.ChunkID,
 			"tombstone", d.Tombstone, "outcome", outcome.String())
 		resp.Results = append(resp.Results, &objectstorev1.ChunkDeletionResult{ChunkId: d.ChunkID, Outcome: outcome})
 	}
@@ -407,7 +409,7 @@ func (s *Server) ReadChunk(req *objectstorev1.ReadChunkRequest, stream objectsto
 	case s.readSlots <- struct{}{}:
 		defer func() { <-s.readSlots }()
 	default:
-		log.Warn("read rejected: concurrent read limit reached", "limit", cap(s.readSlots))
+		log.WarnContext(ctx, "read rejected: concurrent read limit reached", "limit", cap(s.readSlots))
 		return status.Errorf(codes.ResourceExhausted, "node %s is serving %d reads; retry later", s.nodeID, cap(s.readSlots))
 	}
 
@@ -416,13 +418,13 @@ func (s *Server) ReadChunk(req *objectstorev1.ReadChunkRequest, stream objectsto
 	case errors.Is(err, chunkstore.ErrInvalidID):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, chunkstore.ErrNotFound):
-		log.Warn("read of missing chunk")
+		log.WarnContext(ctx, "read of missing chunk")
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, chunkstore.ErrCorrupt):
-		log.Error("chunk failed verification; refusing to serve it", "error", err)
+		log.ErrorContext(ctx, "chunk failed verification; refusing to serve it", "error", err)
 		return status.Error(codes.DataLoss, err.Error())
 	case err != nil:
-		log.Error("read chunk", "error", err)
+		log.ErrorContext(ctx, "read chunk", "error", err)
 		return status.Error(codes.Internal, err.Error())
 	}
 
@@ -434,6 +436,6 @@ func (s *Server) ReadChunk(req *objectstorev1.ReadChunkRequest, stream objectsto
 			return fmt.Errorf("send frame of chunk %s: %w", req.GetChunkId(), err)
 		}
 	}
-	log.Info("chunk read", "bytes", len(data))
+	log.InfoContext(ctx, "chunk read", "bytes", len(data))
 	return nil
 }

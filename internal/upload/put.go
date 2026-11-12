@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"time"
 
+	"google.golang.org/grpc"
+
 	objectstorev1 "github.com/Ayomide1x/object-store/gen/go/objectstore/v1"
 )
 
@@ -68,6 +70,8 @@ type Options struct {
 	ChunkWriteTimeout time.Duration
 	// NodeAddresses says which node addresses the coordinator should return.
 	NodeAddresses objectstorev1.NodeAddressSet
+	// DialOptions are added to each node connection (the gateway adds tracing).
+	DialOptions []grpc.DialOption
 }
 
 // Put uploads size bytes from src under key and returns the new object's ID:
@@ -94,7 +98,7 @@ func Put(ctx context.Context, coord objectstorev1.CoordinatorServiceClient, log 
 		return "", fmt.Errorf("initiate upload of %q: %w", key, err)
 	}
 
-	up := New(objectID, opts.ChunkWriteTimeout, log)
+	up := New(objectID, opts.ChunkWriteTimeout, log, opts.DialOptions...)
 	var completed []*objectstorev1.CompletedChunk
 	var offset int64
 	for _, c := range initResp.GetChunks() {
@@ -113,7 +117,7 @@ func Put(ctx context.Context, coord objectstorev1.CoordinatorServiceClient, log 
 			// and the key keeps its previous version.
 			return "", fmt.Errorf("upload of %q abandoned: %w", key, err)
 		}
-		log.Info("chunk written", "chunk_id", c.GetChunkId(), "index", c.GetIndex(), "replicas", len(acked),
+		log.InfoContext(ctx, "chunk written", "chunk_id", c.GetChunkId(), "index", c.GetIndex(), "replicas", len(acked),
 			"nodes", acked, "sha256", fmt.Sprintf("%x", sum))
 		completed = append(completed, &objectstorev1.CompletedChunk{
 			ChunkId:   c.GetChunkId(),
@@ -133,7 +137,7 @@ func Put(ctx context.Context, coord objectstorev1.CoordinatorServiceClient, log 
 	if err != nil {
 		return "", fmt.Errorf("complete upload of %q: %w", key, err)
 	}
-	log.Info("upload complete", "key", key, "bytes", size, "chunks", len(completed))
+	log.InfoContext(ctx, "upload complete", "key", key, "bytes", size, "chunks", len(completed))
 	return objectID, nil
 }
 
