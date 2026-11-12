@@ -35,6 +35,12 @@ services:
     environment:
       POSTGRES_PASSWORD: ${OBJECTSTORE_DB_PASSWORD:?set OBJECTSTORE_DB_PASSWORD in .env}
     ports: !reset []
+    # For the Datadog Agent on the VM. Postgres writes every log line to
+    # stderr, which Datadog files as an error; naming the source applies its
+    # Postgres pipeline, which reads the real level (routine checkpoints are
+    # LOG, so info). The Agent ignores this label if it isn't running.
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "postgresql", "service": "objectstore-postgres"}]'
 
   coordinator:
     <<: *prod

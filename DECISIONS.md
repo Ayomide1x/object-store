@@ -2273,3 +2273,15 @@ Measured: 3.02–3.03 s in 10 runs out of 10 (the 1 s readiness wait, then the 2
 An offsite copy (for example Oracle's boot-volume backups, or copying the dumps elsewhere) is out of scope for now.
 
 **Breaks if:** the data starts to matter beyond a demo. Then the disk is the single point of failure, and the backups need to leave the VM.
+
+## Postgres logs are labelled for Datadog's Postgres pipeline (deployment)
+**Chose:** a `com.datadoghq.ad.logs` label on the Postgres service in the override, naming the source `postgresql` and the service `objectstore-postgres`. The Datadog Agent runs on the VM as its own container, outside this project, and collects every container's logs.
+
+**Over:**
+- Leaving it unlabelled. Postgres writes every line to stderr, and Datadog files stderr as an error, so routine checkpoint messages (two every 5 minutes) buried the real errors.
+- Turning off `log_checkpoints`. That hides the messages instead of filing them correctly, and they help when diagnosing slow writes.
+- Labelling the base `docker-compose.yml`. The acceptance scripts don't run with an Agent, and the base file stays what they test.
+
+**Because:** an error count that is mostly noise trains you to ignore it. With the source named, the Postgres pipeline reads each line's own level, and the nodes' real errors (such as a chunk failing verification) stand out.
+
+**Breaks if:** the Agent stops honouring container labels, or Postgres's log format changes so the pipeline no longer parses the level. Then checkpoints show as errors again.
